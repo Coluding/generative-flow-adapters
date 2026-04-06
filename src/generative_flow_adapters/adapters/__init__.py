@@ -1,6 +1,7 @@
 from .factory import build_adapter
 from .base import Adapter
 from .hidden_states import ResidualConditioningAdapter
+from .hidden_states import FullSkipLayerControlAdapter, ReplaceDecoderHiddenStateAdapter, UniConHiddenStateAdapter
 from .hypernetworks import HyperNetworkAdapter
 from .low_rank import LoRAAdapter
 from .output import (
@@ -9,7 +10,6 @@ from .output import (
     OutputAdapter,
     OutputAdapterInterface,
     OutputAdapterResult,
-    UniConOutputAdapter,
 )
 
 __all__ = [
@@ -20,7 +20,9 @@ __all__ = [
     "OutputAdapterResult",
     "AffineOutputAdapter",
     "DynamicCrafterOutputAdapter",
-    "UniConOutputAdapter",
+    "FullSkipLayerControlAdapter",
+    "ReplaceDecoderHiddenStateAdapter",
+    "UniConHiddenStateAdapter",
     "OutputAdapter",
     "ResidualConditioningAdapter",
     "HyperNetworkAdapter",

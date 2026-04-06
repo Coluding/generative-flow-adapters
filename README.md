@@ -28,11 +28,12 @@ prediction = model(x_t, t, cond)
 
 ```text
 src/generative_flow_adapters/
-  adapters/         Adapter interfaces and implementations
+  adapters/         Adapter interfaces and implementations grouped by family
   conditioning/     Condition encoders for actions, goals, and multimodal signals
   losses/           Shared objectives and consistency losses
   models/           Frozen base wrappers and adapted composition
   training/         Thin trainer and config-driven builders
+src/external_deps/  Vendored third-party code with clear ownership boundary
 configs/            Example experiment configurations
 examples/           Small entrypoints for construction and smoke testing
 ```
@@ -77,6 +78,12 @@ DynamiCrafter starting point (vendored AVID architecture):
 python examples/build_model.py --config configs/diffusion_output_dynamicrafter.yaml
 ```
 
+UniCon-style Figure 3(d) hidden-state starting point:
+
+```bash
+python examples/build_model.py --config configs/diffusion_hidden_unicon_decoder.yaml
+```
+
 ## Configuration shape
 
 ```yaml
@@ -98,6 +105,12 @@ training:
 `adapter.type: output` accepts `adapter.extra.architecture`:
 - `affine` (default lightweight baseline)
 - `dynamicrafter` (AVID/DynamiCrafter 3D UNet adapter; requires `adapter.extra.unet_config_path`)
+
+`adapter.type: hidden_state` accepts `adapter.extra.architecture`:
+- `residual` (default lightweight hidden-state baseline)
+- `unicon` (paper-aligned Figure 3(d) decoder-part-focused UniCon for U-Net backbones)
+- `replace_decoder` (paper Figure 3(e))
+- `full_skip_controlnet` (paper Figure 3(c))
 
 Output adapters are composed in [adapted_model.py](/Users/lukasbierling/Documents/thesis-uva/code/generative-flow-adapters/src/generative_flow_adapters/models/adapted_model.py), not inside the adapter itself. Supported `adapter.composition` modes are:
 - `add`

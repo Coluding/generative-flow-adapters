@@ -1,0 +1,27 @@
+name: diffusion_hidden_replace_decoder
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  pretrained_model_name_or_path: external_repos/avid/latent_diffusion/dynamicrafter_512/model.ckpt
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    strict_checkpoint: false
+
+adapter:
+  type: hidden_state
+  composition: replace
+  extra:
+    architecture: replace_decoder
+    output_kind: prediction
+    output_mask: false
+
+conditioning:
+  type: identity
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from generative_flow_adapters.adapters.output.dynamicrafter import DynamicCrafterOutputAdapter
-from generative_flow_adapters.adapters.output.unicon import UniConOutputAdapter
+from generative_flow_adapters.adapters.hidden_states.unicon import (
+    FullSkipLayerControlAdapter,
+    ReplaceDecoderHiddenStateAdapter,
+    UniConHiddenStateAdapter,
+)
 from generative_flow_adapters.adapters.hidden_states.residual import ResidualConditioningAdapter
 from generative_flow_adapters.adapters.hypernetworks.basic import HyperNetworkAdapter
 from generative_flow_adapters.adapters.low_rank.lora import LoRAAdapter
@@ -30,18 +34,45 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 strict_checkpoint=bool(adapter.extra.get("strict_checkpoint", False)),
             )
         if architecture == "unicon":
-            return UniConOutputAdapter(
-                feature_dim=feature_dim,
-                cond_dim=cond_dim,
-                hidden_dim=adapter.hidden_dim,
-                num_layers=int(adapter.extra.get("num_layers", 2)),
-                num_heads=int(adapter.extra.get("num_heads", 4)),
-                output_kind=str(adapter.extra.get("output_kind", "prediction")),
+            return UniConHiddenStateAdapter(
+                connector_type=str(adapter.extra.get("connector_type", "zeroft")),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
+                output_kind=str(adapter.extra.get("output_kind", "prediction")),
+            )
+        if architecture in {"replace_decoder", "replace_diffusion_decoder"}:
+            return ReplaceDecoderHiddenStateAdapter(
+                output_mask=bool(adapter.extra.get("output_mask", False)),
+                output_kind=str(adapter.extra.get("output_kind", "prediction")),
+            )
+        if architecture in {"full_skip_controlnet", "skip_layer_controlnet"}:
+            return FullSkipLayerControlAdapter(
+                connector_type=str(adapter.extra.get("connector_type", "zeroconv")),
+                output_mask=bool(adapter.extra.get("output_mask", False)),
+                output_kind=str(adapter.extra.get("output_kind", "prediction")),
             )
         raise ValueError(f"Unsupported output adapter architecture: {architecture}")
     if adapter_type in {"hidden", "hidden_state", "controlnet", "residual"}:
-        return ResidualConditioningAdapter(feature_dim=feature_dim, cond_dim=cond_dim, hidden_dim=adapter.hidden_dim)
+        architecture = str(adapter.extra.get("architecture", "residual")).lower()
+        if architecture == "residual":
+            return ResidualConditioningAdapter(feature_dim=feature_dim, cond_dim=cond_dim, hidden_dim=adapter.hidden_dim)
+        if architecture == "unicon":
+            return UniConHiddenStateAdapter(
+                connector_type=str(adapter.extra.get("connector_type", "zeroft")),
+                output_mask=bool(adapter.extra.get("output_mask", False)),
+                output_kind=str(adapter.extra.get("output_kind", "prediction")),
+            )
+        if architecture in {"replace_decoder", "replace_diffusion_decoder"}:
+            return ReplaceDecoderHiddenStateAdapter(
+                output_mask=bool(adapter.extra.get("output_mask", False)),
+                output_kind=str(adapter.extra.get("output_kind", "prediction")),
+            )
+        if architecture in {"full_skip_controlnet", "skip_layer_controlnet"}:
+            return FullSkipLayerControlAdapter(
+                connector_type=str(adapter.extra.get("connector_type", "zeroconv")),
+                output_mask=bool(adapter.extra.get("output_mask", False)),
+                output_kind=str(adapter.extra.get("output_kind", "prediction")),
+            )
+        raise ValueError(f"Unsupported hidden-state adapter architecture: {architecture}")
     if adapter_type in {"hyper", "hypernetwork"}:
         return HyperNetworkAdapter(feature_dim=feature_dim, cond_dim=cond_dim, hidden_dim=adapter.hidden_dim)
     if adapter_type == "lora":

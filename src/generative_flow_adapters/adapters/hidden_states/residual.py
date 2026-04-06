@@ -3,7 +3,7 @@ from __future__ import annotations
 from torch import Tensor, nn
 
 from generative_flow_adapters.adapters.base import Adapter
-from generative_flow_adapters.adapters.common import ContextProjector, TensorBroadcastHead
+from generative_flow_adapters.adapters.common import ContextProjector, TensorBroadcastHead, resolve_condition_embedding
 
 
 class ResidualConditioningAdapter(Adapter):
@@ -25,7 +25,7 @@ class ResidualConditioningAdapter(Adapter):
         base_output: Tensor | None = None,
     ) -> Tensor:
         reference = base_output if base_output is not None else x_t
-        context = self.context(t, cond)
+        context = self.context(t, resolve_condition_embedding(cond))
         scale, shift = self.head(context, reference)
         gate = self.gate(context)
         while gate.dim() < reference.dim():

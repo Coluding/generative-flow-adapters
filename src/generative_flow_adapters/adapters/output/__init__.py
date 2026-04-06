@@ -1,7 +1,6 @@
 from .affine import AffineOutputAdapter, OutputAdapter
 from .dynamicrafter import DynamicCrafterOutputAdapter
 from .interface import OutputAdapterInterface, OutputAdapterResult
-from .unicon import UniConOutputAdapter
 
 __all__ = [
     "AffineOutputAdapter",
@@ -9,5 +8,4 @@ __all__ = [
     "OutputAdapter",
     "OutputAdapterInterface",
     "OutputAdapterResult",
-    "UniConOutputAdapter",
 ]

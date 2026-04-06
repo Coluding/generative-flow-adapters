@@ -37,7 +37,10 @@ class AdaptedModel(nn.Module):
     def forward(self, x_t: Tensor, t: Tensor, cond: object | None = None) -> Tensor:
         encoded_cond = self.condition_encoder(cond) if self.condition_encoder is not None else cond
         base_cond = encoded_cond if self.pass_cond_to_base else None
-        base_output = self.base_model(x_t, t, cond=base_cond)
+        if hasattr(self.adapter, "clear_captured_base_features"):
+            self.adapter.clear_captured_base_features()
+        with torch.no_grad():
+            base_output = self.base_model(x_t, t, cond=base_cond)
         adapter_cond = self._build_adapter_condition(raw_cond=cond, encoded_cond=encoded_cond)
         adapter_result = self.adapter(x_t, t, adapter_cond, base_output=base_output)
         return self._compose(base_output, adapter_result)
@@ -71,9 +74,9 @@ class AdaptedModel(nn.Module):
             return None
         if isinstance(raw_cond, Mapping):
             adapter_cond = dict(raw_cond)
-            if encoded_cond is not None:
+            if isinstance(encoded_cond, Tensor):
                 adapter_cond["embedding"] = encoded_cond
             return adapter_cond
-        if encoded_cond is not None:
+        if isinstance(encoded_cond, Tensor):
             return {"raw": raw_cond, "embedding": encoded_cond}
         return raw_cond

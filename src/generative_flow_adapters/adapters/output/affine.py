@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from torch import Tensor
 
-from generative_flow_adapters.adapters.common import ContextProjector, TensorBroadcastHead
+from generative_flow_adapters.adapters.common import ContextProjector, TensorBroadcastHead, resolve_condition_embedding
 from generative_flow_adapters.adapters.output.interface import OutputAdapterInterface, OutputAdapterResult
 
 
@@ -22,19 +20,9 @@ class AffineOutputAdapter(OutputAdapterInterface):
         base_output: Tensor | None = None,
     ) -> OutputAdapterResult:
         reference = base_output if base_output is not None else x_t
-        context = self.context(t, _resolve_embedding(cond))
+        context = self.context(t, resolve_condition_embedding(cond))
         scale, shift = self.head(context, reference)
         return OutputAdapterResult(adapter_output=reference * scale + shift, output_kind="delta")
 
 
 OutputAdapter = AffineOutputAdapter
-
-
-def _resolve_embedding(cond: object | None) -> Tensor | None:
-    if cond is None or isinstance(cond, Tensor):
-        return cond
-    if isinstance(cond, Mapping):
-        embedding = cond.get("embedding")
-        if embedding is None or isinstance(embedding, Tensor):
-            return embedding
-    raise TypeError("AffineOutputAdapter expects a tensor embedding or a mapping containing 'embedding'.")

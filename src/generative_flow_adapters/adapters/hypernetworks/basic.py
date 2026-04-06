@@ -4,7 +4,7 @@ import torch
 from torch import Tensor, nn
 
 from generative_flow_adapters.adapters.base import Adapter
-from generative_flow_adapters.adapters.common import ContextProjector
+from generative_flow_adapters.adapters.common import ContextProjector, resolve_condition_embedding
 
 
 class HyperNetworkAdapter(Adapter):
@@ -25,7 +25,7 @@ class HyperNetworkAdapter(Adapter):
         reference = base_output if base_output is not None else x_t
         if reference.dim() != 2:
             raise ValueError("HyperNetworkAdapter currently expects tensor inputs shaped [batch, feature_dim].")
-        context = self.context(t, cond)
+        context = self.context(t, resolve_condition_embedding(cond))
         weight = self.weight_generator(context).view(-1, self.feature_dim, self.feature_dim)
         bias = self.bias_generator(context)
         delta = torch.einsum("bij,bj->bi", weight, reference) + bias

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 from torch import Tensor, nn
 
@@ -37,3 +39,13 @@ class TensorBroadcastHead(nn.Module):
             scale = scale.unsqueeze(-1)
             shift = shift.unsqueeze(-1)
         return scale, shift
+
+
+def resolve_condition_embedding(cond: object | None) -> Tensor | None:
+    if cond is None or isinstance(cond, Tensor):
+        return cond
+    if isinstance(cond, Mapping):
+        embedding = cond.get("embedding")
+        if embedding is None or isinstance(embedding, Tensor):
+            return embedding
+    raise TypeError("Expected a tensor condition or a mapping containing an 'embedding' tensor.")

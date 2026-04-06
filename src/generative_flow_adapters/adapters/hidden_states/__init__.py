@@ -1,3 +1,9 @@
 from .residual import ResidualConditioningAdapter
+from .unicon import FullSkipLayerControlAdapter, ReplaceDecoderHiddenStateAdapter, UniConHiddenStateAdapter
 
-__all__ = ["ResidualConditioningAdapter"]
+__all__ = [
+    "FullSkipLayerControlAdapter",
+    "ReplaceDecoderHiddenStateAdapter",
+    "ResidualConditioningAdapter",
+    "UniConHiddenStateAdapter",
+]

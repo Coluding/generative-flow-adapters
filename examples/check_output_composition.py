@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from generative_flow_adapters.adapters.output_interface import OutputAdapterResult
+from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
 from generative_flow_adapters.models.adapted_model import AdaptedModel
 from generative_flow_adapters.models.base.dummy import DummyVectorField
 
