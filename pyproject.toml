@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "generative-flow-adapters"
+version = "0.1.0"
+description = "Adapter-first research framework for action-conditioned diffusion and flow world models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+diffusers = [
+  "diffusers>=0.30",
+  "accelerate>=0.33",
+  "transformers>=4.44",
+]
+dynamicrafter = [
+  "einops>=0.7",
+  "numpy>=1.26",
+  "pytorch-lightning>=2.2",
+]
+
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

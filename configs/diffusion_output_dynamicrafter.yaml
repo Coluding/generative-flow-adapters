@@ -1,0 +1,35 @@
+name: diffusion_output_dynamicrafter
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  pretrained_model_name_or_path: external_repos/avid/latent_diffusion/dynamicrafter_512/model.ckpt
+  freeze: true
+  pass_cond_to_base: false
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    strict_checkpoint: false
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_145M.yaml
+    # Optional: adapter-only checkpoint (e.g. AVID checkpoint storing action_cond_model state dict)
+    # checkpoint_path: /path/to/avid_adapter.ckpt
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+
+conditioning:
+  type: action
+  input_dim: 7
+  output_dim: 512
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4

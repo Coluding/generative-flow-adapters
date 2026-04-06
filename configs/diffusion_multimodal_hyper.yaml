@@ -1,0 +1,19 @@
+name: diffusion_multimodal_hyper
+model:
+  type: diffusion
+  provider: dummy
+  feature_dim: 32
+  hidden_dim: 128
+  freeze: true
+adapter:
+  type: hyper
+  hidden_dim: 128
+conditioning:
+  type: multimodal
+  modalities:
+    action: 8
+    goal: 8
+    proprio: 16
+  output_dim: 64
+training:
+  loss: diffusion

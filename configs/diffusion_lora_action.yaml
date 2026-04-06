@@ -1,0 +1,19 @@
+name: diffusion_lora_action
+model:
+  type: diffusion
+  provider: dummy
+  feature_dim: 32
+  hidden_dim: 128
+  freeze: true
+adapter:
+  type: lora
+  rank: 8
+  alpha: 8.0
+  target_modules: ["net.0", "net.2"]
+conditioning:
+  type: action
+  input_dim: 8
+  output_dim: 32
+training:
+  loss: diffusion
+  learning_rate: 0.0001
