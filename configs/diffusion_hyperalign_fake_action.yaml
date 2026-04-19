@@ -1,0 +1,46 @@
+name: diffusion_hyperalign_fake_action
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: configs/test_dynamicrafter_hyperalign_unet.yaml
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 8
+
+adapter:
+  type: hyper
+  hidden_dim: 128
+  rank: 4
+  alpha: 1.0
+  extra:
+    architecture: hyperalign
+    aux_down_dim: 16
+    aux_up_dim: 16
+    num_decoder_layers: 2
+    num_decoder_heads: 8
+    update_mode: stepwise
+    use_adapter_conditioning: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  extra:
+    context_tokens: 77
+    context_dim: 512
+    temporal_length: 8
+    action_dim: 7
+  conditions:
+    - key: act
+      input_dim: 7
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000

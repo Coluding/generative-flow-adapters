@@ -28,8 +28,11 @@ def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
         adapter=adapter,
         condition_encoder=condition_encoder,
         pass_cond_to_base=config.model.pass_cond_to_base,
+        condition_drop_prob=config.conditioning.drop_condition_prob,
         output_composition=config.adapter.composition,
         gate_bias=config.adapter.gate_bias,
+        include_base_direction=bool(config.conditioning.extra.get("include_base_direction", False)),
+        normalize_base_direction=bool(config.conditioning.extra.get("normalize_base_direction", True)),
     )
     loss_key = config.training.loss or config.model.type
     loss_fn = LossRegistry.get_loss(loss_key)

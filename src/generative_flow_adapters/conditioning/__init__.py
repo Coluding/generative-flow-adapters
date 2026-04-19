@@ -3,6 +3,7 @@ from .encoders import (
     IdentityConditionEncoder,
     MLPConditionEncoder,
     MultimodalConditionEncoder,
+    StructuredConditionEncoder,
     build_condition_encoder,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "IdentityConditionEncoder",
     "MLPConditionEncoder",
     "MultimodalConditionEncoder",
+    "StructuredConditionEncoder",
     "build_condition_encoder",
 ]

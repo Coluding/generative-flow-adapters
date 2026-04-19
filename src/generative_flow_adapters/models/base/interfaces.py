@@ -6,6 +6,8 @@ from typing import Any
 
 from torch import Tensor, nn
 
+from generative_flow_adapters.losses.diffusion import DiffusionScheduleConfig
+
 
 class BaseGenerativeModel(nn.Module, ABC):
     def __init__(self, model_type: str, prediction_type: str) -> None:
@@ -18,6 +20,10 @@ class BaseGenerativeModel(nn.Module, ABC):
             parameter.requires_grad_(False)
         self.eval()
         return self
+
+    @property
+    def diffusion_schedule_config(self) -> DiffusionScheduleConfig | None:
+        return None
 
     @abstractmethod
     def forward(self, x_t: Tensor, t: Tensor, cond: object | None = None) -> Tensor:

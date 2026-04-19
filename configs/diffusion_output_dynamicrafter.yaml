@@ -24,11 +24,20 @@ adapter:
     condition_on_base_outputs: true
     output_mask: true
     strict_checkpoint: false
+    # Keep fs separate from shortcut step-level conditioning.
+    use_step_level_conditioning: true
+    step_level_key: step_level
 
 conditioning:
-  type: action
-  input_dim: 7
+  type: structured
   output_dim: 512
+  conditions:
+    - key: act
+      input_dim: 7
+      encoder: mlp
+    - key: step_level
+      input_dim: 1
+      encoder: mlp
 
 training:
   loss: diffusion

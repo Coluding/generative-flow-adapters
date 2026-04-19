@@ -8,7 +8,10 @@ from einops import rearrange
 from torch import Tensor, nn
 
 from generative_flow_adapters.adapters.base import Adapter
+from generative_flow_adapters.adapters.common import resolve_condition_embedding
 from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
+from generative_flow_adapters.backbones.dynamicrafter.models.utils_diffusion import timestep_embedding
+from generative_flow_adapters.backbones.dynamicrafter.utils.helpers import prob_mask_like
 
 
 class UniConHiddenStateAdapter(Adapter):
@@ -16,11 +19,17 @@ class UniConHiddenStateAdapter(Adapter):
 
     def __init__(
         self,
+        cond_dim: int | None = None,
+        cond_hidden_dim: int | None = None,
+        use_adapter_conditioning: bool = True,
         connector_type: str = "zeroft",
         output_mask: bool = False,
         output_kind: str = "prediction",
     ) -> None:
         super().__init__()
+        self.cond_dim = cond_dim
+        self.cond_hidden_dim = cond_hidden_dim
+        self.use_adapter_conditioning = use_adapter_conditioning
         self.connector_type = connector_type
         self.output_mask = output_mask
         self.output_kind = output_kind
@@ -46,14 +55,14 @@ class UniConHiddenStateAdapter(Adapter):
         del base_output
         module = self._require_module()
         features = self._feature_store.require()
-        emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond)
+        emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond, adapter=self)
 
         h = self.middle_connector(features.middle)
         for index, block in enumerate(self.decoder_blocks):
             skip = self.skip_connectors[index](features.input_skips[-(index + 1)])
             h = torch.cat([h, skip], dim=1)
             h = block(h, emb, context=context, batch_size=batch_size)
-            h = self.decoder_connectors[index](h, features.output_activations[index])
+            h = self.decoder_connectors[index](h, features.output_activations[index]) # USING output features here
 
         h = h.type(features.final_dtype)
         prediction = self.out_head(h)
@@ -85,6 +94,7 @@ class UniConHiddenStateAdapter(Adapter):
         self.decoder_connectors = nn.ModuleList(
             build_connector(self.connector_type, channels) for channels in output_channels
         )
+        _prepare_adapter_conditioning(self, module)
         self._prepared = True
 
     def _require_module(self) -> nn.Module:
@@ -96,8 +106,18 @@ class UniConHiddenStateAdapter(Adapter):
 class ReplaceDecoderHiddenStateAdapter(Adapter):
     """Figure 3(e): replace the diffusion decoder with a trainable copy."""
 
-    def __init__(self, output_mask: bool = False, output_kind: str = "prediction") -> None:
+    def __init__(
+        self,
+        cond_dim: int | None = None,
+        cond_hidden_dim: int | None = None,
+        use_adapter_conditioning: bool = True,
+        output_mask: bool = False,
+        output_kind: str = "prediction",
+    ) -> None:
         super().__init__()
+        self.cond_dim = cond_dim
+        self.cond_hidden_dim = cond_hidden_dim
+        self.use_adapter_conditioning = use_adapter_conditioning
         self.output_mask = output_mask
         self.output_kind = output_kind
         self._prepared = False
@@ -122,7 +142,7 @@ class ReplaceDecoderHiddenStateAdapter(Adapter):
         del base_output
         module = self._require_module()
         features = self._feature_store.require()
-        emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond)
+        emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond, adapter=self)
 
         h = features.middle
         for index, block in enumerate(self.decoder_blocks):
@@ -147,6 +167,7 @@ class ReplaceDecoderHiddenStateAdapter(Adapter):
         self.decoder_blocks = nn.ModuleList(copy.deepcopy(module.output_blocks))
         self.out_head = copy.deepcopy(module.out)
         self.mask_head = copy.deepcopy(module.out_mask) if self.output_mask and hasattr(module, "out_mask") else None
+        _prepare_adapter_conditioning(self, module)
         self._prepared = True
 
     def _require_module(self) -> nn.Module:
@@ -160,11 +181,17 @@ class FullSkipLayerControlAdapter(Adapter):
 
     def __init__(
         self,
+        cond_dim: int | None = None,
+        cond_hidden_dim: int | None = None,
+        use_adapter_conditioning: bool = True,
         connector_type: str = "zeroconv",
         output_mask: bool = False,
         output_kind: str = "prediction",
     ) -> None:
         super().__init__()
+        self.cond_dim = cond_dim
+        self.cond_hidden_dim = cond_hidden_dim
+        self.use_adapter_conditioning = use_adapter_conditioning
         self.connector_type = connector_type
         self.output_mask = output_mask
         self.output_kind = output_kind
@@ -190,7 +217,7 @@ class FullSkipLayerControlAdapter(Adapter):
         del base_output
         module = self._require_module()
         features = self._feature_store.require()
-        emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond)
+        emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond, adapter=self)
         h = rearrange(x_t, "b c frames h w -> (b frames) c h w").type(module.dtype)
 
         replicated_skips: list[Tensor] = []
@@ -237,6 +264,7 @@ class FullSkipLayerControlAdapter(Adapter):
         self.output_connectors = nn.ModuleList(
             build_connector(self.connector_type, channels) for channels in output_channels
         )
+        _prepare_adapter_conditioning(self, module)
         self._prepared = True
 
     def _require_module(self) -> nn.Module:
@@ -369,7 +397,45 @@ def _infer_block_channels(block: nn.Module) -> int:
     raise ValueError("Unable to infer block channels for connector construction.")
 
 
-def _prepare_unet_runtime(module: nn.Module, x: Tensor, timesteps: Tensor, cond: object | None) -> tuple[Tensor, Tensor, int]:
+def _prepare_adapter_conditioning(adapter: Adapter, module: nn.Module) -> None:
+    cond_dim = getattr(adapter, "cond_dim", None)
+    if not getattr(adapter, "use_adapter_conditioning", False) or cond_dim is None or cond_dim <= 0:
+        return
+    if hasattr(adapter, "condition_proj") and hasattr(adapter, "emb_fuse"):
+        return
+
+    emb_dim = _infer_time_embedding_dim(module)
+    cond_hidden_dim = int(getattr(adapter, "cond_hidden_dim", 0) or emb_dim)
+    adapter.condition_proj = nn.Sequential(
+        nn.Linear(cond_dim, cond_hidden_dim),
+        nn.SiLU(),
+        nn.Linear(cond_hidden_dim, emb_dim),
+    )
+    adapter.emb_fuse = nn.Sequential(
+        nn.Linear(emb_dim * 2, emb_dim),
+        nn.SiLU(),
+        nn.Linear(emb_dim, emb_dim),
+    )
+    final = adapter.emb_fuse[-1]
+    nn.init.zeros_(final.weight)
+    nn.init.zeros_(final.bias)
+
+
+def _infer_time_embedding_dim(module: nn.Module) -> int:
+    final_layer = module.time_embed[-1]
+    if not hasattr(final_layer, "out_features"):
+        raise ValueError("Unable to infer U-Net timestep embedding dimension.")
+    return int(final_layer.out_features)
+
+
+def _prepare_unet_runtime(
+    module: nn.Module,
+    x: Tensor,
+    timesteps: Tensor,
+    cond: object | None,
+    adapter: Adapter | None = None,
+    add_cond_embedding_time: bool = True,
+) -> tuple[Tensor, Tensor, int]:
     if not isinstance(cond, Mapping):
         raise TypeError("Paper-aligned UniCon adapters expect a mapping condition with at least 'context'.")
     context = cond.get("context")
@@ -383,10 +449,7 @@ def _prepare_unet_runtime(module: nn.Module, x: Tensor, timesteps: Tensor, cond:
     batch_size, _, frames, _, _ = x.shape
     t_emb = module.time_embed[0].weight.new_zeros((1,))  # placeholder to keep dtype/device tied to module params
     del t_emb
-
-    timestep_embedding = __import__("external_deps.lvdm.models.utils_diffusion", fromlist=["timestep_embedding"]).timestep_embedding
-    prob_mask_like = __import__("external_deps.avid_utils.helpers", fromlist=["prob_mask_like"]).prob_mask_like
-
+    #TODO: Integrate the timestep embedding in the code
     t_emb = timestep_embedding(timesteps, module.model_channels, repeat_only=False).type(x.dtype)
 
     _, context_tokens, _ = context.shape
@@ -400,7 +463,7 @@ def _prepare_unet_runtime(module: nn.Module, x: Tensor, timesteps: Tensor, cond:
 
     if not getattr(module, "action_conditioned", False):
         emb = module.time_embed(t_emb)
-        emb = emb.repeat_interleave(repeats=frames, dim=0)
+        emb = emb.repeat_interleave(repeats=frames, dim=0) # Repeat along frame dimension
     else:
         act_drop_prob = module.action_dropout_prob if dropout_actions else 0.0
         time_emb = module.time_embed(t_emb)
@@ -420,10 +483,39 @@ def _prepare_unet_runtime(module: nn.Module, x: Tensor, timesteps: Tensor, cond:
     if getattr(module, "fs_condition", False):
         if fs is None:
             fs = torch.tensor([module.default_fs] * batch_size, dtype=torch.long, device=x.device)
-        timestep_embedding = __import__("external_deps.lvdm.models.utils_diffusion", fromlist=["timestep_embedding"]).timestep_embedding
         fs_emb = timestep_embedding(fs, module.model_channels, repeat_only=False).type(x.dtype)
         fs_embed = module.fps_embedding(fs_emb)
         fs_embed = fs_embed.repeat_interleave(repeats=frames, dim=0)
         emb = emb + fs_embed
 
+    adapter_embedding = _prepare_adapter_embedding(adapter=adapter, cond=cond, batch_size=batch_size, frames=frames, dtype=x.dtype)
+    if adapter_embedding is not None: # Merging timestep embedding + condition embedding
+        emb = emb + adapter.emb_fuse(torch.cat([emb, adapter_embedding], dim=1))
+
     return emb, context, batch_size
+
+
+def _prepare_adapter_embedding(
+    adapter: Adapter | None,
+    cond: object | None,
+    batch_size: int,
+    frames: int,
+    dtype: torch.dtype,
+) -> Tensor | None:
+    if adapter is None or not getattr(adapter, "use_adapter_conditioning", False):
+        return None
+    cond_embedding = resolve_condition_embedding(cond)
+    if cond_embedding is None:
+        return None
+    condition_proj = getattr(adapter, "condition_proj", None)
+    if condition_proj is None:
+        return None
+    if cond_embedding.dim() == 2:
+        cond_embedding = cond_embedding.repeat_interleave(repeats=frames, dim=0)
+    elif cond_embedding.dim() == 3:
+        if cond_embedding.shape[0] != batch_size or cond_embedding.shape[1] != frames:
+            raise ValueError("Adapter conditioning tensors with rank 3 must be shaped [batch, frames, cond_dim].")
+        cond_embedding = rearrange(cond_embedding, "b t c -> (b t) c")
+    else:
+        raise ValueError("Adapter conditioning embedding must have rank 2 or 3.")
+    return condition_proj(cond_embedding).type(dtype)

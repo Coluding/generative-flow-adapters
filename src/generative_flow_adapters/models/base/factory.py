@@ -13,6 +13,7 @@ def build_base_model(config: ModelConfig):
             model_type=config.type,
             feature_dim=config.feature_dim,
             hidden_dim=config.hidden_dim,
+            prediction_type=config.prediction_type,
         )
     elif provider == "diffusers":
         if not config.pretrained_model_name_or_path:
@@ -33,6 +34,8 @@ def build_base_model(config: ModelConfig):
             checkpoint_path=config.pretrained_model_name_or_path,
             prediction_type=config.prediction_type,
             strict_checkpoint=bool(config.extra.get("strict_checkpoint", False)),
+            allow_missing_checkpoint=bool(config.extra.get("allow_missing_checkpoint", False)),
+            allow_dummy_concat_condition=bool(config.extra.get("allow_dummy_concat_condition", False)),
         )
     else:
         raise ValueError(f"Unsupported model provider: {config.provider}")

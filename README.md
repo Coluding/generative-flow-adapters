@@ -78,10 +78,22 @@ DynamiCrafter starting point (vendored AVID architecture):
 python examples/build_model.py --config configs/diffusion_output_dynamicrafter.yaml
 ```
 
+HyperAlign paper-replication starting point:
+
+```bash
+python examples/build_model.py --config configs/diffusion_hyperalign_action.yaml
+```
+
 UniCon-style Figure 3(d) hidden-state starting point:
 
 ```bash
 python examples/build_model.py --config configs/diffusion_hidden_unicon_decoder.yaml
+```
+
+Run a short synthetic training smoke test:
+
+```bash
+python examples/training_test.py --config configs/flow_output_shortcut.yaml --steps 3
 ```
 
 ## Configuration shape
@@ -111,6 +123,12 @@ training:
 - `unicon` (paper-aligned Figure 3(d) decoder-part-focused UniCon for U-Net backbones)
 - `replace_decoder` (paper Figure 3(e))
 - `full_skip_controlnet` (paper Figure 3(c))
+
+`adapter.type: hyper` accepts `adapter.extra.architecture`:
+- `hyper_lora_simple` (lightweight baseline generating LoRA weights from pooled model state)
+- `hyperalign` (paper-aligned HyperAlign architecture for DynamiCrafter video U-Nets: attention-only targets, auxiliary-factorized LoRA, perception encoder, transformer decoder, and `S/I/P` update modes)
+
+HyperAlign implementation notes are documented in [docs/hyperalign-architecture-replication.md](/Users/lukasbierling/Documents/thesis-uva/code/generative-flow-adapters/docs/hyperalign-architecture-replication.md).
 
 Output adapters are composed in [adapted_model.py](/Users/lukasbierling/Documents/thesis-uva/code/generative-flow-adapters/src/generative_flow_adapters/models/adapted_model.py), not inside the adapter itself. Supported `adapter.composition` modes are:
 - `add`

@@ -1,0 +1,39 @@
+name: diffusion_hyperalign_action
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  pretrained_model_name_or_path: external_repos/avid/latent_diffusion/dynamicrafter_512/model.ckpt
+  hidden_dim: 128
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    strict_checkpoint: false
+
+adapter:
+  type: hyper
+  hidden_dim: 128
+  rank: 4
+  alpha: 1.0
+  extra:
+    architecture: hyperalign
+    aux_down_dim: 16
+    aux_up_dim: 16
+    num_decoder_layers: 4
+    num_decoder_heads: 8
+    update_mode: stepwise
+    piecewise_progress_markers: [0.0, 0.05, 0.20]
+
+conditioning:
+  type: structured
+  output_dim: 512
+  conditions:
+    - key: act
+      input_dim: 7
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4

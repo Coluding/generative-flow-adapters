@@ -609,6 +609,8 @@ class UNetModel(nn.Module):
             )
         )
 
+        self.input_block_chans = list(input_block_chans)
+
         ## Middle Block
         self.middle_block = TimestepEmbedSequential(*layers)
 

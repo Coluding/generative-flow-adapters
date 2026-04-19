@@ -8,8 +8,8 @@ from generative_flow_adapters.utils import timestep_embedding
 
 
 class DummyVectorField(BaseGenerativeModel):
-    def __init__(self, model_type: str, feature_dim: int, hidden_dim: int) -> None:
-        super().__init__(model_type=model_type, prediction_type=infer_prediction_type(model_type))
+    def __init__(self, model_type: str, feature_dim: int, hidden_dim: int, prediction_type: str | None = None) -> None:
+        super().__init__(model_type=model_type, prediction_type=infer_prediction_type(model_type, explicit=prediction_type))
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.time_mlp = nn.Sequential(

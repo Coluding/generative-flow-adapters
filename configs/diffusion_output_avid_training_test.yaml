@@ -1,0 +1,42 @@
+name: diffusion_output_avid_training_test
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  pretrained_model_name_or_path: external_repos/avid/latent_diffusion/dynamicrafter_512/model.ckpt
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    strict_checkpoint: false
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    use_step_level_conditioning: true
+    step_level_key: step_level
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.05
+  conditions:
+    - key: act
+      input_dim: 7
+      encoder: mlp
+    - key: step_level
+      input_dim: 1
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4

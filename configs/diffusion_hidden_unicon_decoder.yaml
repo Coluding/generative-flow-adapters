@@ -21,7 +21,12 @@ adapter:
     output_mask: false
 
 conditioning:
-  type: identity
+  type: structured
+  output_dim: 512
+  conditions:
+    - key: act
+      input_dim: 7
+      encoder: mlp
 
 training:
   loss: diffusion

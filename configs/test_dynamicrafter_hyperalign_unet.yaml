@@ -1,0 +1,46 @@
+model:
+  params:
+    timesteps: 1000
+    beta_schedule: linear
+    linear_start: 8.5e-4
+    linear_end: 1.2e-2
+    rescale_betas_zero_snr: false
+    unet_config:
+      params:
+        in_channels: 4
+        model_channels: 32
+        out_channels: 4
+        num_res_blocks: 1
+        attention_resolutions: [1, 2]
+        dropout: 0.0
+        channel_mult: [1, 2]
+        original_size: [16, 16]
+        output_mask: false
+        action_conditioned: true
+        add_act_time_emb: false
+        action_dropout_prob: 0.0
+        action_dims: 7
+        downsample_size: null
+        conv_resample: true
+        dims: 2
+        context_dim: 512
+        use_scale_shift_norm: false
+        resblock_updown: false
+        num_heads: -1
+        num_head_channels: 8
+        transformer_depth: 1
+        use_linear: false
+        use_checkpoint: false
+        temporal_conv: false
+        tempspatial_aware: false
+        temporal_attention: true
+        use_relative_position: false
+        use_causal_attention: false
+        temporal_length: 8
+        use_fp16: false
+        addition_attention: false
+        temporal_selfatt_only: true
+        image_cross_attention: false
+        image_cross_attention_scale_learnable: false
+        default_fs: 4
+        fs_condition: false

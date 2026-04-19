@@ -4,7 +4,11 @@ from collections.abc import Callable
 
 from torch import Tensor
 
-from generative_flow_adapters.losses.consistency import local_consistency_loss, multistep_self_consistency_loss
+from generative_flow_adapters.losses.consistency import (
+    local_consistency_loss,
+    multistep_self_consistency_loss,
+    shortcut_direction_loss,
+)
 from generative_flow_adapters.losses.diffusion import diffusion_loss
 from generative_flow_adapters.losses.flow_matching import flow_matching_loss
 
@@ -16,6 +20,7 @@ class LossRegistry:
         "flow_matching": flow_matching_loss,
     }
     _consistency_losses: dict[str, Callable[[Tensor, Tensor], Tensor]] = {
+        "shortcut_direction": shortcut_direction_loss,
         "local_consistency": local_consistency_loss,
         "multistep_self_consistency": multistep_self_consistency_loss,
     }

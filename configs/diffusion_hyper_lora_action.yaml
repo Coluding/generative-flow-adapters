@@ -1,0 +1,29 @@
+name: diffusion_hyper_lora_action
+
+model:
+  type: diffusion
+  provider: dummy
+  feature_dim: 32
+  hidden_dim: 128
+  freeze: true
+
+adapter:
+  type: hyper
+  hidden_dim: 128
+  rank: 4
+  alpha: 1.0
+  target_modules:
+    - "0"
+    - "2"
+  extra:
+    architecture: hyper_lora_simple
+    use_base_output_summary: false
+
+conditioning:
+  type: action
+  input_dim: 8
+  output_dim: 128
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4

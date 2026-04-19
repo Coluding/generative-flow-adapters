@@ -13,6 +13,9 @@ def build_batch(config) -> dict[str, torch.Tensor | object]:
     x_t = torch.randn(4, 32)
     t = torch.rand(4)
     target = torch.randn(4, 32)
+    if config.conditioning.conditions:
+        cond = {spec.key: torch.randn(4, spec.input_dim) for spec in config.conditioning.conditions}
+        return {"x_t": x_t, "t": t, "target": target, "cond": cond}
     if config.conditioning.type == "multimodal":
         cond = {
             "action": torch.randn(4, 8),
