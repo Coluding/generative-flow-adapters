@@ -74,6 +74,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         self._factor_head: nn.Linear | None = None
         self._memory_projections: nn.ModuleList | None = None
         self._prepared = False
+        self._feature_store = _HyperAlignInputFeatureStore()
 
         self._cached_hyper_factors: tuple[Tensor, Tensor] | None = None
         self._cached_stage_index: int | None = None
@@ -95,6 +96,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
     def attach_base_model(self, base_model) -> None:
         super().attach_base_model(base_model)
         module = _resolve_unet_module(base_model)
+        self._feature_store.attach(module)
         self._handles = inject_hyperalign_lora_layers(
             module,
             rank=self.rank,
@@ -111,8 +113,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         clear_dynamic_lora_parameters(self._handles)
 
     def clear_captured_base_features(self) -> None:
-        # Intentionally a no-op: I/P variants cache factors across denoising steps.
-        return None
+        self._feature_store.clear()
 
     def reset_trajectory_state(self) -> None:
         self.clear_dynamic_parameters()
@@ -269,6 +270,11 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         )
         if not isinstance(cond, Mapping) or "context" not in cond:
             raise TypeError("Paper-aligned HyperAlign expects a mapping condition containing a 'context' tensor.")
+        if self._can_use_captured_features(cond):
+            expected_blocks = len(self._memory_projections) if self._memory_projections is not None else 0
+            captured = self._feature_store.get(expected_count=expected_blocks)
+            if captured is not None:
+                return self._build_memory_from_captured_features(captured, batch_size=x_t.shape[0], frames=x_t.shape[2], dtype=x_t.dtype)
 
         module = _resolve_unet_module(self.base_model)
         emb, context, batch_size = _prepare_hyperalign_runtime(module, x_t, t, cond, adapter=self)
@@ -287,6 +293,29 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         memory = torch.cat(projected_tokens, dim=1)
         position = _sinusoidal_position_embeddings(memory.shape[1], self.hidden_dim).to(device=memory.device, dtype=memory.dtype)
         return memory + position.unsqueeze(0)
+
+    def _build_memory_from_captured_features(
+        self,
+        captured_features: list[Tensor],
+        *,
+        batch_size: int,
+        frames: int,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        projected_tokens: list[Tensor] = []
+        for index, block_features in enumerate(captured_features):
+            pooled = _pool_video_encoder_features(block_features.to(dtype=dtype), batch_size=batch_size, frames=frames)
+            projection = self._require_memory_projection(index)
+            projected_tokens.append(projection(pooled))
+        memory = torch.cat(projected_tokens, dim=1)
+        position = _sinusoidal_position_embeddings(memory.shape[1], self.hidden_dim).to(device=memory.device, dtype=memory.dtype)
+        return memory + position.unsqueeze(0)
+
+    def _can_use_captured_features(self, cond: Mapping[str, object]) -> bool:
+        # The frozen base pass in AdaptedModel runs on raw cond. If adapter-only embeddings are present,
+        # captured features do not match HyperAlign conditioning and we must rebuild memory with adapter cond.
+        embedding = cond.get("embedding")
+        return not isinstance(embedding, Tensor)
 
     def _resolve_base_condition(self, cond: object | None) -> object | None:
         if isinstance(cond, dict) and "embedding" in cond:
@@ -425,6 +454,35 @@ def _prepare_hyperalign_adapter_embedding(
         adapter_embedding = rearrange(adapter_embedding, "b t c -> (b t) c")
         return condition_proj(adapter_embedding)
     raise ValueError("HyperAlign adapter_embedding must have rank 2 or 3.")
+
+
+class _HyperAlignInputFeatureStore:
+    def __init__(self) -> None:
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        self.input_activations: list[Tensor] = []
+
+    def attach(self, module: nn.Module) -> None:
+        self.clear_handles()
+
+        def capture_input(_module, _args, output):
+            if isinstance(output, Tensor):
+                self.input_activations.append(output.detach())
+
+        for block in module.input_blocks:
+            self._handles.append(block.register_forward_hook(capture_input))
+
+    def get(self, expected_count: int) -> list[Tensor] | None:
+        if expected_count <= 0 or len(self.input_activations) < expected_count:
+            return None
+        return self.input_activations[-expected_count:]
+
+    def clear(self) -> None:
+        self.input_activations = []
+
+    def clear_handles(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
 
 
 def _normalize_update_mode(update_mode: str) -> str:
