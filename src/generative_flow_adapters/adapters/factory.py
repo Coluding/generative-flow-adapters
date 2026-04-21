@@ -128,6 +128,8 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 hidden_dim=adapter.hidden_dim,
                 input_summary_dim=input_summary_dim,
                 use_base_output_summary=bool(adapter.extra.get("use_base_output_summary", False)),
+                include_step_size=bool(adapter.extra.get("include_step_size", conditioning.include_step_size)),
+                step_size_key=str(adapter.extra.get("step_size_key", conditioning.step_size_key)),
             )
         if architecture in {"hyperalign", "paper"}:
             if model.provider.lower() != "dynamicrafter":
@@ -151,6 +153,7 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
                 step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
                 step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                use_factorized_memory_position=bool(adapter.extra.get("use_factorized_memory_position", True)),
                 update_mode=str(adapter.extra.get("update_mode", "stepwise")),
                 piecewise_progress_markers=tuple(adapter.extra.get("piecewise_progress_markers", (0.0, 0.05, 0.20))),
             )

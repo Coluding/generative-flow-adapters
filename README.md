@@ -96,6 +96,12 @@ Run a short synthetic training smoke test:
 python examples/training_test.py --config configs/flow_output_shortcut.yaml --steps 3
 ```
 
+Run shortcut-consistency training with a hypernetwork (step-size-conditioned dynamic LoRA):
+
+```bash
+python examples/hyper_shortcut_training_test.py --config configs/flow_hyper_shortcut_stepwise.yaml --steps 3
+```
+
 ## Configuration shape
 
 ```yaml

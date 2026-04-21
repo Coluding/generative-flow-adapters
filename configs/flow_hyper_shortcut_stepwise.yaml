@@ -1,4 +1,4 @@
-name: diffusion_hyperalign_fake_action
+name: flow_hyper_shortcut_stepwise
 
 model:
   type: diffusion
@@ -19,6 +19,11 @@ adapter:
   hidden_dim: 128
   rank: 4
   alpha: 1.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
   extra:
     architecture: hyperalign
     aux_down_dim: 16
@@ -27,6 +32,8 @@ adapter:
     num_decoder_heads: 8
     update_mode: stepwise
     use_adapter_conditioning: true
+    include_step_size: true
+    step_size_key: step_size
 
 conditioning:
   type: structured
@@ -42,6 +49,6 @@ conditioning:
       encoder: mlp
 
 training:
-  loss: diffusion
+  loss: flow
   learning_rate: 1.0e-4
-  diffusion_timesteps: 1000
+  shortcut_direction_weight: 1.0

@@ -39,6 +39,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         use_step_level_conditioning: bool = False,
         step_level_key: str = "step_level",
         step_level_hidden_dim: int | None = None,
+        use_factorized_memory_position: bool = True,
         update_mode: str = "stepwise",
         piecewise_progress_markers: tuple[float, ...] = (0.0, 0.05, 0.20),
     ) -> None:
@@ -58,6 +59,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         self.use_step_level_conditioning = use_step_level_conditioning
         self.step_level_key = step_level_key
         self.step_level_hidden_dim = int(step_level_hidden_dim or (cond_hidden_dim or cond_dim or 128))
+        self.use_factorized_memory_position = bool(use_factorized_memory_position)
         self.update_mode = _normalize_update_mode(update_mode)
         self.piecewise_progress_markers = _normalize_piecewise_markers(piecewise_progress_markers)
 
@@ -197,7 +199,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
 
     def _resolve_hyper_factors(self, x_t: Tensor, t: Tensor, cond: object | None) -> tuple[Tensor, Tensor]:
         should_refresh, stage_index = self._should_refresh_hyper_factors(x_t=x_t, t=t)
-        if should_refresh:
+        if should_refresh: # Check whether recomputation of hypernetwork is necessary
             factor_tokens = self.build_hyper_input(x_t=x_t, t=t, cond=cond)
             hyper_down, hyper_up = self._split_hyper_factors(factor_tokens)
             self._cached_hyper_factors = (hyper_down, hyper_up)
@@ -282,17 +284,14 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         h = x_t.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, x_t.shape[1], x_t.shape[3], x_t.shape[4])
         h = h.type(getattr(module, "dtype", x_t.dtype))
         projected_tokens: list[Tensor] = []
-
+        # TODO: we should always use the precomputed features. As we are always doing a basemodel forward pass, the features are already present. Let's use them and not recompute them here
         with torch.no_grad():
             for index, block in enumerate(module.input_blocks):
                 h = block(h, emb, context=context, batch_size=batch_size)
                 pooled = _pool_video_encoder_features(h, batch_size=batch_size, frames=frames)
                 projection = self._require_memory_projection(index)
                 projected_tokens.append(projection(pooled))
-
-        memory = torch.cat(projected_tokens, dim=1)
-        position = _sinusoidal_position_embeddings(memory.shape[1], self.hidden_dim).to(device=memory.device, dtype=memory.dtype)
-        return memory + position.unsqueeze(0)
+        return self._compose_memory_tokens(projected_tokens)
 
     def _build_memory_from_captured_features(
         self,
@@ -307,9 +306,42 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
             pooled = _pool_video_encoder_features(block_features.to(dtype=dtype), batch_size=batch_size, frames=frames)
             projection = self._require_memory_projection(index)
             projected_tokens.append(projection(pooled))
-        memory = torch.cat(projected_tokens, dim=1)
-        position = _sinusoidal_position_embeddings(memory.shape[1], self.hidden_dim).to(device=memory.device, dtype=memory.dtype)
-        return memory + position.unsqueeze(0)
+        return self._compose_memory_tokens(projected_tokens)
+
+    def _compose_memory_tokens(self, projected_tokens: list[Tensor]) -> Tensor:
+        """Compose HyperAlign memory tokens with optional factorized positional encoding.
+
+        When `use_factorized_memory_position` is enabled, we treat memory as a 2D grid:
+        encoder-layer axis and video-frame axis. We then add
+        `layer_position[layer] + frame_position[frame]` before flattening, so tokens from the
+        same layer share the same layer identity and tokens at the same frame share the same
+        temporal identity. This avoids conflating layer and frame semantics into a single
+        flattened token index.
+        Why? Without it:
+        - Each block gives frames tokens after pooling/projection: [B, F, H].
+        - Concatenating all blocks gives [B, L*F, H].
+        - One sinusoidal table over length L*F assigns a unique position to every (layer, frame) token.
+         --> Tokens from the same layer get different positional vectors.
+        """
+        if not projected_tokens:
+            raise ValueError("HyperAlign requires at least one projected memory token tensor.")
+        memory_grid = torch.stack(projected_tokens, dim=1)
+        if self.use_factorized_memory_position:
+            num_layers = memory_grid.shape[1]
+            num_frames = memory_grid.shape[2]
+            layer_pos = _sinusoidal_position_embeddings(num_layers, self.hidden_dim).to(
+                device=memory_grid.device, dtype=memory_grid.dtype
+            )
+            frame_pos = _sinusoidal_position_embeddings(num_frames, self.hidden_dim).to(
+                device=memory_grid.device, dtype=memory_grid.dtype
+            )
+            memory_grid = memory_grid + layer_pos.unsqueeze(0).unsqueeze(2) + frame_pos.unsqueeze(0).unsqueeze(1)
+            return memory_grid.flatten(1, 2)
+        memory = memory_grid.flatten(1, 2)
+        flat_position = _sinusoidal_position_embeddings(memory.shape[1], self.hidden_dim).to(
+            device=memory.device, dtype=memory.dtype
+        )
+        return memory + flat_position.unsqueeze(0)
 
     def _can_use_captured_features(self, cond: Mapping[str, object]) -> bool:
         # The frozen base pass in AdaptedModel runs on raw cond. If adapter-only embeddings are present,

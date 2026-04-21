@@ -26,6 +26,8 @@ class SimpleHyperLoRAAdapter(HyperNetworkAdapterInterface):
         hidden_dim: int,
         input_summary_dim: int,
         use_base_output_summary: bool = False,
+        include_step_size: bool = False,
+        step_size_key: str = "step_size",
     ) -> None:
         super().__init__()
         self.rank = rank
@@ -35,6 +37,8 @@ class SimpleHyperLoRAAdapter(HyperNetworkAdapterInterface):
         self.hidden_dim = hidden_dim
         self.input_summary_dim = input_summary_dim
         self.use_base_output_summary = use_base_output_summary
+        self.include_step_size = include_step_size
+        self.step_size_key = step_size_key
 
         self.context = ContextProjector(cond_dim=cond_dim, hidden_dim=hidden_dim)
         self.input_summary = nn.Sequential(
@@ -47,6 +51,13 @@ class SimpleHyperLoRAAdapter(HyperNetworkAdapterInterface):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.step_size_proj: nn.Module | None = None
+        if self.include_step_size:
+            self.step_size_proj = nn.Sequential(
+                nn.Linear(1, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
 
         self._handles: list[LoRAHandle] = []
         self._module_heads = nn.ModuleDict()
@@ -76,6 +87,11 @@ class SimpleHyperLoRAAdapter(HyperNetworkAdapterInterface):
         base_output: Tensor | None = None,
     ) -> Tensor:
         context = self.context(t, resolve_condition_embedding(cond))
+        step_size = self._resolve_step_size(cond, device=x_t.device, dtype=x_t.dtype)
+        if step_size is not None:
+            if self.step_size_proj is None:
+                raise RuntimeError("Step-size conditioning is enabled but step_size_proj is not initialized.")
+            context = context + self.step_size_proj(step_size)
         summary_source = base_output if self.use_base_output_summary and base_output is not None else x_t
         pooled = _pool_reference(summary_source)
         pooled_features = self.input_summary(pooled)
@@ -120,6 +136,29 @@ class SimpleHyperLoRAAdapter(HyperNetworkAdapterInterface):
 
     def _key(self, qualified_name: str) -> str:
         return qualified_name.replace(".", "__")
+
+    def _resolve_step_size(self, cond: object | None, *, device: torch.device, dtype: torch.dtype) -> Tensor | None:
+        if not self.include_step_size:
+            return None
+        if not isinstance(cond, dict):
+            raise TypeError("Step-size-conditioned hypernetwork expects mapping conditions.")
+        step_size = cond.get(self.step_size_key)
+        if step_size is None and self.step_size_key != "horizon":
+            step_size = cond.get("horizon")
+        if not isinstance(step_size, Tensor):
+            raise KeyError(
+                f"Step-size-conditioned hypernetwork requires cond['{self.step_size_key}'] tensor"
+                " (or 'horizon' fallback)."
+            )
+        step_size = step_size.to(device=device, dtype=dtype)
+        if step_size.dim() == 1:
+            return step_size.unsqueeze(-1)
+        if step_size.dim() == 2:
+            if step_size.shape[-1] == 1:
+                return step_size
+            return step_size.mean(dim=-1, keepdim=True)
+        reduce_dims = tuple(range(1, step_size.dim()))
+        return step_size.mean(dim=reduce_dims, keepdim=True).reshape(step_size.shape[0], 1)
 
 
 class _LoRAParameterHead(nn.Module):

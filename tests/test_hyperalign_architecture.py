@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from generative_flow_adapters.adapters.hypernetworks.hyperalign import HyperAlignAdapter
+from generative_flow_adapters.adapters.hypernetworks.hyperalign import HyperAlignAdapter, _sinusoidal_position_embeddings
 from generative_flow_adapters.adapters.low_rank.common import PAPER_HYPERALIGN_TARGET_MODULES
 
 
@@ -207,6 +207,30 @@ class HyperAlignArchitectureTest(unittest.TestCase):
         self.assertTrue(any(name.endswith("to_out.0") for name in names))
         self.assertFalse(any(name.endswith("to_k") for name in names))
         self.assertFalse(any(name.endswith("to_v") for name in names))
+
+    def test_hyperalign_factorized_memory_position_is_layer_plus_frame(self):
+        adapter = _build_adapter()
+        adapter.use_factorized_memory_position = True
+
+        projected_tokens = [torch.zeros(1, 3, adapter.hidden_dim), torch.zeros(1, 3, adapter.hidden_dim)]
+        memory = adapter._compose_memory_tokens(projected_tokens).view(1, 2, 3, adapter.hidden_dim)
+
+        layer_pos = _sinusoidal_position_embeddings(2, adapter.hidden_dim).to(memory.device, memory.dtype)
+        frame_pos = _sinusoidal_position_embeddings(3, adapter.hidden_dim).to(memory.device, memory.dtype)
+
+        self.assertTrue(torch.allclose(memory[0, 0, 0], layer_pos[0] + frame_pos[0]))
+        self.assertTrue(torch.allclose(memory[0, 0, 2], layer_pos[0] + frame_pos[2]))
+        self.assertTrue(torch.allclose(memory[0, 1, 1], layer_pos[1] + frame_pos[1]))
+
+    def test_hyperalign_flat_memory_position_when_factorized_is_disabled(self):
+        adapter = _build_adapter()
+        adapter.use_factorized_memory_position = False
+
+        projected_tokens = [torch.zeros(1, 3, adapter.hidden_dim), torch.zeros(1, 3, adapter.hidden_dim)]
+        memory = adapter._compose_memory_tokens(projected_tokens)
+
+        flat_position = _sinusoidal_position_embeddings(memory.shape[1], adapter.hidden_dim).to(memory.device, memory.dtype)
+        self.assertTrue(torch.allclose(memory[0], flat_position))
 
 
 if __name__ == "__main__":
