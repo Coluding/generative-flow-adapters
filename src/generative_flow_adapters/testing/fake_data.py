@@ -68,6 +68,28 @@ def infer_fake_batch_spec(config: ExperimentConfig) -> FakeBatchSpec:
         config.training.local_consistency_weight > 0.0 or config.training.multistep_consistency_weight > 0.0
     )
 
+    if config.model.provider == "opensora":
+        # OpenSora uses flow matching with packed video latents
+        latent_channels = int(config.model.extra.get("in_channels", 64))
+        temporal_length = int(config.model.extra.get("num_frames", 17))
+        latent_height = int(config.model.extra.get("latent_height", 32))
+        latent_width = int(config.model.extra.get("latent_width", 32))
+        context_tokens = int(config.model.extra.get("context_tokens", 512))
+        context_dim = int(config.model.extra.get("context_in_dim", 4096))
+        clip_dim = int(config.model.extra.get("vec_in_dim", 768))
+        action_dim = config.conditioning.input_dim
+        return FakeBatchSpec(
+            x_shape=(latent_channels, temporal_length, latent_height, latent_width),
+            target_shape=(latent_channels, temporal_length, latent_height, latent_width),
+            cond_kind="opensora",
+            timestep_max=1,  # Flow matching uses [0, 1] range, not integer timesteps
+            include_shortcut_targets=include_shortcut_targets,
+            action_dim=action_dim,
+            context_shape=(context_tokens, context_dim),
+            modalities={"clip": clip_dim},
+            structured_conditions={spec.key: spec.input_dim for spec in config.conditioning.conditions} or None,
+        )
+
     if config.model.provider == "dynamicrafter":
         action_dim = int(config.conditioning.extra.get("action_dim", 7))
         context_tokens = int(config.conditioning.extra.get("context_tokens", 77))
@@ -109,6 +131,27 @@ def infer_fake_batch_spec(config: ExperimentConfig) -> FakeBatchSpec:
 def _build_condition(spec: FakeBatchSpec) -> Tensor | Mapping[str, Tensor] | None:
     if spec.cond_kind == "identity":
         return None
+
+    if spec.cond_kind == "opensora":
+        if spec.context_shape is None:
+            raise ValueError("OpenSora fake data requires a context_shape.")
+        latent_channels, temporal_length, latent_height, latent_width = spec.x_shape
+        # OpenSora conditioning structure
+        cond: dict[str, Tensor] = {
+            # T5 text embeddings
+            "txt": torch.randn(spec.context_shape),
+            # CLIP vector embedding
+            "y_vec": torch.randn(spec.modalities["clip"]) if spec.modalities and "clip" in spec.modalities else torch.randn(768),
+            # Guidance scale
+            "guidance": torch.tensor(7.5),
+        }
+        # Add structured conditions (e.g., action embeddings)
+        if spec.structured_conditions is not None:
+            for key, dim in spec.structured_conditions.items():
+                cond[key] = torch.randn(dim)
+        elif spec.action_dim is not None:
+            cond["action"] = torch.randn(spec.action_dim)
+        return cond
 
     if spec.cond_kind == "dynamicrafter":
         if spec.context_shape is None:

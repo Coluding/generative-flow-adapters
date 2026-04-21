@@ -1,0 +1,70 @@
+# OpenSora with Output Adapter (AVID-style)
+#
+# This config demonstrates using the Open-Sora MMDiT backbone with a simple output adapter.
+# The adapter learns to modify the base model's velocity prediction conditioned on actions.
+# Similar to AVID: combined_output = base_output + adapter_output
+#
+# Usage:
+#   python examples/opensora_fake_training.py --config configs/opensora_output_adapter.yaml
+
+name: opensora_output_adapter
+
+model:
+  type: flow  # Flow matching model
+  provider: opensora
+  prediction_type: velocity
+  freeze: true
+
+  # For real model, set this to checkpoint path:
+  # pretrained_model_name_or_path: ./ckpts/Open_Sora_v2.safetensors
+
+  extra:
+    # Use stub model for testing (set to false for real model)
+    use_stub: false
+
+    # Model architecture (smaller for testing with stub)
+    in_channels: 64
+    hidden_size: 256  # Reduced from 3072 for testing
+    num_heads: 4      # Reduced from 24 for testing
+    depth: 2          # Reduced from 19 for testing
+    depth_single_blocks: 2  # Reduced from 38 for testing
+    mlp_ratio: 4.0
+    patch_size: 2
+    axes_dim: [16, 24, 24]  # Must sum to hidden_size/num_heads = 64
+    theta: 10000
+
+    # Text encoder dimensions
+    vec_in_dim: 768
+    context_in_dim: 4096
+
+    # Model options
+    guidance_embed: true
+    cond_embed: true
+    fused_qkv: false
+    qkv_bias: true
+
+    # For fake data generation
+    num_frames: 17
+    latent_height: 32
+    latent_width: 32
+    context_tokens: 512
+
+adapter:
+  type: output
+  hidden_dim: 128
+  feature_dim: 64  # Must match in_channels
+
+  extra:
+    architecture: affine
+
+conditioning:
+  type: action
+  input_dim: 7
+  output_dim: 128
+  drop_condition_prob: 0.1
+
+training:
+  loss: flow_matching
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0

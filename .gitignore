@@ -8,4 +8,30 @@ dist/
 build/
 *.egg-info/
 
-external_repos
+# External repositories
+external_repos/
+
+# Model checkpoints and weights
+ckpts/
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# HuggingFace cache
+.cache/
+huggingface/
+
+# Experiment outputs
+outputs/
+samples/
+logs/
+wandb/
+tensorboard/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

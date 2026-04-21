@@ -8,6 +8,7 @@ from torch import Tensor, nn
 from generative_flow_adapters.config import TrainingConfig
 from generative_flow_adapters.inference import DiffusionInferenceSampler
 from generative_flow_adapters.losses.diffusion import DiffusionTrainingObjective
+from generative_flow_adapters.losses.flow_matching import FlowMatchingTrainingObjective
 from generative_flow_adapters.losses.registry import LossRegistry
 
 
@@ -39,6 +40,15 @@ class Trainer:
             prediction_type=getattr(model, "prediction_type", "noise"),
             scheduler_name=config.inference_scheduler,
         )
+        self.flow_objective = FlowMatchingTrainingObjective(
+            sigma_min=float(config.extra.get("flow_sigma_min", 1e-5)),
+            shift_schedule=bool(config.extra.get("flow_shift_schedule", True)),
+            base_shift=float(config.extra.get("flow_base_shift", 1.0)),
+            max_shift=float(config.extra.get("flow_max_shift", 3.0)),
+            shift_x1=float(config.extra.get("flow_shift_x1", 256.0)),
+            shift_x2=float(config.extra.get("flow_shift_x2", 4096.0)),
+            temporal_sqrt_scaling=bool(config.extra.get("flow_temporal_sqrt_scaling", True)),
+        )
 
     def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
         self.model.train()
@@ -69,11 +79,32 @@ class Trainer:
             loss = self.loss_fn(prediction, target_tensor)
         else:
             x_t = batch["x_t"]
-            t = batch["t"]
             if not isinstance(x_t, Tensor):
                 raise TypeError("batch['x_t'] must be a tensor.")
-            if not isinstance(t, Tensor):
-                raise TypeError("batch['t'] must be a tensor.")
+            t_value = batch.get("t")
+            use_batch_timesteps = bool(self.config.extra.get("use_batch_timesteps_for_flow", False))
+            if use_batch_timesteps:
+                if not isinstance(t_value, Tensor):
+                    raise TypeError("batch['t'] must be a tensor when use_batch_timesteps_for_flow=true.")
+                t = t_value.to(device=x_t.device, dtype=x_t.dtype)
+            else:
+                batch_size = x_t.shape[0]
+                patch_size = 2
+                base_model = getattr(self.model, "base_model", None)
+                if base_model is not None:
+                    patch_size = int(getattr(getattr(base_model, "config", None), "patch_size", patch_size))
+                height = int(x_t.shape[-2]) if x_t.dim() >= 4 else None
+                width = int(x_t.shape[-1]) if x_t.dim() >= 4 else None
+                num_frames = int(x_t.shape[-3]) if x_t.dim() >= 5 else 1
+                t = self.flow_objective.sample_timesteps(
+                    batch_size=batch_size,
+                    device=x_t.device,
+                    dtype=x_t.dtype,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    patch_size=patch_size,
+                )
             prediction = self.model(x_t, t, batch.get("cond"))
             loss = self.loss_fn(prediction, target)
 
