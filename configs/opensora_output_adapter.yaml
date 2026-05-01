@@ -22,8 +22,11 @@ model:
     # Use stub model for testing (set to false for real model)
     use_stub: false
 
-    # Model architecture (smaller for testing with stub)
+    # Model architecture (smaller for testing)
+    # in_channels is the PACKED dimension = latent_channels * patch_size^2
+    # For 16 raw latent channels and patch_size=2: 16 * 4 = 64
     in_channels: 64
+    latent_channels: 16  # Raw VAE latent channels (before packing)
     hidden_size: 256  # Reduced from 3072 for testing
     num_heads: 4      # Reduced from 24 for testing
     depth: 2          # Reduced from 19 for testing
@@ -39,7 +42,7 @@ model:
 
     # Model options
     guidance_embed: true
-    cond_embed: true
+    cond_embed: false  # Set to false for simpler testing
     fused_qkv: false
     qkv_bias: true
 
@@ -52,7 +55,7 @@ model:
 adapter:
   type: output
   hidden_dim: 128
-  feature_dim: 64  # Must match in_channels
+  feature_dim: 16  # Must match latent_channels (raw VAE output)
 
   extra:
     architecture: affine

@@ -1,0 +1,260 @@
+{
+  "version": "1.0.0",
+  "installedAt": "2026-05-01T09:34:21.892Z",
+  "skills": [
+    {
+      "category": "06-post-training",
+      "skill": "grpo-rl-training",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "miles",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "openrlhf",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "simpo",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "slime",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "torchforge",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "trl-fine-tuning",
+      "standalone": false
+    },
+    {
+      "category": "06-post-training",
+      "skill": "verl",
+      "standalone": false
+    },
+    {
+      "category": "03-fine-tuning",
+      "skill": "axolotl",
+      "standalone": false
+    },
+    {
+      "category": "03-fine-tuning",
+      "skill": "llama-factory",
+      "standalone": false
+    },
+    {
+      "category": "03-fine-tuning",
+      "skill": "peft",
+      "standalone": false
+    },
+    {
+      "category": "03-fine-tuning",
+      "skill": "unsloth",
+      "standalone": false
+    },
+    {
+      "category": "12-inference-serving",
+      "skill": "llama-cpp",
+      "standalone": false
+    },
+    {
+      "category": "12-inference-serving",
+      "skill": "sglang",
+      "standalone": false
+    },
+    {
+      "category": "12-inference-serving",
+      "skill": "tensorrt-llm",
+      "standalone": false
+    },
+    {
+      "category": "12-inference-serving",
+      "skill": "vllm",
+      "standalone": false
+    },
+    {
+      "category": "08-distributed-training",
+      "skill": "accelerate",
+      "standalone": false
+    },
+    {
+      "category": "08-distributed-training",
+      "skill": "deepspeed",
+      "standalone": false
+    },
+    {
+      "category": "08-distributed-training",
+      "skill": "megatron-core",
+      "standalone": false
+    },
+    {
+      "category": "08-distributed-training",
+      "skill": "pytorch-fsdp2",
+      "standalone": false
+    },
+    {
+      "category": "08-distributed-training",
+      "skill": "pytorch-lightning",
+      "standalone": false
+    },
+    {
+      "category": "08-distributed-training",
+      "skill": "ray-train",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "awq",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "bitsandbytes",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "flash-attention",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "gguf",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "gptq",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "hqq",
+      "standalone": false
+    },
+    {
+      "category": "10-optimization",
+      "skill": "ml-training-recipes",
+      "standalone": false
+    },
+    {
+      "category": "13-mlops",
+      "skill": "mlflow",
+      "standalone": false
+    },
+    {
+      "category": "13-mlops",
+      "skill": "swanlab",
+      "standalone": false
+    },
+    {
+      "category": "13-mlops",
+      "skill": "tensorboard",
+      "standalone": false
+    },
+    {
+      "category": "13-mlops",
+      "skill": "weights-and-biases",
+      "standalone": false
+    },
+    {
+      "category": "11-evaluation",
+      "skill": "bigcode-evaluation-harness",
+      "standalone": false
+    },
+    {
+      "category": "11-evaluation",
+      "skill": "lm-evaluation-harness",
+      "standalone": false
+    },
+    {
+      "category": "11-evaluation",
+      "skill": "nemo-evaluator",
+      "standalone": false
+    },
+    {
+      "category": "16-prompt-engineering",
+      "skill": "dspy",
+      "standalone": false
+    },
+    {
+      "category": "16-prompt-engineering",
+      "skill": "guidance",
+      "standalone": false
+    },
+    {
+      "category": "16-prompt-engineering",
+      "skill": "instructor",
+      "standalone": false
+    },
+    {
+      "category": "16-prompt-engineering",
+      "skill": "outlines",
+      "standalone": false
+    },
+    {
+      "category": "15-rag",
+      "skill": "chroma",
+      "standalone": false
+    },
+    {
+      "category": "15-rag",
+      "skill": "faiss",
+      "standalone": false
+    },
+    {
+      "category": "15-rag",
+      "skill": "pinecone",
+      "standalone": false
+    },
+    {
+      "category": "15-rag",
+      "skill": "qdrant",
+      "standalone": false
+    },
+    {
+      "category": "15-rag",
+      "skill": "sentence-transformers",
+      "standalone": false
+    },
+    {
+      "category": "20-ml-paper-writing",
+      "skill": "academic-plotting",
+      "standalone": false
+    },
+    {
+      "category": "20-ml-paper-writing",
+      "skill": "ml-paper-writing",
+      "standalone": false
+    },
+    {
+      "category": "20-ml-paper-writing",
+      "skill": "presenting-conference-talks",
+      "standalone": false
+    },
+    {
+      "category": "20-ml-paper-writing",
+      "skill": "systems-paper-writing",
+      "standalone": false
+    },
+    {
+      "category": "0-autoresearch-skill",
+      "skill": "0-autoresearch-skill",
+      "standalone": true
+    }
+  ],
+  "agents": [
+    "claude",
+    "codex"
+  ]
+}

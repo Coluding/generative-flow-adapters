@@ -70,7 +70,9 @@ def infer_fake_batch_spec(config: ExperimentConfig) -> FakeBatchSpec:
 
     if config.model.provider == "opensora":
         # OpenSora uses flow matching with packed video latents
-        latent_channels = int(config.model.extra.get("in_channels", 64))
+        # latent_channels is the raw VAE output channels (before packing)
+        # in_channels is the packed dimension = latent_channels * patch_size^2
+        latent_channels = int(config.model.extra.get("latent_channels", 16))
         temporal_length = int(config.model.extra.get("num_frames", 17))
         latent_height = int(config.model.extra.get("latent_height", 32))
         latent_width = int(config.model.extra.get("latent_width", 32))

@@ -12,7 +12,6 @@ Key features:
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -151,20 +150,14 @@ class OpenSoraModelWrapper(BaseGenerativeModel):
     ) -> nn.Module:
         """Build the MMDiT model from config.
 
-        This requires the Open-Sora repository to be available in the path.
+        Uses the vendored MMDiT implementation from this package.
         """
-        try:
-            from opensora.models.mmdit.model import MMDiTConfig, MMDiTModel
-        except ImportError as e:
-            raise ImportError(
-                "Could not import Open-Sora. Make sure the Open-Sora repository "
-                "is installed or added to sys.path. "
-                "Try: pip install -e external_repos/Open-Sora"
-            ) from e
+        from generative_flow_adapters.backbones.opensora.mmdit import (
+            MMDiTConfig,
+            MMDiTModel,
+        )
 
         mmdit_config = MMDiTConfig(
-            from_pretrained="",
-            cache_dir="",
             in_channels=config.in_channels,
             vec_in_dim=config.vec_in_dim,
             context_in_dim=config.context_in_dim,
