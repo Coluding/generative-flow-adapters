@@ -1,3 +1,9 @@
+"""Shortcut target computation for accelerated diffusion/flow matching training.
+
+This module provides utilities for computing shortcut targets from a frozen base model,
+which can be used to train adapter models to predict multi-step trajectories in a single step.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -69,7 +75,11 @@ def _compute_linear_shortcut_target(
     step_size: Tensor,
     normalize_base_direction: bool,
 ) -> Tensor:
-    """Linear scaling method: target = base_output * step_size."""
+    """Linear scaling method: target = base_output * step_size.
+
+    This is a fast approximation that requires only a single forward pass through
+    the base model. Optionally normalizes the direction for 2D outputs.
+    """
     with torch.no_grad():
         base_output = base_model(x_t, t, cond=cond)
 
@@ -95,6 +105,8 @@ def _compute_two_step_shortcut_target(
         2. x_t2 = x_t + step_size * v_b1
         3. v_b2 = model(x_t2, t, cond)  # Use same t (simplified)
         4. target = (v_b1 + v_b2) / 2
+
+    This method is more accurate but requires two forward passes through the base model.
     """
     with torch.no_grad():
         # First prediction
@@ -121,6 +133,7 @@ def _resolve_step_size(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
+    """Extract step size from conditioning or return default ones."""
     if isinstance(cond, Mapping):
         step_size = cond.get(step_size_key)
         if step_size is None and step_size_key != "horizon":
@@ -131,6 +144,7 @@ def _resolve_step_size(
 
 
 def _as_tensor(batch: Mapping[str, Tensor | object], key: str) -> Tensor:
+    """Extract tensor from batch and validate type."""
     value = batch.get(key)
     if not isinstance(value, Tensor):
         raise TypeError(f"batch['{key}'] must be a tensor.")
@@ -138,6 +152,7 @@ def _as_tensor(batch: Mapping[str, Tensor | object], key: str) -> Tensor:
 
 
 def _reshape_step_size_for_base(step_size: Tensor, base_direction: Tensor) -> Tensor:
+    """Reshape step_size tensor to match base_direction dimensions for broadcasting."""
     if base_direction.dim() == 2:
         if step_size.dim() == 1:
             return step_size.unsqueeze(-1)

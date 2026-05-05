@@ -7,7 +7,7 @@ model:
     rescale_betas_zero_snr: false
     unet_config:
       params:
-        in_channels: 4
+        in_channels: 8  # 4 (latent) + 4 (concat conditioning)
         model_channels: 32
         out_channels: 4
         num_res_blocks: 1

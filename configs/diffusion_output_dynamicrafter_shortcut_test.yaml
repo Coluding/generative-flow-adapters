@@ -3,7 +3,7 @@ name: diffusion_output_dynamicrafter_shortcut_test
 model:
   type: diffusion
   provider: dynamicrafter
-  prediction_type: velocity
+  prediction_type: noise
   pretrained_model_name_or_path: external_repos/avid/latent_diffusion/dynamicrafter_512/model.ckpt
   freeze: true
   pass_cond_to_base: true

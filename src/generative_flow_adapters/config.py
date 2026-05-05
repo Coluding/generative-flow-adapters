@@ -65,6 +65,7 @@ class TrainingConfig:
     shortcut_direction_weight: float = 0.0
     local_consistency_weight: float = 0.0
     multistep_consistency_weight: float = 0.0
+    shortcut_target_method: str = "linear"  # "linear" or "two_step"
     grad_clip_norm: float | None = None
     diffusion_timesteps: int = 1000
     diffusion_beta_schedule: str = "linear"

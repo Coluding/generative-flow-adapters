@@ -3,9 +3,8 @@ from __future__ import annotations
 import argparse
 
 from generative_flow_adapters.config import load_config
-from generative_flow_adapters.testing import attach_shortcut_targets_from_base, build_fake_dataloader
-from generative_flow_adapters.training.builders import build_experiment
-from generative_flow_adapters.training.trainer import Trainer
+from generative_flow_adapters.testing import build_fake_dataloader
+from generative_flow_adapters.training import Trainer, attach_shortcut_targets_from_base, build_experiment
 
 
 def main() -> None:
@@ -36,6 +35,7 @@ def main() -> None:
             batch,
             step_size_key=config.conditioning.step_size_key,
             normalize_base_direction=bool(config.conditioning.extra.get("normalize_base_direction", True)),
+            method=config.training.shortcut_target_method,
         )
         metrics = trainer.training_step(batch)
         print(

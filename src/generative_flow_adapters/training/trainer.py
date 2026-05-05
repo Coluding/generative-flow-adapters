@@ -75,7 +75,7 @@ class Trainer:
                 x_t=x_t,
                 t=t,
                 noise=noise,
-            )
+            ) ## Very important. We can predict either noise, starting data point or velocity. Velocity is a combination of the first two.
             loss = self.loss_fn(prediction, target_tensor)
         else:
             x_t = batch["x_t"]
