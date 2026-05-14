@@ -137,6 +137,7 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
             aux_down_dim = int(adapter.extra.get("aux_down_dim", 16))
             aux_up_dim = int(adapter.extra.get("aux_up_dim", 16))
             target_modules = tuple(adapter.extra.get("target_modules", PAPER_HYPERALIGN_TARGET_MODULES))
+            output_channels = adapter.extra.get("output_channels", model.extra.get("latent_channels"))
             return HyperAlignAdapter(
                 rank=adapter.rank,
                 alpha=adapter.alpha,
@@ -158,6 +159,9 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 condition_injection_mode=str(adapter.extra.get("condition_injection_mode", "memory_tokens")),
                 condition_input_dim=adapter.extra.get("condition_input_dim"),
                 condition_cross_attention_heads=int(adapter.extra.get("condition_cross_attention_heads", 4)),
+                output_composition=adapter.composition,
+                mask_mix_gate_kind=str(adapter.extra.get("mask_mix_gate_kind", "channel")),
+                output_channels=output_channels,
             )
         raise ValueError(f"Unsupported hypernetwork adapter architecture: {architecture}")
     if adapter_type == "lora":

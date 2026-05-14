@@ -36,6 +36,7 @@ def build_base_model(config: ModelConfig):
             strict_checkpoint=bool(config.extra.get("strict_checkpoint", False)),
             allow_missing_checkpoint=bool(config.extra.get("allow_missing_checkpoint", False)),
             allow_dummy_concat_condition=bool(config.extra.get("allow_dummy_concat_condition", False)),
+            load_first_stage_model=bool(config.extra.get("load_first_stage_model", False)),
         )
     elif provider == "opensora":
         model = _build_opensora_model(config)

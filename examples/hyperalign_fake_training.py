@@ -43,7 +43,13 @@ def main() -> None:
     torch.manual_seed(args.seed)
     config = load_config(args.config)
     experiment = build_experiment(config)
-    trainer = Trainer(experiment.model, experiment.optimizer, experiment.loss_fn, config.training)
+    trainer = Trainer(
+        experiment.model,
+        experiment.optimizer,
+        experiment.loss_fn,
+        config.training,
+        video_logger=experiment.video_logger,
+    )
 
     print(f"experiment={config.name}")
     print(f"provider={config.model.provider}")

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Mapping
 
 import torch
@@ -172,7 +171,38 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
             queries = self._inject_condition_via_cross_attention(queries, condition_tokens)
         decoded = decoder(tgt=queries, memory=memory)
         factor_head = self._require_factor_head()
-        return factor_head(decoded)
+        factor_tokens = factor_head(decoded)
+        # Compute the mask-mix gate while we have `decoded` and the captured base
+        # features in hand; cache it alongside the factors so forward() can pick
+        # it up without recomputation under stepwise/initial/piecewise modes.
+        self._cached_gate = self._compute_gate(decoded=decoded, x_t=x_t) if self.output_composition == "mask_mix" else None
+        return factor_tokens
+
+    def _compute_gate(self, *, decoded: Tensor, x_t: Tensor) -> Tensor:
+        batch_size, _, frames, height, width = x_t.shape
+        if self.mask_mix_gate_kind == "channel":
+            if self._gate_head_channel is None:
+                raise RuntimeError("Channel gate head was not initialized.")
+            pooled = decoded.mean(dim=1)
+            gate = self._gate_head_channel(pooled.to(dtype=self._gate_head_channel.weight.dtype))
+            return gate.view(batch_size, self.output_channels or gate.shape[-1], 1, 1, 1).to(dtype=x_t.dtype)
+        if self._gate_head_spatial is None:
+            raise RuntimeError("Spatial gate head was not initialized.")
+        expected_blocks = len(self._memory_projections) if self._memory_projections is not None else 0
+        captured = self._feature_store.get(expected_count=expected_blocks)
+        if captured is None or not captured:
+            raise RuntimeError(
+                "Spatial mask-mix gate requires captured base features from the frozen base pass."
+            )
+        shallow = captured[0].to(dtype=self._gate_head_spatial.weight.dtype)
+        gate_flat = self._gate_head_spatial(shallow)
+        if gate_flat.shape[-2:] != (height, width):
+            gate_flat = nn.functional.interpolate(
+                gate_flat, size=(height, width), mode="bilinear", align_corners=False
+            )
+        channels = self.output_channels or gate_flat.shape[1]
+        gate = gate_flat.view(batch_size, frames, channels, height, width)
+        return gate.permute(0, 2, 1, 3, 4).contiguous().to(dtype=x_t.dtype)
 
     def _prepare_runtime_cond(self, cond: object | None, *, x_t: Tensor) -> object | None:
         if not isinstance(cond, Mapping):
@@ -224,14 +254,21 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         t: Tensor,
         cond: object | None,
         base_output: Tensor | None = None,
-    ) -> Tensor:
+    ) -> Tensor | OutputAdapterResult:
         if self.base_model is None:
             raise RuntimeError("HyperAlignAdapter must be attached to a base model before use.")
 
+        # Clear any LoRA factors left over from a previous step so the
+        # reference pass (and any base-model call that happens before we
+        # explicitly set fresh factors below) runs on the unmodified frozen
+        # weights. We deliberately do NOT clear at the end of forward — the
+        # factors must remain set through backward so that gradient
+        # checkpointing's recomputation produces the same graph as the
+        # original forward.
+        self.clear_dynamic_parameters()
         reference = base_output if base_output is not None else self.base_model(x_t, t, cond=self._resolve_base_condition(cond))
         hyper_down, hyper_up = self._resolve_hyper_factors(x_t=x_t, t=t, cond=cond)
 
-        self.clear_dynamic_parameters()
         for index, handle in enumerate(self._handles):
             handle.wrapped.set_dynamic_hyper_factors(
                 down_hyper=hyper_down[:, index, :, :],
@@ -239,16 +276,19 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
                 alpha=self.alpha,
             )
 
-        with self._dynamic_enabled():
-            adapted = self.base_model(x_t, t, cond=self._resolve_base_condition(cond))
-        return adapted - reference
+        adapted = self.base_model(x_t, t, cond=self._resolve_base_condition(cond))
 
-    @contextmanager
-    def _dynamic_enabled(self):
-        try:
-            yield
-        finally:
-            self.clear_dynamic_parameters()
+        if self.output_composition == "add":
+            return adapted - reference
+        if self.output_composition == "replace":
+            return OutputAdapterResult(adapter_output=adapted, output_kind="prediction")
+        gate = self._cached_gate
+        if gate is None:
+            raise RuntimeError(
+                "Mask-mix composition requires a cached gate from build_hyper_input; "
+                "ensure _resolve_hyper_factors ran before forward returned."
+            )
+        return OutputAdapterResult(adapter_output=adapted, output_kind="prediction", gate=gate)
 
     def _prepare_architecture(self) -> None:
         if self._prepared:

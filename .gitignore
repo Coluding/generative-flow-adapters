@@ -36,4 +36,4 @@ tensorboard/
 *.swp
 *.swo
 
-data/
+ds/

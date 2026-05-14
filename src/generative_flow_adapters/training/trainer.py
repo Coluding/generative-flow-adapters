@@ -19,11 +19,13 @@ class Trainer:
         optimizer: torch.optim.Optimizer,
         loss_fn,
         config: TrainingConfig,
+        wandb_logger: object | None = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.config = config
+        self.wandb_logger = wandb_logger
         self.global_step = 0
         diffusion_schedule = getattr(model, "diffusion_schedule_config", None) or {}
         self.diffusion_objective = DiffusionTrainingObjective(
@@ -40,6 +42,20 @@ class Trainer:
             prediction_type=getattr(model, "prediction_type", "noise"),
             scheduler_name=config.inference_scheduler,
         )
+        # Second sampler that points at the frozen base model only. Used at
+        # eval time to produce a "no-adapter" baseline rollout from the same
+        # starting noise as the adapted rollout — makes the visual difference
+        # exactly attributable to the adapter rather than to noise drift.
+        base_model = getattr(model, "base_model", None)
+        if self.wandb_logger is not None and base_model is not None:
+            self.base_inference_sampler = DiffusionInferenceSampler(
+                model=base_model,
+                objective=self.diffusion_objective,
+                prediction_type=getattr(base_model, "prediction_type", "noise"),
+                scheduler_name=config.inference_scheduler,
+            )
+        else:
+            self.base_inference_sampler = None
         self.flow_objective = FlowMatchingTrainingObjective(
             sigma_min=float(config.extra.get("flow_sigma_min", 1e-5)),
             shift_schedule=bool(config.extra.get("flow_shift_schedule", True)),
@@ -165,4 +181,45 @@ class Trainer:
             return None
         if self.global_step % self.config.inference_every_n_steps != 0:
             return None
-        return self.generate_samples(batch=batch, num_inference_steps=self.config.inference_num_steps)
+
+        target = batch.get("target")
+        steps = self.config.inference_num_steps
+        if self.wandb_logger is not None and self.base_inference_sampler is not None and isinstance(target, Tensor):
+            shared_noise = torch.randn_like(target)
+            adapted_samples = self.inference_sampler.sample_from_batch(
+                batch=batch, num_inference_steps=steps, initial_sample=shared_noise
+            )
+            base_cond = _strip_adapter_only_keys(batch.get("cond"))
+            base_batch = {"target": target, "cond": base_cond}
+            base_samples = self.base_inference_sampler.sample_from_batch(
+                batch=base_batch, num_inference_steps=steps, initial_sample=shared_noise
+            )
+            self.wandb_logger.log(
+                prediction_latents=adapted_samples,
+                base_prediction_latents=base_samples,
+                target_latents=target,
+                cond=batch.get("cond"),
+                step=self.global_step,
+            )
+            return adapted_samples
+
+        samples = self.generate_samples(batch=batch, num_inference_steps=steps)
+        if self.wandb_logger is not None and isinstance(target, Tensor):
+            self.wandb_logger.log(
+                prediction_latents=samples,
+                target_latents=target,
+                cond=batch.get("cond"),
+                step=self.global_step,
+            )
+        return samples
+
+
+def _strip_adapter_only_keys(cond: object | None) -> object | None:
+    if not isinstance(cond, Mapping):
+        return cond
+    stripped = dict(cond)
+    # The condition encoder's output lives under "embedding"; the frozen base
+    # was never trained to consume it, so feeding it to the base-only rollout
+    # would be at best ignored and at worst confusing for downstream hooks.
+    stripped.pop("embedding", None)
+    return stripped

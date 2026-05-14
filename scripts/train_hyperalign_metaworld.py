@@ -56,7 +56,7 @@ def trainable_parameter_count(model: torch.nn.Module) -> tuple[int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/diffusion_hyperalign_metaworld.yaml")
-    parser.add_argument("--hdf5", default="data/metaworld_corner2.hdf5")
+    parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -67,7 +67,7 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument(
         "--vae-checkpoint",
-        default=None,
+        default="ckts/dynami512.ckpt",
         help="Path to a DynamiCrafter / SD VAE checkpoint. Without it, the VAE is random-init (smoke run).",
     )
     parser.add_argument("--uncond-prob", type=float, default=0.05, help="CFG dropout probability per branch.")
@@ -93,10 +93,10 @@ def main() -> None:
     device = torch.device(args.device)
 
     config = load_config(args.config)
-    config.model.extra.setdefault("allow_dummy_concat_condition", True)
+    config.model.extra.setdefault("allow_dummy_concat_condition", False)
     checkpoint_path = config.model.pretrained_model_name_or_path
     if checkpoint_path and not Path(checkpoint_path).exists():
-        config.model.extra.setdefault("allow_missing_checkpoint", True)
+        config.model.extra.setdefault("allow_missing_checkpoint", False)
 
     temporal_length = int(config.model.extra.get("temporal_length", 8))
     context_tokens = int(config.conditioning.extra.get("context_tokens", 77))
@@ -111,7 +111,7 @@ def main() -> None:
     if args.vae_checkpoint is not None:
         if not Path(args.vae_checkpoint).exists():
             raise FileNotFoundError(f"VAE checkpoint not found: {args.vae_checkpoint}")
-        loaded_keys = vae.load_dynamicrafter_checkpoint(args.vae_checkpoint, strict=False)
+        loaded_keys = vae.load_dynamicrafter_checkpoint(args.vae_checkpoint, strict=True)
         vae_status = f"loaded {len(loaded_keys)} tensors from {args.vae_checkpoint}"
     for parameter in vae.parameters():
         parameter.requires_grad_(False)

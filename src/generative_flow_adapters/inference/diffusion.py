@@ -27,6 +27,7 @@ class DiffusionInferenceSampler:
         self,
         batch: Mapping[str, Tensor | object],
         num_inference_steps: int = 50,
+        initial_sample: Tensor | None = None,
     ) -> Tensor:
         target = batch.get("target")
         if not isinstance(target, Tensor):
@@ -37,6 +38,7 @@ class DiffusionInferenceSampler:
             device=target.device,
             dtype=target.dtype,
             num_inference_steps=num_inference_steps,
+            initial_sample=initial_sample,
         )
 
     def sample(
@@ -47,9 +49,17 @@ class DiffusionInferenceSampler:
         device: torch.device,
         dtype: torch.dtype,
         num_inference_steps: int = 50,
+        initial_sample: Tensor | None = None,
     ) -> Tensor:
         scheduler = self._build_scheduler()
-        sample = torch.randn(shape, device=device, dtype=dtype)
+        if initial_sample is not None:
+            if tuple(initial_sample.shape) != tuple(shape):
+                raise ValueError(
+                    f"initial_sample shape {tuple(initial_sample.shape)} does not match target {tuple(shape)}."
+                )
+            sample = initial_sample.to(device=device, dtype=dtype)
+        else:
+            sample = torch.randn(shape, device=device, dtype=dtype)
         scheduler.set_timesteps(num_inference_steps, device=device)
 
         was_training = self.model.training

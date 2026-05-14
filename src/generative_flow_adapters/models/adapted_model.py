@@ -57,6 +57,13 @@ class AdaptedModel(nn.Module):
         encoded_cond = self.condition_encoder(cond, drop_mask=drop_mask) if self.condition_encoder is not None else cond
         if hasattr(self.adapter, "clear_captured_base_features"):
             self.adapter.clear_captured_base_features()
+        # Some adapters (e.g. HyperAlign) inject dynamic LoRA weights into the
+        # base model and intentionally leave them set across forward+backward
+        # so that gradient checkpointing's recomputation matches the original
+        # forward. Clear before our frozen reference pass so it sees the
+        # unmodified base.
+        if hasattr(self.adapter, "clear_dynamic_parameters"):
+            self.adapter.clear_dynamic_parameters()
         with torch.no_grad():
             base_output = self.base_model(x_t, t, cond=cond)
         base_direction = self._build_base_direction(base_output)

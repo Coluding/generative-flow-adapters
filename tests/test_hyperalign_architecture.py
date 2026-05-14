@@ -8,6 +8,8 @@ from torch import nn
 
 from generative_flow_adapters.adapters.hypernetworks.hyperalign import HyperAlignAdapter, _sinusoidal_position_embeddings
 from generative_flow_adapters.adapters.low_rank.common import PAPER_HYPERALIGN_TARGET_MODULES
+from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
+from generative_flow_adapters.models.adapted_model import AdaptedModel
 
 
 class FakeInputBlock(nn.Module):
@@ -83,13 +85,17 @@ class FakeBaseModel(nn.Module):
         return self.module(x_t, timesteps=t, context=cond["context"], act=cond.get("act"), fs=cond.get("fs"))
 
 
-def _build_adapter(
+def _build_unattached_adapter(
     update_mode: str = "stepwise",
     *,
     cond_dim: int = 12,
     use_step_level_conditioning: bool = False,
+    output_composition: str = "add",
+    mask_mix_gate_kind: str = "channel",
+    output_channels: int | None = 4,
+    condition_injection_mode: str = "memory_tokens",
 ) -> HyperAlignAdapter:
-    adapter = HyperAlignAdapter(
+    return HyperAlignAdapter(
         rank=4,
         alpha=1.0,
         target_modules=list(PAPER_HYPERALIGN_TARGET_MODULES),
@@ -103,7 +109,15 @@ def _build_adapter(
         use_step_level_conditioning=use_step_level_conditioning,
         update_mode=update_mode,
         piecewise_progress_markers=(0.0, 0.2),
+        condition_injection_mode=condition_injection_mode,
+        output_composition=output_composition,
+        mask_mix_gate_kind=mask_mix_gate_kind,
+        output_channels=output_channels,
     )
+
+
+def _build_adapter(**kwargs) -> HyperAlignAdapter:
+    adapter = _build_unattached_adapter(**kwargs)
     adapter.attach_base_model(FakeBaseModel())
     return adapter
 
@@ -231,6 +245,160 @@ class HyperAlignArchitectureTest(unittest.TestCase):
 
         flat_position = _sinusoidal_position_embeddings(memory.shape[1], adapter.hidden_dim).to(memory.device, memory.dtype)
         self.assertTrue(torch.allclose(memory[0], flat_position))
+
+
+class HyperAlignCompositionTest(unittest.TestCase):
+    """The adapter must return the right type/shape per composition mode and
+    play correctly with AdaptedModel's _compose so that mask-mix actually
+    blends base and adapted via a learned gate."""
+
+    def test_add_composition_returns_residual_tensor(self):
+        adapter = _build_adapter(output_composition="add")
+        x_t, cond = _build_inputs()
+        t = torch.full((2,), 999, dtype=torch.long)
+
+        result = adapter(x_t, t, cond)
+
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertEqual(tuple(result.shape), tuple(x_t.shape))
+
+    def test_replace_composition_returns_full_prediction(self):
+        adapter = _build_adapter(output_composition="replace")
+        x_t, cond = _build_inputs()
+        t = torch.full((2,), 999, dtype=torch.long)
+
+        result = adapter(x_t, t, cond)
+
+        self.assertIsInstance(result, OutputAdapterResult)
+        self.assertEqual(result.output_kind, "prediction")
+        self.assertIsNone(result.gate)
+        self.assertEqual(tuple(result.adapter_output.shape), tuple(x_t.shape))
+
+    def test_mask_mix_channel_gate_has_per_channel_shape(self):
+        adapter = _build_adapter(output_composition="mask_mix", mask_mix_gate_kind="channel", output_channels=4)
+        x_t, cond = _build_inputs()
+        t = torch.full((2,), 999, dtype=torch.long)
+
+        result = adapter(x_t, t, cond)
+
+        self.assertIsInstance(result, OutputAdapterResult)
+        self.assertEqual(result.output_kind, "prediction")
+        self.assertIsNotNone(result.gate)
+        # Channel gate: [B, C, 1, 1, 1] — broadcasts over T, H, W.
+        self.assertEqual(tuple(result.gate.shape), (x_t.shape[0], x_t.shape[1], 1, 1, 1))
+
+    def test_mask_mix_spatial_gate_has_full_video_shape(self):
+        adapter = _build_adapter(output_composition="mask_mix", mask_mix_gate_kind="spatial", output_channels=4)
+        x_t, cond = _build_inputs()
+        t = torch.full((2,), 999, dtype=torch.long)
+
+        result = adapter(x_t, t, cond)
+
+        self.assertIsInstance(result, OutputAdapterResult)
+        self.assertIsNotNone(result.gate)
+        # Spatial gate: [B, C, T, H, W] — fully expressive per element.
+        self.assertEqual(tuple(result.gate.shape), tuple(x_t.shape))
+
+    def test_mask_mix_gate_initialized_to_zero(self):
+        # Gate heads start at zero so sigmoid(gate) = 0.5 (neutral mix). This
+        # is important because the LoRA up_aux also starts at zero, meaning
+        # adapted ≈ base at init; a neutral gate then leaves the prediction
+        # ≈ base and training can take over from there.
+        adapter = _build_adapter(output_composition="mask_mix", mask_mix_gate_kind="channel", output_channels=4)
+        x_t, cond = _build_inputs()
+        result = adapter(x_t, torch.full((2,), 999, dtype=torch.long), cond)
+        self.assertTrue(torch.allclose(result.gate, torch.zeros_like(result.gate)))
+
+    def test_adapted_model_blends_base_and_adapted_under_mask_mix(self):
+        adapter = _build_unattached_adapter(output_composition="mask_mix", mask_mix_gate_kind="channel", output_channels=4)
+        model = AdaptedModel(base_model=FakeBaseModel(), adapter=adapter, output_composition="mask_mix")
+        x_t, cond = _build_inputs()
+        t = torch.full((2,), 999, dtype=torch.long)
+
+        prediction = model(x_t, t, cond)
+        self.assertEqual(tuple(prediction.shape), tuple(x_t.shape))
+        # Backward must run cleanly all the way through the gate head.
+        prediction.sum().backward()
+
+    def test_backward_succeeds_for_all_composition_modes(self):
+        # Catches regressions in the dynamic-LoRA cleanup ordering. If
+        # factors are cleared too early the FakeBaseModel still works (no
+        # gradient checkpointing), but the loss should still flow back
+        # cleanly through one full step.
+        x_t, cond = _build_inputs()
+        t = torch.full((2,), 999, dtype=torch.long)
+        target = torch.randn_like(x_t)
+
+        for composition, gate_kind in [("add", "channel"), ("replace", "channel"),
+                                        ("mask_mix", "channel"), ("mask_mix", "spatial")]:
+            with self.subTest(composition=composition, gate_kind=gate_kind):
+                adapter = _build_unattached_adapter(
+                    output_composition=composition, mask_mix_gate_kind=gate_kind, output_channels=4
+                )
+                model = AdaptedModel(base_model=FakeBaseModel(), adapter=adapter, output_composition=composition)
+                prediction = model(x_t, t, cond)
+                loss = (prediction - target).pow(2).mean()
+                loss.backward()
+
+
+class HyperAlignConditionInjectionTest(unittest.TestCase):
+    """The condition embedding from the structured encoder must reach the
+    hypernetwork through the configured injection path, and never through
+    the frozen base model."""
+
+    def test_condition_embedding_is_stripped_from_base_path(self):
+        adapter = _build_adapter()
+        cond = {"context": torch.randn(2, 5, 12), "embedding": torch.randn(2, 3, 12)}
+
+        stripped = adapter._strip_condition_embedding(cond)
+
+        self.assertNotIn("embedding", stripped)
+        self.assertIn("context", stripped)
+        # Original is untouched so the adapter's own path can still read it.
+        self.assertIn("embedding", cond)
+
+    def test_memory_tokens_mode_extends_memory_with_condition_tokens(self):
+        adapter = _build_adapter(condition_injection_mode="memory_tokens")
+        x_t, cond = _build_inputs()
+        cond_embedding = torch.randn(2, 3, 12)
+        cond["embedding"] = cond_embedding
+
+        # Memory with embedding should have more tokens than without — the
+        # extra ones are the per-frame condition tokens.
+        memory_with = adapter._build_memory_tokens(
+            x_t=x_t, t=torch.full((2,), 999, dtype=torch.long), cond=cond, cond_embedding=cond_embedding,
+        )
+        memory_without = adapter._build_memory_tokens(
+            x_t=x_t, t=torch.full((2,), 999, dtype=torch.long), cond=cond, cond_embedding=None,
+        )
+        self.assertEqual(memory_with.shape[1] - memory_without.shape[1], x_t.shape[2])
+
+    def test_cross_attention_mode_does_not_extend_memory(self):
+        adapter = _build_adapter(condition_injection_mode="cross_attention")
+        x_t, cond = _build_inputs()
+        cond_embedding = torch.randn(2, 3, 12)
+        cond["embedding"] = cond_embedding
+
+        memory_with = adapter._build_memory_tokens(
+            x_t=x_t, t=torch.full((2,), 999, dtype=torch.long), cond=cond, cond_embedding=cond_embedding,
+        )
+        memory_without = adapter._build_memory_tokens(
+            x_t=x_t, t=torch.full((2,), 999, dtype=torch.long), cond=cond, cond_embedding=None,
+        )
+        # In cross_attention mode, condition tokens go to the queries, not the
+        # memory, so the memory shape must be identical.
+        self.assertEqual(memory_with.shape, memory_without.shape)
+
+    def test_none_mode_ignores_condition_embedding(self):
+        adapter = _build_adapter(condition_injection_mode="none")
+        self.assertIsNone(adapter._condition_token_proj)
+        x_t, cond = _build_inputs()
+        cond["embedding"] = torch.randn(2, 3, 12)
+
+        # Should still run; the embedding is just ignored downstream.
+        t = torch.full((2,), 999, dtype=torch.long)
+        result = adapter(x_t, t, cond)
+        self.assertEqual(tuple(result.shape), tuple(x_t.shape))
 
 
 if __name__ == "__main__":

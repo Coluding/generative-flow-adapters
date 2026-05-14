@@ -17,6 +17,7 @@ class ExperimentComponents:
     model: AdaptedModel
     optimizer: torch.optim.Optimizer
     loss_fn: object
+    video_logger: object | None = None
 
 
 def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
@@ -41,4 +42,26 @@ def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    return ExperimentComponents(model=model, optimizer=optimizer, loss_fn=loss_fn)
+    video_logger = _maybe_build_video_logger(config, base_model)
+    return ExperimentComponents(model=model, optimizer=optimizer, loss_fn=loss_fn, video_logger=video_logger)
+
+
+def _maybe_build_video_logger(config: ExperimentConfig, base_model) -> object | None:
+    vl_cfg = config.training.extra.get("video_logging", {}) or {}
+    if not vl_cfg.get("enable", False):
+        return None
+    decode_fn = getattr(base_model, "decode_first_stage", None)
+    if decode_fn is None or getattr(base_model, "first_stage_model", None) is None:
+        raise ValueError(
+            "training.extra.video_logging.enable=True but the base model has no first_stage_model. "
+            "Set model.extra.load_first_stage_model=True."
+        )
+    from generative_flow_adapters.training.video_logger import WandbVideoLogger
+    return WandbVideoLogger(
+        decode_fn=decode_fn,
+        num_samples=int(vl_cfg.get("num_samples", 2)),
+        fps=int(vl_cfg.get("fps", 4)),
+        project=vl_cfg.get("wandb_project"),
+        run_name=vl_cfg.get("wandb_run_name") or config.name,
+        config={"experiment": config.name},
+    )
