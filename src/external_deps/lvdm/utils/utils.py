@@ -1,6 +1,5 @@
 import importlib
 
-import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -56,6 +55,8 @@ def load_npz_from_paths(data_paths):
 
 
 def resize_numpy_image(image, max_resolution=512 * 512, resize_short_edge=None):
+    import cv2  # lazy: only needed by this helper, not by the model code
+
     h, w = image.shape[:2]
     if resize_short_edge is not None:
         k = resize_short_edge / min(h, w)

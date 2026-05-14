@@ -24,6 +24,10 @@ def build_fake_batch(config, batch_size: int) -> dict[str, torch.Tensor | dict[s
     cond = {
         "context": torch.randn(batch_size, context_tokens, context_dim),
         "act": torch.randn(batch_size, temporal_length, action_dim),
+        # In production this carries the first-frame latent replicated across
+        # the temporal axis (the DynamiCrafter "concat" / image conditioning).
+        # A random tensor is fine for a fake-training shape check.
+        "concat": torch.randn(batch_size, latent_channels, temporal_length, latent_height, latent_width),
     }
     return {"target": target, "t": timesteps, "cond": cond}
 

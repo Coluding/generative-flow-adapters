@@ -23,11 +23,19 @@ dynamicrafter = [
   "einops>=0.7",
   "numpy>=1.26",
   "pytorch-lightning>=2.2",
+  "open_clip_torch>=2.24",
+]
+
+data = [
+  "h5py>=3.10",
+  "numpy>=1.26",
 ]
 
 dev = [
   "pytest>=8.0",
   "ruff>=0.6",
+  "h5py>=3.10",
+  "numpy>=1.26",
 ]
 
 [tool.setuptools]

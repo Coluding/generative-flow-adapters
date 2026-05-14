@@ -1,0 +1,67 @@
+name: diffusion_hyperalign_metaworld
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: false
+  include_base_condition: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 8
+    allow_dummy_concat_condition: true
+    allow_missing_checkpoint: true
+
+adapter:
+  type: hyper
+  hidden_dim: 128
+  rank: 4
+  alpha: 1.0
+  extra:
+    architecture: hyperalign
+    aux_down_dim: 16
+    aux_up_dim: 16
+    num_decoder_layers: 2
+    num_decoder_heads: 8
+    update_mode: stepwise
+    # How the condition embedding (from the structured condition encoder) enters
+    # the hypernetwork. Options:
+    #   memory_tokens   - per-frame condition tokens concatenated to the decoder
+    #                     memory (Option B). Decoder cross-attention pulls
+    #                     whichever frames each LoRA layer needs.
+    #   cross_attention - dedicated cross-attention block where the queries
+    #                     attend over the condition sequence before the decoder
+    #                     (Option A).
+    #   none            - ablation: no condition signal reaches the hypernetwork.
+    # The frozen base UNet never receives the condition embedding in any mode.
+    condition_injection_mode: memory_tokens
+    condition_cross_attention_heads: 4
+
+conditioning:
+  # Structured encoder turns whatever `conditions` are listed below into a
+  # per-frame condition embedding of shape [B, T, output_dim]. AdaptedModel
+  # injects it as cond["embedding"]; HyperAlign consumes it through its
+  # condition_injection path only — the frozen base UNet still receives raw
+  # cond without `embedding`. The condition signal is action-like for this
+  # config, but the same plumbing works for any structured condition.
+  type: structured
+  output_dim: 512
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0

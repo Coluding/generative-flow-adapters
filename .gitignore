@@ -35,3 +35,5 @@ tensorboard/
 .idea/
 *.swp
 *.swo
+
+data/

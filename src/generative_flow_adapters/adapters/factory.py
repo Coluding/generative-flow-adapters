@@ -145,7 +145,6 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 hidden_dim=adapter.hidden_dim,
                 input_summary_dim=input_summary_dim,
                 cond_hidden_dim=adapter.extra.get("adapter_condition_hidden_dim"),
-                use_adapter_conditioning=bool(adapter.extra.get("use_adapter_conditioning", True)),
                 aux_down_dim=aux_down_dim,
                 aux_up_dim=aux_up_dim,
                 num_decoder_layers=int(adapter.extra.get("num_decoder_layers", 4)),
@@ -156,6 +155,9 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 use_factorized_memory_position=bool(adapter.extra.get("use_factorized_memory_position", True)),
                 update_mode=str(adapter.extra.get("update_mode", "stepwise")),
                 piecewise_progress_markers=tuple(adapter.extra.get("piecewise_progress_markers", (0.0, 0.05, 0.20))),
+                condition_injection_mode=str(adapter.extra.get("condition_injection_mode", "memory_tokens")),
+                condition_input_dim=adapter.extra.get("condition_input_dim"),
+                condition_cross_attention_heads=int(adapter.extra.get("condition_cross_attention_heads", 4)),
             )
         raise ValueError(f"Unsupported hypernetwork adapter architecture: {architecture}")
     if adapter_type == "lora":

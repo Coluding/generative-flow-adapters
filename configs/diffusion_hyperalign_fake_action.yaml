@@ -8,7 +8,7 @@ model:
   pass_cond_to_base: false
   include_base_condition: true
   extra:
-    unet_config_path: configs/test_dynamicrafter_hyperalign_unet.yaml
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
     latent_channels: 4
     latent_height: 16
     latent_width: 16
@@ -26,14 +26,15 @@ adapter:
     num_decoder_layers: 2
     num_decoder_heads: 8
     update_mode: stepwise
-    use_adapter_conditioning: true
+    condition_injection_mode: memory_tokens
 
 conditioning:
   type: structured
   output_dim: 512
   extra:
     context_tokens: 77
-    context_dim: 512
+    # Must match the UNet's `context_dim` in dynamicrafter_512.yaml (1024).
+    context_dim: 1024
     temporal_length: 8
     action_dim: 7
   conditions:

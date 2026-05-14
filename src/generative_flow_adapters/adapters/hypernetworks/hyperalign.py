@@ -8,8 +8,9 @@ from einops import rearrange
 from torch import Tensor, nn
 
 from generative_flow_adapters.conditioning.utils.dynamicrafter_conditioning import prepare_dynamicrafter_condition
-from generative_flow_adapters.adapters.hidden_states.unicon import _prepare_adapter_conditioning, _resolve_unet_module
+from generative_flow_adapters.adapters.hidden_states.unicon import _resolve_unet_module
 from generative_flow_adapters.adapters.hypernetworks.interface import HyperNetworkAdapterInterface
+from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
 from generative_flow_adapters.adapters.low_rank.common import (
     LoRAHandle,
     clear_dynamic_lora_parameters,
@@ -31,7 +32,6 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         hidden_dim: int,
         input_summary_dim: int,
         cond_hidden_dim: int | None = None,
-        use_adapter_conditioning: bool = True,
         aux_down_dim: int = 16,
         aux_up_dim: int = 16,
         num_decoder_layers: int = 4,
@@ -42,6 +42,12 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         use_factorized_memory_position: bool = True,
         update_mode: str = "stepwise",
         piecewise_progress_markers: tuple[float, ...] = (0.0, 0.05, 0.20),
+        condition_injection_mode: str = "memory_tokens",
+        condition_input_dim: int | None = None,
+        condition_cross_attention_heads: int = 4,
+        output_composition: str = "add",
+        mask_mix_gate_kind: str = "channel",
+        output_channels: int | None = None,
     ) -> None:
         del input_summary_dim
         super().__init__()
@@ -50,7 +56,6 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         self.target_modules = tuple(target_modules)
         self.cond_dim = cond_dim
         self.cond_hidden_dim = cond_hidden_dim
-        self.use_adapter_conditioning = use_adapter_conditioning
         self.aux_down_dim = aux_down_dim
         self.aux_up_dim = aux_up_dim
         self.hidden_dim = hidden_dim
@@ -62,6 +67,12 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         self.use_factorized_memory_position = bool(use_factorized_memory_position)
         self.update_mode = _normalize_update_mode(update_mode)
         self.piecewise_progress_markers = _normalize_piecewise_markers(piecewise_progress_markers)
+        self.condition_injection_mode = _normalize_condition_injection_mode(condition_injection_mode)
+        self.condition_input_dim = int(condition_input_dim if condition_input_dim is not None else (cond_dim or 0))
+        self.condition_cross_attention_heads = int(condition_cross_attention_heads)
+        self.output_composition = _normalize_output_composition(output_composition)
+        self.mask_mix_gate_kind = _normalize_mask_mix_gate_kind(mask_mix_gate_kind)
+        self.output_channels = int(output_channels) if output_channels is not None else None
 
         expected_hidden_dim = self.rank * (self.aux_down_dim + self.aux_up_dim)
         if self.hidden_dim != expected_hidden_dim:
@@ -94,6 +105,15 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
                 nn.SiLU(),
                 nn.Linear(self.step_level_hidden_dim, int(self.cond_dim)),
             )
+
+        self._condition_token_proj: nn.Linear | None = None
+        self._condition_type_embed: nn.Parameter | None = None
+        self._condition_cross_attn: nn.MultiheadAttention | None = None
+        self._condition_cross_attn_norm: nn.LayerNorm | None = None
+
+        self._gate_head_channel: nn.Linear | None = None
+        self._gate_head_spatial: nn.Conv2d | None = None
+        self._cached_gate: Tensor | None = None
 
     def attach_base_model(self, base_model) -> None:
         super().attach_base_model(base_model)
@@ -132,12 +152,71 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         base_output: Tensor | None = None,
     ) -> Tensor:
         del base_output
-        memory = self._build_memory_tokens(x_t=x_t, t=t, cond=cond)
+        prepared_cond = self._prepare_runtime_cond(cond, x_t=x_t)
+        cond_embedding = (
+            prepared_cond.get("embedding") if isinstance(prepared_cond, Mapping) else None
+        )
+        memory = self._build_memory_tokens(
+            x_t=x_t,
+            t=t,
+            cond=prepared_cond,
+            cond_embedding=cond_embedding,
+        )
         decoder = self._require_decoder()
-        query_tokens = self._require_query_tokens(memory.shape[0], memory.device, memory.dtype)
-        decoded = decoder(tgt=query_tokens, memory=memory)
+        queries = self._require_query_tokens(memory.shape[0], memory.device, memory.dtype)
+        if (
+            self.condition_injection_mode == "cross_attention"
+            and isinstance(cond_embedding, Tensor)
+        ):
+            condition_tokens = self._build_condition_tokens(cond_embedding, frames=int(x_t.shape[2]))
+            queries = self._inject_condition_via_cross_attention(queries, condition_tokens)
+        decoded = decoder(tgt=queries, memory=memory)
         factor_head = self._require_factor_head()
         return factor_head(decoded)
+
+    def _prepare_runtime_cond(self, cond: object | None, *, x_t: Tensor) -> object | None:
+        if not isinstance(cond, Mapping):
+            return cond
+        return prepare_dynamicrafter_condition(
+            cond,
+            x_t=x_t,
+            use_step_level_conditioning=self.use_step_level_conditioning,
+            step_level_key=self.step_level_key,
+            step_level_embed=self.step_level_embed,
+        )
+
+    def _build_condition_tokens(self, condition_embedding: Tensor, *, frames: int) -> Tensor:
+        if self._condition_token_proj is None or self._condition_type_embed is None:
+            raise RuntimeError("Condition injection modules were not initialized.")
+        proj_dtype = self._condition_token_proj.weight.dtype
+        if condition_embedding.dim() == 2:
+            projected = self._condition_token_proj(condition_embedding.to(dtype=proj_dtype))
+            tokens = projected.unsqueeze(1)
+        elif condition_embedding.dim() == 3:
+            projected = self._condition_token_proj(condition_embedding.to(dtype=proj_dtype))
+            if projected.shape[1] == frames and frames > 0:
+                frame_pos = _sinusoidal_position_embeddings(frames, self.hidden_dim).to(
+                    device=projected.device, dtype=projected.dtype
+                )
+                projected = projected + frame_pos.unsqueeze(0)
+            tokens = projected
+        else:
+            raise ValueError("HyperAlign condition embedding must have rank 2 or 3.")
+        type_embed = self._condition_type_embed.to(device=tokens.device, dtype=tokens.dtype)
+        return tokens + type_embed.view(1, 1, -1) # The type embedding is like a learanble categorical embedding telling the cross attention to distinguish between memory and codnition tokens
+
+    def _inject_condition_via_cross_attention(
+        self, queries: Tensor, condition_tokens: Tensor
+    ) -> Tensor:
+        if self._condition_cross_attn is None or self._condition_cross_attn_norm is None:
+            raise RuntimeError("Condition cross-attention modules were not initialized.")
+        attended, _ = self._condition_cross_attn(
+            query=queries,
+            key=condition_tokens,
+            value=condition_tokens,
+            need_weights=False,
+        )
+        return self._condition_cross_attn_norm(queries + attended)
 
     def forward(
         self,
@@ -185,17 +264,58 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         )
         self._decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.num_decoder_layers)
         self._factor_head = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self._prepare_condition_injection_modules()
         self._prepared = True
 
         if self.base_model is None:
             return
         module = _resolve_unet_module(self.base_model)
-        _prepare_adapter_conditioning(self, module)
         encoder_dims = _infer_encoder_feature_dims(module)
         self._memory_projections = nn.ModuleList(nn.Linear(channels, self.hidden_dim) for channels in encoder_dims)
         query_count = len(self._handles)
         self._query_tokens = torch.zeros(1, query_count, self.hidden_dim)
         self._query_positional_encoding = _sinusoidal_position_embeddings(query_count, self.hidden_dim).unsqueeze(0)
+        self._prepare_mask_mix_gate_modules(encoder_dims=encoder_dims)
+
+    def _prepare_mask_mix_gate_modules(self, encoder_dims: list[int]) -> None:
+        if self.output_composition != "mask_mix":
+            return
+        if self.output_channels is None or self.output_channels <= 0:
+            raise ValueError(
+                "HyperAlign mask_mix composition requires a positive output_channels "
+                "(set adapter.extra.output_channels or model.extra.latent_channels)."
+            )
+        if self.mask_mix_gate_kind == "channel":
+            head = nn.Linear(self.hidden_dim, self.output_channels)
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+            self._gate_head_channel = head
+        elif self.mask_mix_gate_kind == "spatial":
+            if not encoder_dims:
+                raise ValueError("Cannot build spatial gate head without encoder feature dims.")
+            shallow_channels = int(encoder_dims[0])
+            conv = nn.Conv2d(shallow_channels, self.output_channels, kernel_size=3, padding=1)
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+            self._gate_head_spatial = conv
+
+    def _prepare_condition_injection_modules(self) -> None:
+        if self.condition_injection_mode == "none":
+            return
+        if self.condition_input_dim <= 0:
+            raise ValueError(
+                "HyperAlign condition injection requires a positive condition_input_dim "
+                "(set adapter.extra.condition_input_dim or conditioning.output_dim)."
+            )
+        self._condition_token_proj = nn.Linear(self.condition_input_dim, self.hidden_dim)
+        self._condition_type_embed = nn.Parameter(torch.zeros(self.hidden_dim))
+        if self.condition_injection_mode == "cross_attention":
+            self._condition_cross_attn = nn.MultiheadAttention(
+                embed_dim=self.hidden_dim,
+                num_heads=self.condition_cross_attention_heads,
+                batch_first=True,
+            )
+            self._condition_cross_attn_norm = nn.LayerNorm(self.hidden_dim)
 
     def _resolve_hyper_factors(self, x_t: Tensor, t: Tensor, cond: object | None) -> tuple[Tensor, Tensor]:
         should_refresh, stage_index = self._should_refresh_hyper_factors(x_t=x_t, t=t)
@@ -258,33 +378,59 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         hyper_up = up_flat.view(factor_tokens.shape[0], factor_tokens.shape[1], self.rank, self.aux_up_dim)
         return hyper_down, hyper_up
 
-    def _build_memory_tokens(self, x_t: Tensor, t: Tensor, cond: object | None) -> Tensor:
+    def _build_memory_tokens(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        cond: object | None,
+        cond_embedding: Tensor | None = None,
+    ) -> Tensor:
         if self.base_model is None:
             raise RuntimeError("HyperAlignAdapter must be attached to a base model before use.")
         if x_t.dim() != 5:
             raise ValueError("Paper-aligned HyperAlign currently expects video latents shaped [batch, channels, frames, height, width].")
-        cond = prepare_dynamicrafter_condition(
-            cond,
-            x_t=x_t,
-            use_step_level_conditioning=self.use_step_level_conditioning,
-            step_level_key=self.step_level_key,
-            step_level_embed=self.step_level_embed,
-        )
         if not isinstance(cond, Mapping) or "context" not in cond:
             raise TypeError("Paper-aligned HyperAlign expects a mapping condition containing a 'context' tensor.")
-        if self._can_use_captured_features(cond):
-            expected_blocks = len(self._memory_projections) if self._memory_projections is not None else 0
-            captured = self._feature_store.get(expected_count=expected_blocks)
-            if captured is not None:
-                return self._build_memory_from_captured_features(captured, batch_size=x_t.shape[0], frames=x_t.shape[2], dtype=x_t.dtype)
+        # The frozen base UNet was never trained to interpret the adapter's
+        # condition embedding; strip it so the encoder pass (live or captured)
+        # reflects only what the base knows. The condition signal reaches the
+        # hypernetwork through the condition_injection path instead.
+        base_cond = self._strip_condition_embedding(cond)
+        encoder_memory = self._build_encoder_memory(x_t=x_t, t=t, base_cond=base_cond)
+        if (
+            self.condition_injection_mode == "memory_tokens"
+            and isinstance(cond_embedding, Tensor)
+        ):
+            condition_tokens = self._build_condition_tokens(cond_embedding, frames=int(x_t.shape[2]))
+            condition_tokens = condition_tokens.to(dtype=encoder_memory.dtype, device=encoder_memory.device)
+            return torch.cat([encoder_memory, condition_tokens], dim=1)
+        return encoder_memory
+
+    def _build_encoder_memory(self, *, x_t: Tensor, t: Tensor, base_cond: Mapping[str, object]) -> Tensor:
+        expected_blocks = len(self._memory_projections) if self._memory_projections is not None else 0
+        captured = self._feature_store.get(expected_count=expected_blocks)
+        if captured is not None:
+            return self._build_memory_from_captured_features(
+                captured,
+                batch_size=int(x_t.shape[0]),
+                frames=int(x_t.shape[2]),
+                dtype=x_t.dtype,
+            )
 
         module = _resolve_unet_module(self.base_model)
-        emb, context, batch_size = _prepare_hyperalign_runtime(module, x_t, t, cond, adapter=self)
+        emb, context, batch_size = _prepare_hyperalign_runtime(module, x_t, t, base_cond)
         frames = int(x_t.shape[2])
         h = x_t.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, x_t.shape[1], x_t.shape[3], x_t.shape[4])
+        h = _apply_channel_concat_for_input_blocks(
+            h=h,
+            cond=base_cond,
+            base_model=self.base_model,
+            module=module,
+            batch_size=batch_size,
+            frames=frames,
+        )
         h = h.type(getattr(module, "dtype", x_t.dtype))
         projected_tokens: list[Tensor] = []
-        # TODO: we should always use the precomputed features. As we are always doing a basemodel forward pass, the features are already present. Let's use them and not recompute them here
         with torch.no_grad():
             for index, block in enumerate(module.input_blocks):
                 h = block(h, emb, context=context, batch_size=batch_size)
@@ -292,6 +438,12 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
                 projection = self._require_memory_projection(index)
                 projected_tokens.append(projection(pooled))
         return self._compose_memory_tokens(projected_tokens)
+
+    @staticmethod
+    def _strip_condition_embedding(cond: Mapping[str, object]) -> dict[str, object]:
+        stripped = dict(cond)
+        stripped.pop("embedding", None)
+        return stripped
 
     def _build_memory_from_captured_features(
         self,
@@ -342,12 +494,6 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
             device=memory.device, dtype=memory.dtype
         )
         return memory + flat_position.unsqueeze(0)
-
-    def _can_use_captured_features(self, cond: Mapping[str, object]) -> bool:
-        # The frozen base pass in AdaptedModel runs on raw cond. If adapter-only embeddings are present,
-        # captured features do not match HyperAlign conditioning and we must rebuild memory with adapter cond.
-        embedding = cond.get("embedding")
-        return not isinstance(embedding, Tensor)
 
     def _resolve_base_condition(self, cond: object | None) -> object | None:
         if isinstance(cond, dict) and "embedding" in cond:
@@ -407,13 +553,47 @@ def _pool_video_encoder_features(features: Tensor, batch_size: int, frames: int)
     return features.mean(dim=(3, 4)).to(dtype=features.dtype)
 
 
+def _apply_channel_concat_for_input_blocks(
+    *,
+    h: Tensor,
+    cond: Mapping[str, object],
+    base_model: nn.Module,
+    module: nn.Module,
+    batch_size: int,
+    frames: int,
+) -> Tensor:
+    """Append concat-conditioning channels to ``h`` so it matches the UNet's
+    first input block. Mirrors ``DynamiCrafterUNetWrapper.forward``: prefer
+    a real ``cond["concat"]`` tensor; otherwise zero-pad if the wrapper has
+    ``allow_dummy_concat_condition=True``; otherwise leave ``h`` untouched.
+    """
+    concat = cond.get("concat") if isinstance(cond, Mapping) else None
+    if isinstance(concat, Tensor):
+        flat = concat.to(device=h.device, dtype=h.dtype)
+        flat = flat.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, flat.shape[1], flat.shape[3], flat.shape[4])
+        return torch.cat([h, flat], dim=1)
+    if getattr(base_model, "allow_dummy_concat_condition", False):
+        expected = getattr(module, "in_channels", h.shape[1])
+        missing = int(expected) - int(h.shape[1])
+        if missing > 0:
+            dummy = torch.zeros(h.shape[0], missing, *h.shape[2:], device=h.device, dtype=h.dtype)
+            return torch.cat([h, dummy], dim=1)
+    return h
+
+
 def _prepare_hyperalign_runtime(
     module: nn.Module,
     x: Tensor,
     timesteps: Tensor,
     cond: Mapping[str, object],
-    adapter: HyperAlignAdapter,
 ) -> tuple[Tensor, Tensor, int]:
+    """Build the encoder-pass `emb` and `context` for the frozen UNet.
+
+    The adapter's condition embedding is intentionally not consumed here —
+    it reaches the hypernetwork through the condition_injection path instead.
+    Native action-conditioned bases (`module.action_conditioned=True`) still
+    receive `cond["act"]` directly through their own action head.
+    """
     context = cond.get("context")
     if not isinstance(context, Tensor):
         raise KeyError("Condition mapping must provide a 'context' tensor for HyperAlign.")
@@ -421,7 +601,6 @@ def _prepare_hyperalign_runtime(
     act = cond.get("act")
     fs = cond.get("fs")
     dropout_actions = bool(cond.get("dropout_actions", True))
-    adapter_embedding = cond.get("embedding")
 
     batch_size, _, frames, _, _ = x.shape
     t_emb = timestep_embedding(timesteps, module.model_channels, repeat_only=False).type(x.dtype)
@@ -435,20 +614,18 @@ def _prepare_hyperalign_runtime(
     else:
         context = context.repeat_interleave(repeats=frames, dim=0)
 
-    if not getattr(module, "action_conditioned", False) and adapter_embedding is None:
+    if not getattr(module, "action_conditioned", False):
         emb = module.time_embed(t_emb)
         emb = emb.repeat_interleave(repeats=frames, dim=0)
     else:
         act_drop_prob = module.action_dropout_prob if dropout_actions else 0.0
         time_emb = module.time_embed(t_emb)
         time_emb = time_emb.repeat_interleave(repeats=frames, dim=0)
-        if act is not None and adapter_embedding is None:
+        if act is not None:
             act_emb = module.action_embed(act)
             keep_mask = prob_mask_like((act.shape[0],), 1 - act_drop_prob, device=act.device)
             act_emb = torch.where(rearrange(keep_mask, "b -> b 1 1"), act_emb, module.null_action_emb)
             cond_emb = rearrange(act_emb, "b t c -> (b t) c")
-        elif isinstance(adapter_embedding, Tensor):
-            cond_emb = _prepare_hyperalign_adapter_embedding(adapter, adapter_embedding, batch_size=batch_size, frames=frames)
         else:
             cond_emb = module.null_action_emb.repeat_interleave(repeats=frames * batch_size, dim=0)
         if not getattr(module, "add_act_time_emb", False):
@@ -465,27 +642,6 @@ def _prepare_hyperalign_runtime(
         emb = emb + fs_embed
 
     return emb, context, batch_size
-
-
-def _prepare_hyperalign_adapter_embedding(
-    adapter: HyperAlignAdapter,
-    adapter_embedding: Tensor,
-    *,
-    batch_size: int,
-    frames: int,
-) -> Tensor:
-    condition_proj = getattr(adapter, "condition_proj", None)
-    if condition_proj is None:
-        raise RuntimeError("HyperAlign adapter conditioning projection was not initialized.")
-    if adapter_embedding.dim() == 2:
-        projected = condition_proj(adapter_embedding)
-        return projected.repeat_interleave(repeats=frames, dim=0)
-    if adapter_embedding.dim() == 3:
-        if adapter_embedding.shape[0] != batch_size or adapter_embedding.shape[1] != frames:
-            raise ValueError("HyperAlign adapter_embedding with rank 3 must have shape [batch, frames, cond_dim].")
-        adapter_embedding = rearrange(adapter_embedding, "b t c -> (b t) c")
-        return condition_proj(adapter_embedding)
-    raise ValueError("HyperAlign adapter_embedding must have rank 2 or 3.")
 
 
 class _HyperAlignInputFeatureStore:
@@ -515,6 +671,56 @@ class _HyperAlignInputFeatureStore:
         for handle in self._handles:
             handle.remove()
         self._handles = []
+
+
+def _normalize_output_composition(composition: str) -> str:
+    normalized = str(composition).strip().lower()
+    aliases = {
+        "add": "add",
+        "delta": "add",
+        "replace": "replace",
+        "adapter_only": "replace",
+        "mask_mix": "mask_mix",
+        "avid_mask_mix": "mask_mix",
+        "gated": "mask_mix",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported HyperAlign output_composition: {composition}")
+    return aliases[normalized]
+
+
+def _normalize_mask_mix_gate_kind(kind: str) -> str:
+    normalized = str(kind).strip().lower()
+    aliases = {
+        "channel": "channel",
+        "c": "channel",
+        "per_channel": "channel",
+        "spatial": "spatial",
+        "s": "spatial",
+        "per_spatial": "spatial",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported HyperAlign mask_mix_gate_kind: {kind}")
+    return aliases[normalized]
+
+
+def _normalize_condition_injection_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "memory_tokens": "memory_tokens",
+        "memory": "memory_tokens",
+        "tokens": "memory_tokens",
+        "b": "memory_tokens",
+        "cross_attention": "cross_attention",
+        "cross": "cross_attention",
+        "ca": "cross_attention",
+        "a": "cross_attention",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported HyperAlign condition_injection_mode: {mode}")
+    return aliases[normalized]
 
 
 def _normalize_update_mode(update_mode: str) -> str:
