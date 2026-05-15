@@ -229,9 +229,14 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
     def encode_with_transformer(self, text):
         x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
         x = x + self.model.positional_embedding
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        # open_clip >= 2.32 defaults the text transformer to batch_first=True
+        # (NLD); older versions used LND. Permute only when needed.
+        batch_first = bool(getattr(self.model.transformer, "batch_first", False))
+        if not batch_first:
+            x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        if not batch_first:
+            x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.model.ln_final(x)
         return x
 
@@ -370,7 +375,9 @@ class FrozenOpenCLIPImageEmbedderV2(AbstractEncoder):
         x = self.preprocess(x)
 
         # to patches - whether to use dual patchnorm - https://arxiv.org/abs/2302.01327v1
-        if self.model.visual.input_patchnorm:
+        # open_clip >= 2.32 removed the `input_patchnorm` attribute (ViT-H/14
+        # was never trained with it anyway); treat missing-attr as False.
+        if getattr(self.model.visual, "input_patchnorm", False):
             # einops - rearrange(x, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)')
             x = x.reshape(
                 x.shape[0],
@@ -404,9 +411,14 @@ class FrozenOpenCLIPImageEmbedderV2(AbstractEncoder):
         x = self.model.visual.patch_dropout(x)
         x = self.model.visual.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        # open_clip >= 2.32 defaults the visual transformer to batch_first=True
+        # (NLD); older versions used LND. Permute only when needed.
+        batch_first = bool(getattr(self.model.visual.transformer, "batch_first", False))
+        if not batch_first:
+            x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.model.visual.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        if not batch_first:
+            x = x.permute(1, 0, 2)  # LND -> NLD
 
         return x
 

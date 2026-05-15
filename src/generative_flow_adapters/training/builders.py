@@ -17,7 +17,7 @@ class ExperimentComponents:
     model: AdaptedModel
     optimizer: torch.optim.Optimizer
     loss_fn: object
-    video_logger: object | None = None
+    wandb_logger: object | None = None
 
 
 def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
@@ -42,26 +42,39 @@ def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    video_logger = _maybe_build_video_logger(config, base_model)
-    return ExperimentComponents(model=model, optimizer=optimizer, loss_fn=loss_fn, video_logger=video_logger)
+    wandb_logger = _maybe_build_wandb_logger(config, base_model)
+    return ExperimentComponents(model=model, optimizer=optimizer, loss_fn=loss_fn, wandb_logger=wandb_logger)
 
 
-def _maybe_build_video_logger(config: ExperimentConfig, base_model) -> object | None:
-    vl_cfg = config.training.extra.get("video_logging", {}) or {}
-    if not vl_cfg.get("enable", False):
+def _maybe_build_wandb_logger(config: ExperimentConfig, base_model) -> object | None:
+    """Build a single WandbLogger that handles both metrics and eval videos.
+
+    Configuration lives under `training.extra.wandb` (preferred) or
+    `training.extra.video_logging` (legacy alias kept so older YAMLs still work).
+    Set `enable: true` to turn on logging; set `model.extra.load_first_stage_model: true`
+    if you also want video panels (a VAE is needed to decode latents to RGB).
+    """
+    extra = config.training.extra
+    cfg = extra.get("wandb") or extra.get("video_logging") or {}
+    if not cfg.get("enable", False):
         return None
     decode_fn = getattr(base_model, "decode_first_stage", None)
-    if decode_fn is None or getattr(base_model, "first_stage_model", None) is None:
+    has_vae = decode_fn is not None and getattr(base_model, "first_stage_model", None) is not None
+    if cfg.get("require_vae", True) and not has_vae:
+        # Default: refuse silently mismatched configs. Set `require_vae: false`
+        # in the wandb block to opt into metrics-only logging without a VAE.
         raise ValueError(
-            "training.extra.video_logging.enable=True but the base model has no first_stage_model. "
-            "Set model.extra.load_first_stage_model=True."
+            "wandb logging requires a VAE on the base model for video panels. "
+            "Either set model.extra.load_first_stage_model=true or set "
+            "training.extra.wandb.require_vae=false to log scalar metrics only."
         )
-    from generative_flow_adapters.training.video_logger import WandbVideoLogger
-    return WandbVideoLogger(
-        decode_fn=decode_fn,
-        num_samples=int(vl_cfg.get("num_samples", 2)),
-        fps=int(vl_cfg.get("fps", 4)),
-        project=vl_cfg.get("wandb_project"),
-        run_name=vl_cfg.get("wandb_run_name") or config.name,
+    from generative_flow_adapters.training.wandb_logger import WandbLogger
+    return WandbLogger(
+        decode_fn=decode_fn if has_vae else None,
+        num_samples=int(cfg.get("num_samples", 2)),
+        fps=int(cfg.get("fps", 4)),
+        project=cfg.get("wandb_project") or cfg.get("project"),
+        run_name=cfg.get("wandb_run_name") or cfg.get("run_name") or config.name,
         config={"experiment": config.name},
+        metrics_prefix=str(cfg.get("metrics_prefix", "train")),
     )

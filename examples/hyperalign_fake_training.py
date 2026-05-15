@@ -48,7 +48,7 @@ def main() -> None:
         experiment.optimizer,
         experiment.loss_fn,
         config.training,
-        video_logger=experiment.video_logger,
+        wandb_logger=experiment.wandb_logger,
     )
 
     print(f"experiment={config.name}")

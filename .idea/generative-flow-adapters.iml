@@ -2,7 +2,11 @@
 <module type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/latent_diffusion" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/latent_diffusion/libs/dynamicrafter" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/latent_diffusion/libs/octo" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/latent_diffusion/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/libs/avid_utils" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
     </content>

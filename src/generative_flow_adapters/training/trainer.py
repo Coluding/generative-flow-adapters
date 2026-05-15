@@ -35,6 +35,9 @@ class Trainer:
             linear_end=float(diffusion_schedule.get("linear_end", config.diffusion_linear_end)),
             rescale_betas_zero_snr=bool(diffusion_schedule.get("rescale_betas_zero_snr", config.diffusion_rescale_betas_zero_snr)),
             offset_noise_strength=config.diffusion_offset_noise_strength,
+            use_dynamic_rescale=bool(diffusion_schedule.get("use_dynamic_rescale", False)),
+            base_scale=float(diffusion_schedule.get("base_scale", 0.7)),
+            turning_step=int(diffusion_schedule.get("turning_step", 400)),
         )
         self.inference_sampler = DiffusionInferenceSampler(
             model=self.model,
@@ -83,11 +86,16 @@ class Trainer:
             else:
                 t = self.diffusion_objective.sample_timesteps(batch_size=batch_size, device=target.device)
             noise = self.diffusion_objective.sample_noise(target)
-            x_t = self.diffusion_objective.q_sample(x_start=target, t=t, noise=noise)
+            # DynamiCrafter-style data SNR shaping: scale x_0 by scale_arr[t]
+            # BEFORE noising, so q_sample and the v/eps target all live in the
+            # same attenuated space the base model was trained in. No-op when
+            # `use_dynamic_rescale=False`.
+            target_scaled = self.diffusion_objective.scale_x_start(target, t)
+            x_t = self.diffusion_objective.q_sample(x_start=target_scaled, t=t, noise=noise)
             prediction = self.model(x_t, t, batch.get("cond"))
             target_tensor = self.diffusion_objective.get_target(
                 prediction_type=prediction_type or "noise",
-                x_start=target,
+                x_start=target_scaled,
                 x_t=x_t,
                 t=t,
                 noise=noise,
@@ -161,6 +169,11 @@ class Trainer:
         generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
         if generated_samples is not None:
             metrics["generated_samples"] = generated_samples.detach().cpu()
+        # Push scalar metrics to wandb every step. Non-scalar entries (e.g.
+        # the `generated_samples` tensor) are filtered inside log_metrics; the
+        # video panels are pushed separately by `_maybe_generate_samples`.
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_metrics(metrics, step=self.global_step)
         return metrics
 
     def generate_samples(
@@ -179,7 +192,7 @@ class Trainer:
             return None
         if self.config.inference_every_n_steps is None or self.config.inference_every_n_steps <= 0:
             return None
-        if self.global_step % self.config.inference_every_n_steps != 0:
+        if self.global_step % self.config.inference_every_n_steps - 1 != 0:
             return None
 
         target = batch.get("target")
@@ -194,7 +207,7 @@ class Trainer:
             base_samples = self.base_inference_sampler.sample_from_batch(
                 batch=base_batch, num_inference_steps=steps, initial_sample=shared_noise
             )
-            self.wandb_logger.log(
+            self.wandb_logger.log_videos(
                 prediction_latents=adapted_samples,
                 base_prediction_latents=base_samples,
                 target_latents=target,
@@ -205,7 +218,7 @@ class Trainer:
 
         samples = self.generate_samples(batch=batch, num_inference_steps=steps)
         if self.wandb_logger is not None and isinstance(target, Tensor):
-            self.wandb_logger.log(
+            self.wandb_logger.log_videos(
                 prediction_latents=samples,
                 target_latents=target,
                 cond=batch.get("cond"),

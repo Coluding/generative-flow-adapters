@@ -189,4 +189,7 @@ def _load_diffusion_schedule_config(config_path: str) -> DiffusionScheduleConfig
         linear_start=float(model_params.get("linear_start", 8.5e-4)),
         linear_end=float(model_params.get("linear_end", 1.2e-2)),
         rescale_betas_zero_snr=bool(model_params.get("rescale_betas_zero_snr", False)),
+        use_dynamic_rescale=bool(model_params.get("use_dynamic_rescale", False)),
+        base_scale=float(model_params.get("base_scale", 0.7)),
+        turning_step=int(model_params.get("turning_step", 400)),
     )

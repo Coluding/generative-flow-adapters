@@ -45,6 +45,7 @@ from generative_flow_adapters.data import (
 )
 from generative_flow_adapters.training import build_experiment
 from generative_flow_adapters.training.trainer import Trainer
+from generative_flow_adapters.training.wandb_logger import WandbLogger
 
 
 def trainable_parameter_count(model: torch.nn.Module) -> tuple[int, int]:
@@ -104,7 +105,10 @@ def main() -> None:
 
     experiment = build_experiment(config)
     model = experiment.model.to(device)
-    trainer = Trainer(model, experiment.optimizer, experiment.loss_fn, config.training)
+    trainer = Trainer(model, experiment.optimizer,
+                      experiment.loss_fn,
+                      config.training,
+                      experiment.wandb_logger)
 
     vae = VideoAutoencoderKL(ddconfig=dict(SD_VAE_DDCONFIG), embed_dim=4).to(device)
     vae_status = "random-init"
