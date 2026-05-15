@@ -26,7 +26,6 @@ Run:
 from __future__ import annotations
 
 import argparse
-import time
 from pathlib import Path
 
 import torch
@@ -42,6 +41,10 @@ from generative_flow_adapters.data import (
     TranslatedClipDataset,
     VideoAutoencoderKL,
     precompute_null_text_embedding,
+)
+from generative_flow_adapters.data.clip import (
+    OpenCLIPImageEmbedder,
+    build_dynamicrafter_resampler_from_checkpoint,
 )
 from generative_flow_adapters.training import build_experiment
 from generative_flow_adapters.training.trainer import Trainer
@@ -72,6 +75,21 @@ def main() -> None:
         help="Path to a DynamiCrafter / SD VAE checkpoint. Without it, the VAE is random-init (smoke run).",
     )
     parser.add_argument("--uncond-prob", type=float, default=0.05, help="CFG dropout probability per branch.")
+    parser.add_argument(
+        "--target-height",
+        type=int,
+        default=320,
+        help=(
+            "Pixel height the preprocessor resizes clips to. Default 320 matches the "
+            "dynamicrafter_512 training resolution (latent 40x64). Set to 0 to disable resize."
+        ),
+    )
+    parser.add_argument(
+        "--target-width",
+        type=int,
+        default=512,
+        help="Pixel width; see --target-height. Default 512 matches dynamicrafter_512.",
+    )
     parser.add_argument(
         "--clip-null-prompt",
         dest="clip_null_prompt",
@@ -139,6 +157,25 @@ def main() -> None:
         caption_encoder = CachedNullCaptionEncoder(null_embedding)
         print(f"  cached null prompt: shape={tuple(null_embedding.shape)} device={null_embedding.device}")
 
+    # Build the image cross-attention branch (OpenCLIP vision + Resampler).
+    # DynamiCrafter's UNet expects context = [text(77); image(T*16)]; without
+    # this branch the cross-attention silently falls through to text-only and
+    # generated frames are noticeably blurry. Both encoders are frozen.
+    image_encoder = None
+    image_resampler = None
+    if args.vae_checkpoint and Path(args.vae_checkpoint).exists():
+        print("Loading OpenCLIP image embedder + Resampler for image cross-attention...")
+        image_encoder = OpenCLIPImageEmbedder().to(device)
+        image_encoder.eval()
+        image_resampler = build_dynamicrafter_resampler_from_checkpoint(
+            args.vae_checkpoint,
+            video_length=temporal_length,
+            device=device,
+        )
+        print(f"  image encoder + Resampler ready on {device}")
+
+    target_height = args.target_height if args.target_height > 0 else None
+    target_width = args.target_width if args.target_width > 0 else None
     preprocessor = DynamiCrafterBatchPreprocessor(
         vae=vae,
         config=BatchPreprocessConfig(
@@ -147,8 +184,13 @@ def main() -> None:
             rand_cond_frame=False,
             context_tokens=context_tokens,
             context_dim=context_dim,
+            target_height=target_height,
+            target_width=target_width,
+            resize_mode="stretch",
         ),
         caption_encoder=caption_encoder,
+        image_encoder=image_encoder,
+        image_resampler=image_resampler,
     )
 
     translator = MetaWorldTranslator(args.hdf5, caption_mode="empty")
@@ -176,34 +218,12 @@ def main() -> None:
     print(f"params trainable={trainable:,} total={total:,} ({100.0 * trainable / max(total, 1):.2f}% trainable)")
     print(f"steps={args.steps} batch_size={args.batch_size}")
 
-    step = 0
-    epoch = 0
-    running_loss = 0.0
-    running_count = 0
-    start = time.time()
-
-    while step < args.steps:
-        epoch += 1
-        for raw_batch in loader:
-            if step >= args.steps:
-                break
-            batch = preprocessor(raw_batch, train=True)
-            metrics = trainer.training_step(batch)
-            loss_value = float(metrics["loss"])
-            running_loss += loss_value
-            running_count += 1
-            step += 1
-
-            if step % args.log_every == 0:
-                avg = running_loss / running_count
-                elapsed = time.time() - start
-                steps_per_sec = step / max(elapsed, 1e-6)
-                print(
-                    f"epoch={epoch} step={step}/{args.steps} loss={loss_value:.5f} "
-                    f"avg_loss={avg:.5f} steps/s={steps_per_sec:.2f}"
-                )
-
-    print(f"done. final_avg_loss={running_loss / max(running_count, 1):.5f} elapsed={time.time() - start:.1f}s")
+    trainer.train(
+        loader=loader,
+        max_steps=args.steps,
+        preprocessor=preprocessor,
+        log_every=args.log_every,
+    )
 
 
 if __name__ == "__main__":

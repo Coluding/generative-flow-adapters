@@ -37,3 +37,5 @@ tensorboard/
 *.swo
 
 ds/
+
+tests/_outputs/

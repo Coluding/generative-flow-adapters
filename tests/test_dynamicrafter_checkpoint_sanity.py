@@ -27,6 +27,7 @@ from generative_flow_adapters.inference import DiffusionInferenceSampler
 from generative_flow_adapters.losses.diffusion import DiffusionTrainingObjective
 from generative_flow_adapters.models.base.dynamicrafter import DynamicCrafterUNetWrapper
 
+from generative_flow_adapters.data.batch_preprocessor import resize_stretch
 from generative_flow_adapters.data.clip import (
     build_dynamicrafter_resampler_from_checkpoint,
     encode_image_with_openclip,
@@ -116,17 +117,12 @@ class DynamicCrafterCheckpointSanityTest(unittest.TestCase):
         # `image_size: [40, 64]` (latent) == 320x512 pixels. Metaworld frames are
         # 128x128 — running the U-Net at that resolution drives its lowest
         # attention block down to 1x1 tokens, well outside its trained regime.
-        # F.interpolate works on 4D [N, C, H, W]; collapse the T=1 axis, resize,
-        # then put it back.
-        first_frame = first_frame.squeeze(2)  # [B, 3, H, W]
-        first_frame = torch.nn.functional.interpolate(
-            first_frame,
-            size=(320, 512),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        ).clamp(-1.0, 1.0)
-        first_frame = first_frame.unsqueeze(2)  # [B, 3, 1, 320, 512]
+        # `resize_stretch` is the single source of truth for the bicubic policy
+        # the training preprocessor uses, so this rollout matches what the
+        # adapter will be trained on.
+        first_frame = first_frame.squeeze(2)               # [B, 3, H, W]
+        first_frame = resize_stretch(first_frame, 320, 512)
+        first_frame = first_frame.unsqueeze(2)             # [B, 3, 1, 320, 512]
 
         # VAE-encode the conditioning frame, broadcast across time as `concat`.
         vae = self.wrapper.first_stage_model

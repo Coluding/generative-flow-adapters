@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import inspect
+import time
+from collections.abc import Callable, Iterable, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -176,6 +178,80 @@ class Trainer:
             self.wandb_logger.log_metrics(metrics, step=self.global_step)
         return metrics
 
+    def train(
+        self,
+        loader: Iterable,
+        *,
+        max_steps: int,
+        preprocessor: Callable[..., Mapping[str, object]] | None = None,
+        log_every: int = 1,
+        on_step: Callable[[int, dict[str, object]], None] | None = None,
+    ) -> dict[str, float]:
+        """Run the standard outer training loop for ``max_steps`` global steps.
+
+        Folds the boilerplate (epoch counter, dataloader iteration, preprocess
+        call, periodic print, elapsed/throughput tracking) into one entry
+        point so individual scripts can be ~10 lines of setup + ``trainer.train(...)``.
+
+        Args:
+            loader: any iterable yielding raw batches. Re-iterated each epoch
+                until ``max_steps`` is reached.
+            max_steps: target global step count (compared against
+                ``self.global_step``, so resumed runs do the right thing).
+            preprocessor: optional callable applied to each raw batch before
+                ``training_step``. Called as ``preprocessor(raw_batch, train=True)``
+                to match :class:`DynamiCrafterBatchPreprocessor` (extra kwarg
+                ignored if the callable doesn't accept it). Pass ``None`` when
+                your dataloader already yields fully-formed trainer batches.
+            log_every: print a per-step summary every N steps. Set to 0 to disable.
+            on_step: optional callback invoked after each step with
+                ``(global_step, metrics)`` — useful for custom logging or
+                early-stopping logic without subclassing the trainer.
+
+        Returns:
+            A dict with ``final_avg_loss``, ``elapsed_seconds``, ``steps``,
+            and ``epochs`` so callers can decide what (if anything) to print at
+            the end.
+        """
+        running_loss = 0.0
+        running_count = 0
+        epoch = 0
+        start = time.time()
+        while self.global_step < max_steps:
+            epoch += 1
+            for raw_batch in loader:
+                if self.global_step >= max_steps:
+                    break
+                batch = (
+                    _call_preprocessor(preprocessor, raw_batch)
+                    if preprocessor is not None
+                    else raw_batch
+                )
+                metrics = self.training_step(batch)
+                loss_value = float(metrics["loss"])
+                running_loss += loss_value
+                running_count += 1
+                if on_step is not None:
+                    on_step(self.global_step, dict(metrics))
+                if log_every > 0 and self.global_step % log_every == 0:
+                    elapsed = time.time() - start
+                    print(
+                        f"epoch={epoch} step={self.global_step}/{max_steps} "
+                        f"loss={loss_value:.5f} avg_loss={running_loss / running_count:.5f} "
+                        f"steps/s={self.global_step / max(elapsed, 1e-6):.2f}"
+                    )
+
+        elapsed = time.time() - start
+        avg_loss = running_loss / max(running_count, 1)
+        if log_every > 0:
+            print(f"done. final_avg_loss={avg_loss:.5f} elapsed={elapsed:.1f}s")
+        return {
+            "final_avg_loss": avg_loss,
+            "elapsed_seconds": elapsed,
+            "steps": float(self.global_step),
+            "epochs": float(epoch),
+        }
+
     def generate_samples(
         self,
         batch: Mapping[str, Tensor | object],
@@ -225,6 +301,21 @@ class Trainer:
                 step=self.global_step,
             )
         return samples
+
+
+def _call_preprocessor(preprocessor: Callable[..., Mapping[str, object]], raw_batch: object) -> Mapping[str, object]:
+    """Call ``preprocessor(batch, train=True)`` when its signature accepts
+    ``train``, otherwise ``preprocessor(batch)``. Lets the trainer accept
+    both :class:`DynamiCrafterBatchPreprocessor` (expects the kwarg) and
+    plain user lambdas. Signature is inspected instead of catching TypeError
+    so real bugs inside the preprocessor aren't silently swallowed."""
+    try:
+        params = inspect.signature(preprocessor).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "train" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return preprocessor(raw_batch, train=True)
+    return preprocessor(raw_batch)
 
 
 def _strip_adapter_only_keys(cond: object | None) -> object | None:
