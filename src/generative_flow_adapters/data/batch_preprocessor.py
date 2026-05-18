@@ -25,6 +25,7 @@ Mirrors the DynamiCrafter behavior:
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -52,6 +53,12 @@ class BatchPreprocessConfig:
     dropout_actions: bool = False
     include_concat: bool = True
     include_video: bool = False
+    # Structured-condition keys to pluck from the raw batch and forward into
+    # `cond[key]`. Each key must match the `key` field of a `ConditionSpec`
+    # in `ConditioningConfig.conditions`, and the raw batch is expected to
+    # carry a tensor under that same key (the dataset/translator's job).
+    # Default keeps backward compat for action-conditioned configs.
+    condition_keys: tuple[str, ...] = ("act",)
 
 
 class DynamiCrafterBatchPreprocessor:
@@ -68,16 +75,10 @@ class DynamiCrafterBatchPreprocessor:
         self.vae = vae
         self.config = config or BatchPreprocessConfig()
         self.caption_encoder = caption_encoder
-        # DynamiCrafter's cross-attention expects context = [text(77); image(T*16)].
-        # When both `image_encoder` (OpenCLIP vision) and `image_resampler` (the
-        # Resampler whose weights live in `image_proj_model.*` of the checkpoint)
-        # are provided, we build the image branch and concatenate it. When
-        # either is None, the preprocessor falls back to text-only context and
-        # the UNet runs in its degraded "no image cross-attention" mode — the
-        # rollout still produces something via the concat-channel image
-        # conditioning, but fine detail will be blurry.
         self.image_encoder = image_encoder
         self.image_resampler = image_resampler
+
+        self._warned : bool = False
 
     @property
     def device(self) -> torch.device:
@@ -121,6 +122,10 @@ class DynamiCrafterBatchPreprocessor:
         )
         if image_emb is not None:
             context = torch.cat([context, image_emb], dim=1)
+        elif not self._warned:
+            warnings.warn("The image embedding is None, i.e. the context for the U-Net cross attention is different from its training distribution!"
+                          "\nCheck if this is desired.")
+            self._warned  = True
 
         cond: dict[str, Any] = {
             "context": context,
@@ -133,9 +138,13 @@ class DynamiCrafterBatchPreprocessor:
             frame_latent = frame_latent * image_keep
             cond["concat"] = frame_latent.repeat(1, 1, frames, 1, 1)
 
-        actions = batch.get("act")
-        if isinstance(actions, Tensor):
-            cond["act"] = actions.to(device=device, dtype=self.dtype)
+        # Forward every declared structured-condition tensor onto `cond`.
+        # Keys not present in the raw batch are silently skipped so the same
+        # preprocessor works across datasets where some conditions are absent.
+        for key in config.condition_keys:
+            value = batch.get(key)
+            if isinstance(value, Tensor):
+                cond[key] = value.to(device=device, dtype=self.dtype)
 
         fs = self._extract_fs(batch=batch, batch_size=batch_size, device=device)
         if fs is not None:
@@ -168,9 +177,26 @@ class DynamiCrafterBatchPreprocessor:
             return None
         cond_pixels = video[:, :, cond_frame_index]                   # (B, 3, H, W) in [-1, 1]
         cond_pixels = cond_pixels * image_keep.view(-1, 1, 1, 1)      # broadcast-compatible mask
-        tokens = self.image_encoder(cond_pixels)                      # (B, 257, 1280)
-        image_emb = self.image_resampler(tokens)                      # (B, video_length*16, 1024)
+
+        # The image encoder may live on CPU to save GPU memory (its weights
+        # are ~2.5 GB for ViT-H/14 and only used here). Explicitly route the
+        # pixel batch to its device, then bring the tokens back to the
+        # trainer device for the (small) Resampler. Roundtrip cost is
+        # ~50 ms/batch — the GPU headroom this buys back is worth more.
+        encoder_device = self._module_device(self.image_encoder)
+        tokens = self.image_encoder(cond_pixels.to(encoder_device))
+        resampler_device = self._module_device(self.image_resampler)
+        image_emb = self.image_resampler(tokens.to(resampler_device))
         return image_emb.to(device=self.device, dtype=self.dtype)
+
+    @staticmethod
+    def _module_device(module: Any) -> torch.device:
+        """Return the device of the first parameter of a module, or CPU when
+        the module has no parameters (e.g. a stateless callable)."""
+        try:
+            return next(module.parameters()).device
+        except (AttributeError, StopIteration):
+            return torch.device("cpu")
 
     def _normalize_video(self, video: Any) -> Tensor:
         if not isinstance(video, Tensor):

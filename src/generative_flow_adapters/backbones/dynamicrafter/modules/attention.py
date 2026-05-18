@@ -110,37 +110,43 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
 
-        sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
-        if self.relative_position:
-            len_q, len_k, len_v = q.shape[1], k.shape[1], v.shape[1]
-            k2 = self.relative_position_k(len_q, len_k)
-            sim2 = einsum("b t d, t s d -> b t s", q, k2) * self.scale  # TODO check
-            sim += sim2
-        del k
+        # When the relative-position branch and the explicit causal mask aren't
+        # in play, route through PyTorch's SDPA — Flash / mem-efficient backend
+        # never materializes the (N, N) attention matrix, saving multiple GB
+        # at high spatial resolution / long temporal length. Falls back to the
+        # original manual softmax otherwise so the relative-position math is
+        # preserved.
+        use_sdpa = (not self.relative_position) and (not exists(mask))
+        if use_sdpa:
+            out = F.scaled_dot_product_attention(q, k, v)              # (b*h, n, d)
+            del k
+        else:
+            sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
+            if self.relative_position:
+                len_q, len_k, len_v = q.shape[1], k.shape[1], v.shape[1]
+                k2 = self.relative_position_k(len_q, len_k)
+                sim2 = einsum("b t d, t s d -> b t s", q, k2) * self.scale
+                sim += sim2
+            del k
 
-        if exists(mask):
-            ## feasible for causal attention mask only
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, "b i j -> (b h) i j", h=h)
-            sim.masked_fill_(~(mask > 0.5), max_neg_value)
+            if exists(mask):
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, "b i j -> (b h) i j", h=h)
+                sim.masked_fill_(~(mask > 0.5), max_neg_value)
 
-        # attention, what we cannot get enough of
-        sim = sim.softmax(dim=-1)
-
-        out = torch.einsum("b i j, b j d -> b i d", sim, v)
-        if self.relative_position:
-            v2 = self.relative_position_v(len_q, len_v)
-            out2 = einsum("b t s, t s d -> b t d", sim, v2)  # TODO check
-            out += out2
+            sim = sim.softmax(dim=-1)
+            out = torch.einsum("b i j, b j d -> b i d", sim, v)
+            if self.relative_position:
+                v2 = self.relative_position_v(len_q, len_v)
+                out2 = einsum("b t s, t s d -> b t d", sim, v2)
+                out += out2
         out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
 
         ## for image cross-attention
         if k_ip is not None:
             k_ip, v_ip = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (k_ip, v_ip))
-            sim_ip = torch.einsum("b i d, b j d -> b i j", q, k_ip) * self.scale
+            out_ip = F.scaled_dot_product_attention(q, k_ip, v_ip)     # same memory benefit
             del k_ip
-            sim_ip = sim_ip.softmax(dim=-1)
-            out_ip = torch.einsum("b i j, b j d -> b i d", sim_ip, v_ip)
             out_ip = rearrange(out_ip, "(b h) n d -> b n (h d)", h=h)
 
         if out_ip is not None:

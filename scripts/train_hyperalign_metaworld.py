@@ -91,6 +91,19 @@ def main() -> None:
         help="Pixel width; see --target-height. Default 512 matches dynamicrafter_512.",
     )
     parser.add_argument(
+        "--image-encoder-device",
+        choices=("auto", "cuda", "cpu"),
+        default=None,
+        help=(
+            "Device for the OpenCLIP image embedder used by the preprocessor's "
+            "image cross-attention branch. ViT-H/14 weighs ~2.5 GB on GPU; "
+            "moving it to CPU adds ~50 ms / batch but frees that headroom for "
+            "the UNet's activations. When omitted, falls back to "
+            "`conditioning.extra.image_encoder_device` from the YAML, then "
+            "to 'auto' (same as --device)."
+        ),
+    )
+    parser.add_argument(
         "--clip-null-prompt",
         dest="clip_null_prompt",
         action="store_true",
@@ -161,21 +174,58 @@ def main() -> None:
     # DynamiCrafter's UNet expects context = [text(77); image(T*16)]; without
     # this branch the cross-attention silently falls through to text-only and
     # generated frames are noticeably blurry. Both encoders are frozen.
+    #
+    # `video_length=None` makes the loader infer T from the checkpoint's
+    # `latents` shape — so we can then assert the YAML's `temporal_length`
+    # matches what the base model (UNet + Resampler) was trained at, instead
+    # of building a Resampler the UNet's hybrid-cross-attention won't pick up.
     image_encoder = None
     image_resampler = None
     if args.vae_checkpoint and Path(args.vae_checkpoint).exists():
+        # OpenCLIP image embedder placement, resolved in priority order:
+        #   1. --image-encoder-device CLI flag (when explicitly passed).
+        #   2. conditioning.extra.image_encoder_device from the YAML.
+        #   3. 'auto' → same as the main training device.
+        # The Resampler is small and always lives on the training device.
+        device_spec = (
+            args.image_encoder_device
+            or config.conditioning.extra.get("image_encoder_device")
+            or "auto"
+        )
+        image_encoder_device = device if device_spec == "auto" else torch.device(device_spec)
         print("Loading OpenCLIP image embedder + Resampler for image cross-attention...")
-        image_encoder = OpenCLIPImageEmbedder().to(device)
+        image_encoder = OpenCLIPImageEmbedder().to(image_encoder_device)
         image_encoder.eval()
         image_resampler = build_dynamicrafter_resampler_from_checkpoint(
             args.vae_checkpoint,
-            video_length=temporal_length,
+            video_length=None,
             device=device,
         )
-        print(f"  image encoder + Resampler ready on {device}")
+        checkpoint_video_length = image_resampler.video_length
+        if checkpoint_video_length != temporal_length:
+            raise ValueError(
+                f"Config has temporal_length={temporal_length} but the DynamiCrafter "
+                f"checkpoint was trained at temporal_length={checkpoint_video_length}. "
+                "The UNet's temporal blocks and the cross-attention dispatch both "
+                "key on this; mixing T values silently disables the image branch "
+                "and degrades the temporal blocks. Set `model.extra.temporal_length` "
+                f"and `conditioning.extra.temporal_length` to {checkpoint_video_length} "
+                "in your YAML."
+            )
+        print(
+            f"  image encoder on {image_encoder_device} | Resampler on {device} "
+            f"(T={checkpoint_video_length})"
+        )
 
     target_height = args.target_height if args.target_height > 0 else None
     target_width = args.target_width if args.target_width > 0 else None
+    # Pull condition keys from the YAML so the preprocessor forwards every
+    # structured condition the user declared (not just "act"). The keys must
+    # match what the dataset / translator emits in the raw batch.
+    condition_keys = tuple(spec.key for spec in config.conditioning.conditions)
+    if not condition_keys:
+        print("  warning: no structured conditions declared in conditioning.conditions; "
+              "the adapter's condition encoder will see an empty input.")
     preprocessor = DynamiCrafterBatchPreprocessor(
         vae=vae,
         config=BatchPreprocessConfig(
@@ -187,6 +237,7 @@ def main() -> None:
             target_height=target_height,
             target_width=target_width,
             resize_mode="stretch",
+            condition_keys=condition_keys,
         ),
         caption_encoder=caption_encoder,
         image_encoder=image_encoder,

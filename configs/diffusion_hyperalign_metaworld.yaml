@@ -12,7 +12,7 @@ model:
     latent_channels: 4
     latent_height: 16
     latent_width: 16
-    temporal_length: 8
+    temporal_length: 16
     allow_dummy_concat_condition: true
     allow_missing_checkpoint: true
     # Set to true to attach the DynamiCrafter VAE so eval-time samples can be
@@ -59,12 +59,6 @@ adapter:
     condition_cross_attention_heads: 4
 
 conditioning:
-  # Structured encoder turns whatever `conditions` are listed below into a
-  # per-frame condition embedding of shape [B, T, output_dim]. AdaptedModel
-  # injects it as cond["embedding"]; HyperAlign consumes it through its
-  # condition_injection path only — the frozen base UNet still receives raw
-  # cond without `embedding`. The condition signal is action-like for this
-  # config, but the same plumbing works for any structured condition.
   type: structured
   output_dim: 512
   extra:
@@ -72,6 +66,7 @@ conditioning:
     context_dim: 1024
     temporal_length: 8
     action_dim: 4
+    image_encoder_device: cuda
   conditions:
     - key: act
       input_dim: 4

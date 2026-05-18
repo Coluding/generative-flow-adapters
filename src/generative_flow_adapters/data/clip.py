@@ -243,25 +243,20 @@ def build_dynamicrafter_resampler_from_checkpoint(
     embedding_dim: int = 1280,
     output_dim: int = 1024,
     ff_mult: int = 4,
-    video_length: int = 16,
+    video_length: int | None = None,
     device: torch.device | str = "cpu",
 ) -> nn.Module:
     """Build the DynamiCrafter Resampler and load the ``image_proj_model.*``
     weights from the checkpoint. Defaults match ``dynamicrafter_512.yaml``.
+
+    ``video_length`` is inferred from the checkpoint's ``latents`` shape
+    (``shape[1] = num_queries * video_length``) when left as ``None``. Pass
+    an explicit value to assert it matches the checkpoint — a mismatch raises
+    rather than silently producing a Resampler the UNet's hybrid cross-attention
+    won't pick up at runtime.
     """
     from generative_flow_adapters.data._resampler import Resampler
 
-    resampler = Resampler(
-        dim=dim,
-        depth=depth,
-        dim_head=dim_head,
-        heads=heads,
-        num_queries=num_queries,
-        embedding_dim=embedding_dim,
-        output_dim=output_dim,
-        ff_mult=ff_mult,
-        video_length=video_length,
-    )
     state = torch.load(checkpoint_path, map_location="cpu")
     full_state = state.get("state_dict", state)
     prefixes = ("model.image_proj_model.", "image_proj_model.")
@@ -275,6 +270,42 @@ def build_dynamicrafter_resampler_from_checkpoint(
         raise RuntimeError(
             f"No `image_proj_model.*` keys in {checkpoint_path}; cannot rebuild the Resampler."
         )
+
+    # Infer `video_length` from the checkpoint's `latents` tensor so a config
+    # mismatch fails loudly here instead of silently breaking cross-attention.
+    ckpt_latents = weights.get("latents")
+    if ckpt_latents is None or ckpt_latents.dim() != 3:
+        raise RuntimeError(
+            f"Checkpoint at {checkpoint_path} is missing a 3D `image_proj_model.latents` tensor."
+        )
+    ckpt_total_queries = int(ckpt_latents.shape[1])
+    if ckpt_total_queries % num_queries != 0:
+        raise RuntimeError(
+            f"Checkpoint latents shape {tuple(ckpt_latents.shape)} not divisible by num_queries={num_queries}."
+        )
+    inferred_video_length = ckpt_total_queries // num_queries
+    if video_length is None:
+        video_length = inferred_video_length
+    elif video_length != inferred_video_length:
+        raise ValueError(
+            f"Requested video_length={video_length} but checkpoint was trained at "
+            f"video_length={inferred_video_length} (latents shape {tuple(ckpt_latents.shape)}). "
+            "Either pass video_length=None to auto-infer, or update your config so "
+            "temporal_length matches the checkpoint (the UNet's temporal blocks and "
+            "the cross-attention dispatch also need that T to match)."
+        )
+
+    resampler = Resampler(
+        dim=dim,
+        depth=depth,
+        dim_head=dim_head,
+        heads=heads,
+        num_queries=num_queries,
+        embedding_dim=embedding_dim,
+        output_dim=output_dim,
+        ff_mult=ff_mult,
+        video_length=video_length,
+    )
     resampler.load_state_dict(weights, strict=True)
     for parameter in resampler.parameters():
         parameter.requires_grad = False
