@@ -815,7 +815,7 @@ class UNetModel(nn.Module):
 
         if hasattr(self, "out_mask"):
             mask = self.out_mask(h)
-            mask = rearrange(mask, "(b t) c h w -> b c t h w", b=b)
+            mask = rearrange(mask, "(b t) c h w -> b c t h w", b=b) #Important: here again, the batch and time dimension are merged and treated as independent.
             return y, mask
         return y
 

@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>HyperAlign architecture</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 1200px;
+      margin: 24px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .subtitle { color: #4b5563; margin-bottom: 18px; font-size: 14px; }
+    .diagram { margin: 8px 0; }
+    .legend { font-size: 12px; color: #374151; display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+    .legend span { display: inline-block; padding: 3px 10px; border-radius: 4px; border: 1.5px solid; }
+    .caption { color: #4b5563; font-size: 13px; margin-top: 12px; line-height: 1.6; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+    .zoom-panel {
+      margin: 24px 0 12px;
+      padding: 14px 18px 18px;
+      background: linear-gradient(to bottom, #f8fafc, #f1f5f9);
+      border: 1.5px dashed #94a3b8;
+      border-radius: 8px;
+      position: relative;
+    }
+    .zoom-panel::before {
+      content: "🔍";
+      position: absolute;
+      top: -14px;
+      left: 18px;
+      background: #f1f5f9;
+      padding: 0 6px;
+      font-size: 18px;
+    }
+    .zoom-panel h3 { font-size: 15px; margin: 0 0 6px; color: #1f2937; }
+    .zoom-panel .zoom-caption { font-size: 12.5px; color: #4b5563; line-height: 1.55; margin: 0 0 10px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'default',
+      flowchart: { htmlLabels: true, curve: 'basis', padding: 12, nodeSpacing: 40, rankSpacing: 50 }
+    });
+  </script>
+</head>
+<body>
+
+<h1>HyperAlign</h1>
+<div class="subtitle">
+  Hypernetwork-generated, auxiliary-factorised LoRA on attention projections of a frozen video diffusion base.
+</div>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+
+    %% === Conditioning input from structural encoder ===
+    C(["<b>c</b><br/><small>from structural encoder</small>"]):::cond
+
+    %% === Hypernetwork pipeline ===
+    XT(["x<sub>t</sub>, t"]):::data
+    Perc["<b>Perception encoder</b><br/><small>= frozen U-Net <code>input_blocks</code></small><br/><small>+ spatial mean-pool</small><br/><small>+ per-block Linear</small>"]:::frozen
+    Mem["<b>Memory tokens</b><br/><small>shape: [B × (L·F + cond_len) × H]</small><br/><small>↑ from frozen <code>input_blocks</code> (perception encoder)</small><br/><small>⊕ tokens from structural encoder</small><br/><small>+ layer/frame pos. enc.</small>"]:::trainable
+    Dec["<b>Transformer Decoder</b> 🔍<br/><small>N layers, cross-attn</small><br/><small>M zero queries + sin. pos. enc.</small><br/><small>one query per adapted LoRA module</small><br/><small>(see zoom below)</small>"]:::trainable
+    FH["<b>Factor head</b> + reshape 🔍<br/><small>Linear H → r·(a+b)</small><br/><small>hyper_down [B,M,a,r]</small><br/><small>hyper_up [B,M,r,b]</small><br/><small>(see zoom below)</small>"]:::trainable
+
+    XT --> Perc
+    Perc -. stop-grad .-> Mem
+    C -- cond tokens<br/>(memory_tokens) --> Mem
+    Mem -- memory --> Dec
+    Dec --> FH
+
+    %% === Injection bridge ===
+    Inject["<b>Set dynamic LoRA factors</b><br/>on attention projections<br/><small>targets: <code>to_q</code>, <code>to_k</code>, <code>to_v</code>, <code>to_out.0</code></small><br/><small>refresh policy: S (each step) / I (once) / P (piecewise)</small>"]:::inject
+
+    FH --> Inject
+
+    %% === Frozen base with expanded attention ===
+    BIN(["x<sub>t</sub>, t, <b>c</b>"]):::data
+
+    subgraph Base ["Frozen U-Net (DynamiCrafter)"]
+      direction LR
+      Wq["W<sub>q</sub> + <i>ΔW<sub>q</sub></i><br/><small>to_q</small>"]:::frozenInner
+      Wk["W<sub>k</sub> + <i>ΔW<sub>k</sub></i><br/><small>to_k</small>"]:::frozenInner
+      Wv["W<sub>v</sub> + <i>ΔW<sub>v</sub></i><br/><small>to_v</small>"]:::frozenInner
+      Wo["W<sub>o</sub> + <i>ΔW<sub>o</sub></i><br/><small>to_out.0</small>"]:::frozenInner
+    end
+
+    BIN --> Base
+    Inject --> Base
+    C -. via context / time-emb .-> Base
+
+    %% === Two-pass outputs ===
+    VB(["<b>v<sub>base</sub></b><br/><small>pass 1: LoRA off</small>"]):::data
+    VA(["<b>v<sub>adapted</sub></b><br/><small>pass 2: LoRA on</small>"]):::data
+
+    Base --> VB
+    Base --> VA
+
+    %% === Subtract ===
+    Delta["<b>Δ<sub>φ</sub> = v<sub>adapted</sub> − v<sub>base</sub></b><br/><small>adapter output (composition = add)</small>"]:::loss
+
+    VB --> Delta
+    VA --> Delta
+
+    %% === Styles ===
+    classDef frozen fill:#f1f5f9,stroke:#64748b,stroke-width:1.5px,color:#0f172a
+    classDef frozenInner fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#0f172a
+    classDef trainable fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#0c1e3d
+    classDef data fill:#dcfce7,stroke:#16a34a,stroke-width:1px,color:#052e16
+    classDef cond fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
+    classDef inject fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    classDef loss fill:#fee2e2,stroke:#dc2626,stroke-width:1.5px,color:#450a0a
+</pre>
+</div>
+
+<div class="zoom-panel">
+  <h3>Zoom: Transformer Decoder internals</h3>
+  <p class="zoom-caption">
+    Each of the <em>M</em> zero-initialised queries is associated with exactly one LoRA target inside the frozen U-Net's attention blocks (i.e. one of <code>to_q</code>, <code>to_k</code>, <code>to_v</code>, or <code>to_out.0</code> in a specific attention layer). The N stacked decoder layers let the queries cross-attend to the memory tokens, and the memory tokens themselves are the concatenation of (1) per-block features pooled from the frozen U-Net's <code>input_blocks</code>, and (2) the projected condition tokens from the structural encoder. Cross-attention is what lets each query gather the information it needs to predict <em>its own</em> LoRA factor.
+  </p>
+<pre class="mermaid">
+flowchart TB
+
+    %% === Memory tokens (input to cross-attention) ===
+    MemZ["<b>Memory tokens</b> &nbsp;<small>[B × T × H]</small><br/>
+          <small style='color:#475569'>T = L·F &nbsp;perception-encoder tokens<br/>
+          (per-block features from frozen <code>input_blocks</code>)</small><br/>
+          <small style='color:#b45309'>+ cond_len tokens from structural encoder</small>"]:::memTok
+
+    %% === M zero queries with LoRA-target identity ===
+    subgraph QGroup ["<b>M zero queries + sinusoidal pos. enc.</b>&nbsp;&nbsp;<small>(one per adapted LoRA module)</small>"]
+      direction LR
+      Q1["Q₁<br/><small>block 1<br/><code>to_q</code></small>"]:::queryNode
+      Q2["Q₂<br/><small>block 1<br/><code>to_k</code></small>"]:::queryNode
+      Q3["Q₃<br/><small>block 1<br/><code>to_v</code></small>"]:::queryNode
+      Q4["Q₄<br/><small>block 1<br/><code>to_out.0</code></small>"]:::queryNode
+      Qd["⋯"]:::ellipsis
+      QM["Q<sub>M</sub><br/><small>block K<br/><code>to_out.0</code></small>"]:::queryNode
+    end
+
+    %% === Cross-attention block ===
+    XA["<b>Cross-attention</b>&nbsp;&nbsp;<small>(× N decoder layers)</small><br/>
+        <small>Q ← queries &nbsp;|&nbsp; K, V ← memory tokens</small>"]:::xattn
+
+    MemZ -- "K, V" --> XA
+    QGroup -- "Q" --> XA
+
+    %% === Output: decoded factor tokens ===
+    OutZ["<b>Decoded factor tokens</b>&nbsp;&nbsp;<small>[B × M × H]</small><br/>
+          <small>one decoded token per LoRA module</small><br/>
+          <small>→ shared factor head → hyper_down, hyper_up</small>"]:::decoded
+
+    XA --> OutZ
+
+    %% === Styles ===
+    classDef memTok fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#052e16
+    classDef queryNode fill:#dbeafe,stroke:#2563eb,stroke-width:1px,color:#0c1e3d
+    classDef ellipsis fill:none,stroke:none,color:#94a3b8,font-weight:bold
+    classDef xattn fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#0c1e3d
+    classDef decoded fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#052e16
+</pre>
+</div>
+
+<div class="zoom-panel">
+  <h3>Zoom: Factor head + reshape</h3>
+  <p class="zoom-caption">
+    The factor head is a single <code>Linear(H → H)</code> shared across all <em>M</em> decoded tokens (one per adapted LoRA module); the same weights are applied to each token independently. Its output is split along the last dimension (first <em>r·a</em> values, next <em>r·b</em> values) and reshaped into the per-module factors <code>hyper_down</code> and <code>hyper_up</code>. These are then assigned to each <code>WrappedLoRALinear</code> wrapper around the frozen base's attention projections via <code>set_dynamic_hyper_factors(...)</code>. The full LoRA update is <em>ΔW = (α/r) · (B<sub>aux</sub> · B<sub>hyper</sub>)(A<sub>aux</sub> · A<sub>hyper</sub>)</em>, with <em>B<sub>aux</sub></em> zero-initialised so the effective <em>ΔW</em> starts at zero.
+  </p>
+<pre class="mermaid">
+flowchart TB
+
+    %% === Input: decoded factor tokens from the Transformer Decoder ===
+    F_IN["<b>Decoded factor tokens</b>&nbsp;&nbsp;<small>[B × M × H]</small><br/><small>from Transformer Decoder</small>"]:::dataBig
+
+    %% === Shared Linear head ===
+    F_LIN["<b>Linear(H → H)</b><br/><small>shared across the M tokens</small><br/><small>H = r · (a + b)</small>"]:::trainableInner
+
+    %% === Linear output ===
+    F_FT["<b>Factor tokens</b>&nbsp;&nbsp;<small>[B × M × H]</small>"]:::dataBig
+
+    %% === Split + reshape ===
+    F_SPLIT["<b>split last dim + reshape</b><br/><small>first r·a values → hyper_down</small><br/><small>next r·b values → hyper_up</small>"]:::utility
+
+    F_DOWN["<b>hyper_down</b>&nbsp;&nbsp;<small>[B × M × a × r]</small>"]:::dataBig
+    F_UP["<b>hyper_up</b>&nbsp;&nbsp;<small>[B × M × r × b]</small>"]:::dataBig
+
+    %% === Set as dynamic LoRA factors on each WrappedLoRALinear in the frozen base ===
+    F_OUT["<b>set dynamic factors on each WrappedLoRALinear</b><br/><small>effective ΔW = (α/r) · (B_aux · B_hyper)(A_aux · A_hyper)</small><br/><small>B_aux zero-init ⇒ ΔW = 0 at start</small>"]:::injectionInner
+
+    F_IN --> F_LIN
+    F_LIN --> F_FT
+    F_FT --> F_SPLIT
+    F_SPLIT --> F_DOWN
+    F_SPLIT --> F_UP
+    F_DOWN --> F_OUT
+    F_UP --> F_OUT
+
+    classDef dataBig fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#052e16
+    classDef trainableInner fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#0c1e3d
+    classDef utility fill:#f9fafb,stroke:#9ca3af,stroke-width:1px,color:#111827
+    classDef injectionInner fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+</pre>
+</div>
+
+<div class="legend">
+  <span style="background:#f1f5f9;border-color:#64748b">Frozen</span>
+  <span style="background:#dbeafe;border-color:#2563eb">Trainable</span>
+  <span style="background:#dcfce7;border-color:#16a34a">Data / latent</span>
+  <span style="background:#fef3c7;border-color:#d97706">Conditioning</span>
+  <span style="background:#f5f3ff;border-color:#7c3aed">Injection bridge</span>
+  <span style="background:#fee2e2;border-color:#dc2626">Composition / output</span>
+</div>
+
+<div class="caption">
+  <em>a, b</em> = auxiliary dimensions · <em>r</em> = LoRA rank · <em>M</em> = number of adapted modules · <em>L</em> = encoder blocks · <em>F</em> = video frames.
+  Effective per-module LoRA: <em>A = A<sub>aux</sub> · A<sub>hyper</sub></em>, <em>B = B<sub>hyper</sub> · B<sub>aux</sub></em>; <em>B<sub>aux</sub></em> is zero-initialised so the effective <em>ΔW = 0</em> at the start of training.
+  Alternative injection mode <code>cross_attention</code> (zero queries cross-attend to condition tokens before the decoder) is supported but not shown.
+</div>
+
+</body>
+</html>

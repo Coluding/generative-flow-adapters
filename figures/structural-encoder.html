@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Structural condition encoder</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 1300px;
+      margin: 24px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .subtitle { color: #4b5563; margin-bottom: 18px; font-size: 14px; }
+    .diagram { margin: 8px 0; }
+    .legend { font-size: 12px; color: #374151; display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+    .legend span { display: inline-block; padding: 3px 10px; border-radius: 4px; border: 1.5px solid; }
+    .caption { color: #4b5563; font-size: 13px; margin-top: 12px; line-height: 1.6; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'default',
+      flowchart: { htmlLabels: true, curve: 'basis', padding: 12, nodeSpacing: 40, rankSpacing: 60 }
+    });
+  </script>
+</head>
+<body>
+
+<h1>Structural condition encoder</h1>
+<div class="subtitle">
+  Single conditioning path consumed by every adapter family.
+  Builds <em>c = cond["embedding"]</em> from a structured set of input tensors and lands at one precise injection point in each consumer.
+  <small>(Code: <code>StructuredConditionEncoder</code> in <code>conditioning/encoders.py</code>.)</small>
+</div>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+
+    %% === Inputs (structured condition tensors) ===
+    A1(["<b>action</b><br/><small>a<sub>t</sub> ∈ ℝ<sup>d<sub>act</sub></sup></small>"]):::input
+    A2(["<b>step_size</b><br/><small>d ∈ ℝ<sub>+</sub></small>"]):::input
+    A3(["<b>…</b><br/><small>(goal, returns-to-go, …)</small>"]):::input
+
+    %% === Per-key MLP branches ===
+    subgraph Branches ["Per-key MLP branches"]
+      direction TB
+      B1["Linear → SiLU → Linear"]:::trainableInner
+      B2["Linear → SiLU → Linear"]:::trainableInner
+      B3["Linear → SiLU → Linear"]:::trainableInner
+    end
+
+    A1 --> B1
+    A2 --> B2
+    A3 --> B3
+
+    %% === Concat + Fuser ===
+    Concat["concat<br/><small>[B × N·output_dim]</small>"]:::trainableInner
+    Fuser["<b>Fuser MLP</b><br/><small>Linear → SiLU → Linear</small><br/><small>[B × output_dim]</small>"]:::trainable
+
+    B1 --> Concat
+    B2 --> Concat
+    B3 --> Concat
+    Concat --> Fuser
+
+    %% === CFG dropout (null_embedding) ===
+    Null["<b>null_embedding</b><br/><small>learnable, [output_dim]</small>"]:::cond
+    Null -. "CFG dropout<br/>(drop_condition_prob)" .-> C
+
+    %% === Output ===
+    C(["<b>c</b> = cond.embedding<br/><small>shape: B × output_dim</small>"]):::cond
+    Fuser --> C
+
+    %% === Consumer 1: HyperAlign ===
+    subgraph Consumer1 ["<b>Consumer 1: HyperAlign hypernetwork</b>"]
+      direction TB
+      H1["<b>Inject as memory tokens</b><br/><small>condition_token_proj(c)</small><br/><small>concat with perception-encoder<br/>memory tokens before Decoder</small>"]:::injectionPoint
+    end
+
+    %% === Consumer 2: AVID adapter ===
+    subgraph Consumer2 ["<b>Consumer 2: DynamiCrafter output adapter</b>"]
+      direction TB
+      H2["<b>Inject into time embedding</b><br/><small>adapter_condition_proj(c)<br/>= MLP<sub>φ</sub></small><br/><small>emb' = time_embed(t) + cond_emb</small>"]:::injectionPoint
+    end
+
+    C --> H1
+    C --> H2
+
+    %% === Styles ===
+    classDef input fill:#dcfce7,stroke:#16a34a,stroke-width:1px,color:#052e16
+    classDef trainable fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#0c1e3d
+    classDef trainableInner fill:#dbeafe,stroke:#2563eb,stroke-width:1px,color:#0c1e3d
+    classDef cond fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
+    classDef injectionPoint fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#451a03
+</pre>
+</div>
+
+<div class="legend">
+  <span style="background:#dcfce7;border-color:#16a34a">Input condition tensor</span>
+  <span style="background:#dbeafe;border-color:#2563eb">Trainable</span>
+  <span style="background:#fef3c7;border-color:#d97706">Conditioning embedding / injection point</span>
+</div>
+
+<div class="caption">
+  Every adapter family in the framework spends this same <em>c</em>. <em>D1</em> is then a study of <em>how</em> different adapter families consume <em>c</em>; <em>D2</em> uses this path to inject action conditioning; <em>D3</em> uses it to inject the step-size <em>d</em>.
+  Only <code>fuse_mode = "concat_mlp"</code> and <code>encoder = "mlp"</code> are currently implemented per branch (<code>encoders.py:119, 123</code>).
+  Alternative HyperAlign injection mode <code>cross_attention</code> (zero queries cross-attend to condition tokens) is supported but not shown.
+</div>
+
+</body>
+</html>

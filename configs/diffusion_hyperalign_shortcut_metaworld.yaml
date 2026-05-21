@@ -1,0 +1,117 @@
+name: diffusion_hyperalign_shortcut_metaworld
+
+# HyperAlign + shortcut training on MetaWorld.
+#
+# Mirrors ``diffusion_hyperalign_metaworld.yaml`` but turns on shortcut
+# supervision: the trainer samples a random ``step_level`` per batch (in
+# [shortcut_step_level_min, shortcut_step_level_max]), injects it into the
+# adapter's cond mapping, and uses ``base(x_t, t, cond) * step_level`` as the
+# shortcut target. The HyperAlign step-level branch consumes the same
+# ``step_level`` so the adapter knows which multi-step horizon it is being
+# trained for.
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: false
+  include_base_condition: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: true
+    allow_missing_checkpoint: true
+    load_first_stage_model: true
+
+adapter:
+  type: hyper
+  hidden_dim: 128
+  rank: 4
+  alpha: 1.0
+  composition: add
+  extra:
+    architecture: hyperalign
+    aux_down_dim: 16
+    aux_up_dim: 16
+    num_decoder_layers: 12
+    num_decoder_heads: 8
+    update_mode: stepwise
+    mask_mix_gate_kind: channel
+    condition_injection_mode: memory_tokens
+    condition_cross_attention_heads: 4
+    # Adapter-side step-level conditioning: the HyperAlign decoder will mix in
+    # a learned embedding of ``cond[step_level]``. Must use the SAME key the
+    # trainer is configured with (training.extra.shortcut_step_level_key).
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.05
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+    # NOTE: step_level deliberately not in the structured-condition list.
+    # The trainer puts a per-batch (B,) tensor under cond["step_level"]; the
+    # StructuredConditionEncoder would try to concat that with per-frame act
+    # (B,T,A) and crash on rank mismatch. The HyperAlign adapter's own
+    # ``use_step_level_conditioning`` branch consumes cond["step_level"]
+    # directly via its step_level_embed (Linear(1, ...)).
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  # Shortcut target method. Supported values:
+  #   two_step      - Base-anchored Heun: target = (v0 + v1)/2 from one proper
+  #                   DDIM micro-step under the FROZEN BASE (v0 at (x_t, t),
+  #                   v1 at (x_mid, t-1)). No collapse risk; ~2x speedup
+  #                   ceiling at inference. step_level is decorative on the
+  #                   adapter for this method.
+  #   distillation  - Paper-faithful self-consistency (Frans et al. 2024).
+  #                   Each step: with prob `shortcut_anchor_prob` run anchor
+  #                   mode (step_level=1, no shortcut target — standard
+  #                   diffusion loss is the supervision); otherwise sample
+  #                   dyadic d, supervise adapter at step_level=2d against
+  #                   the AVERAGE of two no-grad adapter calls at step_level=d
+  #                   chained across one d-sized DDIM micro-step. The adapter
+  #                   is its own teacher; the base only enters via the
+  #                   composition. See thesis-vault
+  #                   risk-shortcut-self-consistency-collapse for the
+  #                   collapse-mode discussion.
+  shortcut_target_method: distillation
+  inference_every_n_steps: 5000
+  inference_num_steps: 25
+  extra:
+    shortcut_step_level_key: step_level
+    # `two_step`: step_level is sampled uniformly in [min, max] and only fed
+    # to the adapter's step_level branch (the target ignores it). Set min==max
+    # to pin a single value while debugging.
+    # `distillation`: dyadic d is drawn from {1, 2, 4, ...} with 2d <= max.
+    # Set max=2 for the simplest non-trivial case (d=1 anchor + d=1 chain).
+    shortcut_step_level_min: 1
+    shortcut_step_level_max: 4
+    # `distillation` only: fraction of training steps that run the anchor
+    # path (step_level=1, standard diffusion loss only). 0.75 matches the
+    # paper's batch-split fraction (1 - 1/4).
+    shortcut_anchor_prob: 0.75
+    video_logging:
+      enable: true
+      num_samples: 2
+      fps: 4
+      wandb_project: hyperalign-shortcut-metaworld

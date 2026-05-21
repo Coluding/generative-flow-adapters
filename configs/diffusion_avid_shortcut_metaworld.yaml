@@ -1,0 +1,93 @@
+name: diffusion_avid_shortcut_metaworld
+
+# AVID-style output adapter on DynamiCrafter, trained with shortcut
+# supervision on the MetaWorld HDF5 dataset.
+#
+# The frozen DynamiCrafter UNet provides the base velocity prediction. The
+# adapter is a small action-conditioned UNet (AVID 11M) that produces a
+# delta + a per-pixel gate ("avid_mask_mix" composition):
+#
+#     prediction = base * sigmoid(gate) + adapted * (1 - sigmoid(gate))
+#
+# The trainer samples a random ``step_level`` per batch, injects it into the
+# cond mapping, and supervises the *adapted* output toward
+# ``base(x_t, t, cond) * step_level``. The adapter's own step-level branch
+# consumes the same value so it learns which multi-step horizon is active.
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    strict_checkpoint: false
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: true
+    allow_missing_checkpoint: true
+    load_first_stage_model: true
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    # Step-level conditioning on the adapter side; trainer must use the same key.
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.05
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+    # step_level is intentionally NOT in the structured-condition list.
+    # The trainer injects a per-batch (B,) tensor under cond["step_level"];
+    # mixing it with per-frame ``act`` (B,T,A) in the StructuredConditionEncoder
+    # would crash on rank mismatch. The DynamicCrafter output adapter's
+    # ``use_step_level_conditioning`` branch consumes cond["step_level"]
+    # directly via its step_level_embed (Linear(1, ...)).
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  # See docs/comments in diffusion_hyperalign_shortcut_metaworld.yaml.
+  #   two_step      - Base-anchored Heun (one proper DDIM micro-step under base).
+  #   distillation  - Paper-faithful self-consistency with anchor split.
+  shortcut_target_method: distillation
+  inference_every_n_steps: 5000
+  inference_num_steps: 25
+  extra:
+    shortcut_step_level_key: step_level
+    shortcut_step_level_min: 1
+    shortcut_step_level_max: 4
+    shortcut_anchor_prob: 0.5
+    video_logging:
+      enable: true
+      num_samples: 2
+      fps: 4
+      wandb_project: avid-shortcut-metaworld

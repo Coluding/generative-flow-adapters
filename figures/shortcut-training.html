@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Shortcut training</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 1200px;
+      margin: 24px auto;
+      padding: 0 20px;
+      color: #1f2937;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .subtitle { color: #4b5563; margin-bottom: 18px; font-size: 14px; }
+    .diagram { margin: 8px 0; }
+    .legend { font-size: 12px; color: #374151; display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+    .legend span { display: inline-block; padding: 3px 10px; border-radius: 4px; border: 1.5px solid; }
+    .caption { color: #4b5563; font-size: 13px; margin-top: 12px; line-height: 1.6; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+    .accent { color: #dc2626; font-weight: 600; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'default',
+      flowchart: { htmlLabels: true, curve: 'basis', padding: 12, nodeSpacing: 40, rankSpacing: 50 }
+    });
+  </script>
+</head>
+<body>
+
+<h1>Shortcut training</h1>
+<div class="subtitle">
+  Step-size-conditioned adapter trained against a self-distilled target from the frozen base (<code>two_step</code> method, paper-faithful).
+  Training-time data flow: the adapter's architecture is shown in other figures.
+</div>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+
+    %% === Adapter (trainable, step-size-conditioned) ===
+    AIN(["x<sub>t</sub>, t, <b>c</b>, <span style='color:#dc2626'><b>d</b></span><br/><small>step-size d highlighted</small>"]):::data
+    Adapter["<b>Adapter</b> (trainable)<br/><small>s<sub>φ</sub>(x<sub>t</sub>, t, <b>c</b>, d)</small><br/><small>step-size-conditioned</small><br/><small>any family: output / LoRA / hypernet / hidden-state</small>"]:::trainable
+    Pred(["<b>prediction</b><br/><small>s<sub>φ</sub>(x<sub>t</sub>, t, <b>c</b>, d)</small>"]):::data
+
+    AIN --> Adapter
+    Adapter --> Pred
+
+    %% === Frozen base: pass A ===
+    AINA(["x<sub>t</sub>, t, <b>c</b><br/><small>(no_grad)</small>"]):::data
+    BaseA["<b>Frozen base</b><br/><small>f<sub>base</sub>(·)</small><br/><small>pass A</small>"]:::frozen
+    VB1(["v<sub>b1</sub>"]):::data
+
+    AINA --> BaseA --> VB1
+
+    %% === Step forward ===
+    StepFwd["x<sub>t</sub>' = x<sub>t</sub> + d · v<sub>b1</sub>"]:::compute
+    VB1 --> StepFwd
+
+    %% === Frozen base: pass B (shared weights with A) ===
+    AINB(["x<sub>t</sub>', <span style='color:#dc2626'><b>t + d</b></span>, <b>c</b><br/><small>(no_grad)</small>"]):::data
+    BaseB["<b>Frozen base</b> (shared weights)<br/><small>f<sub>base</sub>(·)</small><br/><small>pass B</small>"]:::frozen
+    VB2(["v<sub>b2</sub>"]):::data
+
+    StepFwd --> AINB
+    AINB --> BaseB --> VB2
+
+    BaseA -. "same weights" .- BaseB
+
+    %% === Target ===
+    Target["<b>target = ½(v<sub>b1</sub> + v<sub>b2</sub>)</b><br/><small style='color:#7c3aed'>stop-grad</small>"]:::stopgrad
+
+    VB1 --> Target
+    VB2 --> Target
+
+    %% === Loss ===
+    Loss["<b>ℒ<sub>shortcut</sub> = ‖prediction − target‖²</b><br/><small><code>shortcut_direction_loss</code> (MSE)</small>"]:::loss
+
+    Pred --> Loss
+    Target --> Loss
+
+    %% Gradient only on adapter
+    Loss -. "gradient only on φ" .-> Adapter
+
+    %% === Styles ===
+    classDef frozen fill:#f1f5f9,stroke:#64748b,stroke-width:1.5px,color:#0f172a
+    classDef trainable fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#0c1e3d
+    classDef data fill:#dcfce7,stroke:#16a34a,stroke-width:1px,color:#052e16
+    classDef compute fill:#f9fafb,stroke:#9ca3af,stroke-width:1px,color:#111827
+    classDef stopgrad fill:#faf5ff,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    classDef loss fill:#fee2e2,stroke:#dc2626,stroke-width:1.5px,color:#450a0a
+</pre>
+</div>
+
+<div class="legend">
+  <span style="background:#f1f5f9;border-color:#64748b">Frozen (no_grad)</span>
+  <span style="background:#dbeafe;border-color:#2563eb">Trainable</span>
+  <span style="background:#dcfce7;border-color:#16a34a">Data / latent</span>
+  <span style="background:#faf5ff;border-color:#7c3aed">Stop-grad target</span>
+  <span style="background:#fee2e2;border-color:#dc2626">Loss</span>
+</div>
+
+<div class="caption">
+  <span class="accent">Red</span> highlights the step-size <em>d</em> and the timestep advance <em>t + d</em>: the distinguishing inputs of shortcut training.
+  Note: the current implementation evaluates pass B at <em>t</em> (not <em>t + d</em>); the figure shows the paper-faithful behaviour and the code will be patched to match. Tracked in
+  <code>20_Tickets/bug-training-shortcut-target-timestep.md</code>.
+  Alternative target method <code>linear</code> (1 base pass, target = <em>d</em> · <em>f<sub>base</sub>(x<sub>t</sub>, t, c)</em>) is supported but not shown.
+  The standard diffusion/flow loss against the noisy training target is added on top of <em>ℒ<sub>shortcut</sub></em> (not drawn).
+  Sibling consistency heads (<code>local_consistency</code>, <code>multistep_self_consistency</code>) currently share the same detached target tensor.
+</div>
+
+</body>
+</html>

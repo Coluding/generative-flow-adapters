@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Shortcut training: from scratch to adapter</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 980px;
+      margin: 28px auto;
+      padding: 0 22px;
+      color: #1f2937;
+      line-height: 1.5;
+    }
+    h1 { font-size: 24px; margin-bottom: 6px; }
+    h2 { font-size: 18px; margin-top: 28px; margin-bottom: 8px; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+    h3 { font-size: 15px; margin-top: 16px; margin-bottom: 4px; color: #374151; }
+    p { font-size: 14.5px; color: #1f2937; }
+    .lead { font-size: 15px; color: #4b5563; margin-bottom: 18px; }
+    .panel {
+      margin: 16px 0;
+      padding: 14px 18px 18px;
+      background: #fafafa;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+    }
+    .caption { font-size: 12.5px; color: #4b5563; margin-top: 6px; line-height: 1.5; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .math { font-family: "STIX Two Math", Cambria, Times, serif; font-style: italic; }
+    .bigmath { display: block; text-align: center; margin: 8px 0; font-family: "STIX Two Math", Cambria, Times, serif; font-style: italic; font-size: 15px; }
+    .key { font-weight: 600; color: #111827; }
+    .accent { color: #dc2626; font-weight: 600; }
+    .muted { color: #6b7280; font-size: 12.5px; }
+    ul.tight li { margin: 2px 0; }
+
+    svg { display: block; margin: 6px auto 0; max-width: 100%; height: auto; }
+
+    /* SVG styles */
+    .axis { stroke: #111827; stroke-width: 1.4; }
+    .axis-label { font: 12px -apple-system, sans-serif; fill: #111827; }
+    .axis-end-label { font: 600 12px -apple-system, sans-serif; fill: #111827; }
+    .true-curve { fill: none; stroke: #14b8a6; stroke-width: 2.2; opacity: 0.9; }
+    .true-curve-faint { fill: none; stroke: #94a3b8; stroke-width: 1.6; stroke-dasharray: 4 3; opacity: 0.8; }
+    .sample-dot { fill: #111827; }
+    .sample-dot-highlight { fill: #dc2626; }
+    .euler-seg { stroke: #475569; stroke-width: 1.8; fill: none; }
+    .shortcut-seg { stroke: #dc2626; stroke-width: 2.4; fill: none; }
+    .adapter-seg { stroke: #2563eb; stroke-width: 2.4; fill: none; }
+    .tangent-seg { stroke: #d97706; stroke-width: 2.2; fill: none; }
+    .annot { font: 12px -apple-system, sans-serif; fill: #374151; }
+    .annot-bold { font: 600 12px -apple-system, sans-serif; }
+  </style>
+</head>
+<body>
+
+<h1>Shortcut training: from scratch to adapter</h1>
+<p class="lead">
+  Pedagogical walkthrough for the advisor meeting.
+  Shortcut models normally retrain a generative model from scratch with a self-consistency objective so it can sample in few steps.
+  Our angle: keep the base frozen and let an adapter learn the few-step behaviour, and crucially, feed the base's local prediction into the adapter so it has a useful starting point.
+</p>
+
+<!-- ============================================================== -->
+<h2>1. Generative models as ODE trajectories</h2>
+
+<p>
+  Both diffusion and flow matching can be sampled by integrating a learned vector field along a trajectory between two endpoints: noise on one side, data on the other.
+  The model's job is to predict the local direction of travel at <span class="math">(x<sub>t</sub>, t)</span>; the sampler's job is to integrate.
+</p>
+
+<p>
+  The cheapest sampler is plain Euler: many small linear steps tangent to the true curve.
+  Each step costs one model forward pass, so cutting the step count by 10× cuts inference cost by 10×.
+  This is the lever shortcut training pulls.
+</p>
+
+<div class="panel">
+  <h3>Euler integration</h3>
+  <svg viewBox="0 0 720 280" width="720" role="img" aria-label="Probability-flow ODE trajectory with 8 small Euler steps">
+    <defs>
+      <marker id="arr-euler" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+      </marker>
+    </defs>
+
+    <!-- Left vertical axis (noise) -->
+    <line class="axis" x1="80" y1="40" x2="80" y2="240"/>
+    <text class="axis-end-label" x="80" y="28" text-anchor="middle">x<tspan font-style="italic">₀</tspan></text>
+    <text class="axis-label" x="80" y="258" text-anchor="middle">noise</text>
+
+    <!-- Right vertical axis (data) -->
+    <line class="axis" x1="640" y1="40" x2="640" y2="240"/>
+    <text class="axis-end-label" x="640" y="28" text-anchor="middle">x<tspan font-style="italic">₁</tspan></text>
+    <text class="axis-label" x="640" y="258" text-anchor="middle">data</text>
+
+    <!-- True curve (smooth Bezier) -->
+    <path class="true-curve" d="M 80 60 C 200 220, 500 30, 640 180"/>
+
+    <!-- Euler segments connecting sample points (the piecewise-linear Euler approximation) -->
+    <path class="euler-seg" d="M 80 60 L 133 105 L 198 125 L 273 129 L 352 124 L 433 118 L 510 120 L 581 138 L 640 180" marker-end="url(#arr-euler)"/>
+
+    <!-- Sample dots -->
+    <circle class="sample-dot" cx="80"  cy="60"  r="3.2"/>
+    <circle class="sample-dot" cx="133" cy="105" r="2.6"/>
+    <circle class="sample-dot" cx="198" cy="125" r="2.6"/>
+    <circle class="sample-dot" cx="273" cy="129" r="2.6"/>
+    <circle class="sample-dot" cx="352" cy="124" r="2.6"/>
+    <circle class="sample-dot" cx="433" cy="118" r="2.6"/>
+    <circle class="sample-dot" cx="510" cy="120" r="2.6"/>
+    <circle class="sample-dot" cx="581" cy="138" r="2.6"/>
+    <circle class="sample-dot" cx="640" cy="180" r="3.2"/>
+
+    <!-- Labels -->
+    <text class="annot" x="360" y="50" text-anchor="middle" fill="#0d9488">true probability-flow ODE trajectory</text>
+    <text class="annot" x="360" y="200" text-anchor="middle" fill="#475569">Euler approximation (8 small linear steps)</text>
+  </svg>
+  <p class="caption">
+    The teal curve is the true trajectory traced by integrating the model's local direction; the dark broken line is what a standard ODE solver (Euler) actually produces: many small chords tangent to the curve.
+    Each chord costs one base-model evaluation. Quality improves with more steps; inference cost grows linearly.
+  </p>
+</div>
+
+<!-- ============================================================== -->
+<h2>2. Shortcut models: predict the full step</h2>
+
+<p>
+  The shortcut models idea (<a href="https://arxiv.org/abs/2410.12557">Frans et al., 2024</a>): instead of predicting only the <em>local</em> direction and integrating many times, train a model that takes the step size <span class="math accent">d</span> as <em>input</em> and predicts the direction of a <em>full step of length d</em>.
+  At inference, one call gives you a step that would have cost many Euler steps.
+</p>
+
+<p>
+  The objective is self-consistency: a shortcut prediction of size <span class="math">2d</span> should equal the average of two shortcut predictions of size <span class="math">d</span> taken in sequence.
+</p>
+
+<p class="bigmath">
+  s(x<sub>t</sub>, t, 2d) &nbsp;≈&nbsp; ½ · s(x<sub>t</sub>, t, d) &nbsp;+&nbsp; ½ · s(x<sub>t+d</sub>, t+d, d)
+</p>
+
+<p>
+  Trained this way, the model can be queried at any step size <span class="math">d</span>; large <span class="math">d</span> lets you traverse the trajectory in a handful of forward passes.
+  But: this requires retraining the entire generative model from scratch.
+</p>
+
+<div class="panel">
+  <h3>Shortcut sampling</h3>
+  <svg viewBox="0 0 720 280" width="720" role="img" aria-label="Same trajectory traversed in 2 large shortcut steps and 1 single shortcut step">
+    <defs>
+      <marker id="arr-shortcut" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+      </marker>
+    </defs>
+
+    <!-- Axes -->
+    <line class="axis" x1="80" y1="40" x2="80" y2="240"/>
+    <text class="axis-end-label" x="80" y="28" text-anchor="middle">x<tspan font-style="italic">₀</tspan></text>
+    <text class="axis-label" x="80" y="258" text-anchor="middle">noise</text>
+    <line class="axis" x1="640" y1="40" x2="640" y2="240"/>
+    <text class="axis-end-label" x="640" y="28" text-anchor="middle">x<tspan font-style="italic">₁</tspan></text>
+    <text class="axis-label" x="640" y="258" text-anchor="middle">data</text>
+
+    <!-- True curve faint -->
+    <path class="true-curve-faint" d="M 80 60 C 200 220, 500 30, 640 180"/>
+
+    <!-- 2-step shortcut -->
+    <path class="shortcut-seg" d="M 80 60 L 352 124 L 640 180" marker-end="url(#arr-shortcut)"/>
+
+    <!-- Sample dots -->
+    <circle class="sample-dot-highlight" cx="80"  cy="60"  r="3.5"/>
+    <circle class="sample-dot-highlight" cx="352" cy="124" r="3.5"/>
+    <circle class="sample-dot-highlight" cx="640" cy="180" r="3.5"/>
+
+    <!-- Labels -->
+    <text class="annot annot-bold" x="216" y="80" fill="#dc2626">shortcut step (size 2d)</text>
+    <text class="annot" x="216" y="96" fill="#dc2626">one model call per arrow</text>
+    <text class="annot" x="450" y="240" text-anchor="middle" fill="#94a3b8">true trajectory (for reference)</text>
+  </svg>
+  <p class="caption">
+    The trajectory now traversed in 2 large steps instead of 8.
+    Single-step shortcut sampling would be the diagonal arrow from <span class="math">x<sub>0</sub></span> to <span class="math">x<sub>1</sub></span> directly: fastest, lowest fidelity. The self-consistency loss is what teaches the model that one step of size <span class="math">2d</span> should land where two steps of size <span class="math">d</span> would.
+  </p>
+</div>
+
+<!-- ============================================================== -->
+<h2>3. Our approach: adapter conditioned on step size, fed the base's local prediction</h2>
+
+<p>
+  Retraining a full video diffusion model from scratch with a shortcut objective is impractical.
+  Instead we freeze the base and put the step-size conditioning + the shortcut loss into an adapter.
+</p>
+
+<p>
+  The crucial design choice: the adapter receives the <span class="key">base model's local prediction</span> as an additional input. That is, the velocity / noise direction the frozen base would have predicted if it had been queried in isolation, with no awareness of <span class="math accent">d</span>.
+  This is the same direction the base contributes to an Euler step.
+</p>
+
+<p>
+  Why hand the base's prediction to the adapter? Because the base already encodes a strong prior about <em>locally</em> where the trajectory wants to go.
+  The adapter's job is then much narrower: starting from a good local direction, produce the <em>step-size-consistent</em> direction: the chord that lands on the trajectory at <span class="math">x<sub>t+d</sub></span>, not the tangent at <span class="math">x<sub>t</sub></span>.
+</p>
+
+<div class="panel">
+  <h3>Adapter as a chord-corrector</h3>
+
+  <svg viewBox="0 0 720 320" width="720" role="img" aria-label="At x_t, the base predicts the tangent direction; the adapter outputs the chord direction to x_{t+d}">
+    <defs>
+      <marker id="arr-tangent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#d97706"/>
+      </marker>
+      <marker id="arr-adapter" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+      </marker>
+    </defs>
+
+    <!-- Axes (faint, for context) -->
+    <line class="axis" x1="80" y1="40" x2="80" y2="240" opacity="0.5"/>
+    <text class="axis-end-label" x="80" y="28" text-anchor="middle" opacity="0.6">x<tspan font-style="italic">₀</tspan></text>
+    <line class="axis" x1="640" y1="40" x2="640" y2="240" opacity="0.5"/>
+    <text class="axis-end-label" x="640" y="28" text-anchor="middle" opacity="0.6">x<tspan font-style="italic">₁</tspan></text>
+
+    <!-- True curve -->
+    <path class="true-curve" d="M 80 60 C 200 220, 500 30, 640 180"/>
+
+    <!-- x_t and x_{t+d} markers -->
+    <circle class="sample-dot-highlight" cx="80"  cy="60"  r="4"/>
+    <circle class="sample-dot-highlight" cx="352" cy="124" r="4"/>
+    <text class="annot annot-bold" x="62" y="58" text-anchor="end">x<tspan font-style="italic">ₜ</tspan></text>
+    <text class="annot annot-bold" x="358" y="116">x<tspan font-style="italic">ₜ₊d</tspan></text>
+
+    <!-- v_base: small tangent arrow at x_t (direction ≈ (0.6, 0.8), length 70) -->
+    <line class="tangent-seg" x1="80" y1="60" x2="122" y2="116" marker-end="url(#arr-tangent)"/>
+    <text class="annot annot-bold" x="118" y="142" fill="#b45309">v<tspan font-style="italic">base</tspan></text>
+    <text class="annot" x="118" y="158" fill="#b45309">= base's local direction</text>
+    <text class="annot" x="118" y="173" fill="#b45309">(tangent at x<tspan font-style="italic">ₜ</tspan>)</text>
+
+    <!-- v_shortcut: chord arrow from x_t to x_{t+d} -->
+    <line class="adapter-seg" x1="80" y1="60" x2="346" y2="123" marker-end="url(#arr-adapter)"/>
+    <text class="annot annot-bold" x="200" y="78" fill="#1d4ed8">v<tspan font-style="italic">shortcut</tspan> = adapter output</text>
+    <text class="annot" x="200" y="93" fill="#1d4ed8">(chord to x<tspan font-style="italic">ₜ₊d</tspan>)</text>
+
+    <!-- Adapter block diagram -->
+    <g transform="translate(120, 230)">
+      <rect x="0" y="0" width="480" height="62" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.4"/>
+      <text class="annot annot-bold" x="240" y="22" text-anchor="middle" fill="#0c1e3d">Adapter (trainable, step-size conditioned)</text>
+      <text class="annot" x="240" y="44" text-anchor="middle" fill="#0c1e3d">
+        input: (x<tspan font-style="italic">ₜ</tspan>, t, c,
+        <tspan font-weight="700" fill="#dc2626">d</tspan>,
+        <tspan font-weight="700" fill="#b45309">v<tspan font-style="italic">base</tspan></tspan>)
+        &nbsp;→&nbsp;
+        output:
+        <tspan font-weight="700" fill="#1d4ed8">v<tspan font-style="italic">shortcut</tspan></tspan>
+      </text>
+    </g>
+  </svg>
+
+  <p class="caption">
+    The base predicts the tangent at <span class="math">x<sub>t</sub></span>, which is accurate for an infinitesimal step but the wrong direction for a finite step <span class="math accent">d</span>, because the trajectory curves.
+    The adapter sees <span class="math">v<sub>base</sub></span>, the step size <span class="math accent">d</span>, and the rest of the conditioning, and learns to output the <em>chord</em> direction: what you'd land at if you took a single step of size <span class="math">d</span>.
+    Concretely the adapter is implementing the transformation <span class="math">v<sub>base</sub></span> → <span class="math">v<sub>shortcut</sub></span> as a function of <span class="math">d</span>.
+  </p>
+</div>
+
+<!-- ============================================================== -->
+<h2>4. Why we think this might work</h2>
+
+<ul class="tight">
+  <li>The base already encodes a strong local prior. Asking the adapter to <em>correct</em> a useful starting direction is plausibly an easier learning problem than asking it to predict the chord direction from scratch.</li>
+  <li>At <span class="math accent">d</span> → 0 the correct output of the adapter is exactly <span class="math">v<sub>base</sub></span>. The architecture makes this regime trivially representable (the adapter can pass <span class="math">v<sub>base</sub></span> through unchanged), giving us a sensible default behaviour.</li>
+  <li>The framework is adapter-family agnostic: the same shortcut training scheme applies whether the adapter is an output residual, a hidden-state modulation, a LoRA, or a hypernetwork. Comparing families on the shortcut speed–quality frontier is one of the planned ablations.</li>
+</ul>
+
+<!-- ============================================================== -->
+<h2>References &amp; code anchors</h2>
+
+<ul class="tight">
+  <li>Shortcut models paper: Frans et al., <em>"One Step Diffusion via Shortcut Models"</em>, arXiv:2410.12557 (2024). See thesis vault: <code>30_Knowledge/related-work/shortcut-models.md</code>.</li>
+  <li>Shortcut adapter with <code>include_base_direction=True</code> (the input we're describing above): <code>src/generative_flow_adapters/adapters/output/shortcut_direction.py</code>, lines 20–47 and 72–80.</li>
+  <li>Self-distilled training target construction (frozen base, two-step averaging): <code>src/generative_flow_adapters/training/shortcut_targets.py</code>, <code>_compute_two_step_shortcut_target</code> at lines 94–125. (Known divergence from paper formulation tracked in <code>20_Tickets/bug-training-shortcut-target-timestep.md</code>.)</li>
+  <li>Forward-time training-data flow figure: <code>figures/shortcut-training.html</code>.</li>
+</ul>
+
+</body>
+</html>
