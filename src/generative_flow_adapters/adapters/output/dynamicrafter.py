@@ -29,6 +29,7 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         use_step_level_conditioning: bool = False,
         step_level_key: str = "step_level",
         step_level_hidden_dim: int | None = None,
+        step_level_transform: str = "linear",
     ) -> None:
         super().__init__()
 
@@ -42,6 +43,7 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         self.allow_dummy_concat_condition = allow_dummy_concat_condition
         self.use_step_level_conditioning = use_step_level_conditioning
         self.step_level_key = step_level_key
+        self.step_level_transform = step_level_transform
         self.step_level_hidden_dim = int(step_level_hidden_dim or (cond_hidden_dim or cond_dim or 128))
         if self.use_adapter_conditioning and self.cond_dim is not None and self.cond_dim > 0:
             params["adapter_condition_dim"] = self.cond_dim
@@ -104,6 +106,7 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
             use_step_level_conditioning=self.use_step_level_conditioning,
             step_level_key=self.step_level_key,
             step_level_embed=self.step_level_embed,
+            step_level_transform=self.step_level_transform,
         )
         context = None
         act = None

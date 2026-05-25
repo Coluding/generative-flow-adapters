@@ -135,6 +135,106 @@ class WandbLoggerVideoPanelTest(unittest.TestCase):
         self.assertNotIn("base_model", video.caption)
 
 
+class WandbLoggerStepSizeGridTest(unittest.TestCase):
+    def test_grid_stacks_rows_per_step_count_with_base(self):
+        fake_log: list = []
+        logger = _make_logger(fake_log)
+        target = torch.zeros(1, 4, 2, 4, 8)  # [B, C, T, H, W]; decode → H=4, W=8
+        adapted_by_steps = [(1, torch.zeros(1, 4, 2, 4, 8)), (4, torch.zeros(1, 4, 2, 4, 8))]
+        base_by_steps = [(1, torch.zeros(1, 4, 2, 4, 8)), (4, torch.zeros(1, 4, 2, 4, 8))]
+
+        logger.log_step_size_grid(
+            target_latents=target,
+            adapted_by_steps=adapted_by_steps,
+            base_by_steps=base_by_steps,
+            cond={"act": torch.randn(1, 2, 4)},
+            step=11,
+        )
+
+        payload, step = fake_log[0]
+        self.assertEqual(step, 11)
+        video = payload["eval_step_grid/sample_0"]
+        # data is [T, C, H, W]. Two rows (N=1, N=4) stacked → H = 4 * 2 = 8.
+        self.assertEqual(video.data.shape[-2], 8)
+        # Each row is gt|base|adapted → W = 8 * 3 = 24.
+        self.assertEqual(video.data.shape[-1], 24)
+        self.assertIn("N=1, N=4", video.caption)
+        self.assertIn("gt | base | adapted", video.caption)
+
+    def test_grid_omits_base_column_when_base_absent(self):
+        fake_log: list = []
+        logger = _make_logger(fake_log)
+        target = torch.zeros(1, 4, 2, 4, 8)
+        adapted_by_steps = [(2, torch.zeros(1, 4, 2, 4, 8))]
+
+        logger.log_step_size_grid(
+            target_latents=target,
+            adapted_by_steps=adapted_by_steps,
+            base_by_steps=None,
+            cond=None,
+            step=3,
+        )
+
+        video = fake_log[0][0]["eval_step_grid/sample_0"]
+        # Single row, gt|adapted → W = 8 * 2 = 16, H = 4.
+        self.assertEqual(video.data.shape[-2], 4)
+        self.assertEqual(video.data.shape[-1], 16)
+        self.assertIn("gt | adapted", video.caption)
+
+
+class EvalStepScheduleParseTest(unittest.TestCase):
+    @staticmethod
+    def _parse(extra: dict):
+        import types
+
+        from generative_flow_adapters.training.trainer import Trainer
+
+        stub = types.SimpleNamespace(config=types.SimpleNamespace(extra=extra), step_schedule=None)
+        return Trainer._eval_step_schedule(stub)
+
+    def test_absent_schedule_returns_empty(self):
+        self.assertEqual(self._parse({}), [])
+
+    def test_mapping_entries_parsed_with_optional_step_level(self):
+        schedule = self._parse(
+            {"eval_step_schedule": [{"num_steps": 4, "step_level": 250}, {"num_steps": 25}]}
+        )
+        self.assertEqual(schedule, [(4, 250.0), (25, None)])
+
+    def test_bare_int_entries_have_no_step_level(self):
+        self.assertEqual(self._parse({"eval_step_schedule": [1, 2, 8]}), [(1, None), (2, None), (8, None)])
+
+    @staticmethod
+    def _parse_with_schedule(extra: dict, schedule):
+        import types
+
+        from generative_flow_adapters.training.trainer import Trainer
+
+        stub = types.SimpleNamespace(config=types.SimpleNamespace(extra=extra), step_schedule=schedule)
+        return Trainer._eval_step_schedule(stub)
+
+    def test_grid_derived_from_step_schedule_when_no_explicit_block(self):
+        from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
+
+        schedule = ShortcutStepSchedule.from_config(
+            {"units": "normalized", "mode": "log2", "min": 1 / 8, "max": 1.0, "base": 2},
+            timesteps=1000,
+        )
+        # Levels {1/8, 1/4, 1/2, 1} → N = 8,4,2,1 with normalised step_level,
+        # largest-step (fewest steps) first.
+        result = self._parse_with_schedule({}, schedule)
+        self.assertEqual([n for n, _ in result], [1, 2, 4, 8])
+        self.assertAlmostEqual(result[0][1], 1.0)
+        self.assertAlmostEqual(result[-1][1], 0.125)
+
+    def test_explicit_block_overrides_step_schedule(self):
+        from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
+
+        schedule = ShortcutStepSchedule.from_config({"mode": "log2", "min": 1 / 8, "max": 1.0}, timesteps=1000)
+        result = self._parse_with_schedule({"eval_step_schedule": [4, 25]}, schedule)
+        self.assertEqual(result, [(4, None), (25, None)])
+
+
 class WandbLoggerMetricsTest(unittest.TestCase):
     def test_log_metrics_filters_non_scalar_and_prefixes_keys(self):
         fake_log: list = []

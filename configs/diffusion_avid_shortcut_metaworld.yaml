@@ -38,7 +38,7 @@ adapter:
   gate_bias: 0.0
   extra:
     architecture: dynamicrafter
-    unet_config_path: configs/base/dynamicrafter512.yaml
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
     condition_on_base_outputs: true
     output_mask: true
     strict_checkpoint: false
@@ -46,6 +46,12 @@ adapter:
     use_step_level_conditioning: true
     step_level_key: step_level
     step_level_hidden_dim: 64
+    # The trainer injects a normalised step size s ∈ (0,1] (see
+    # training.extra.shortcut_step_schedule). `log2` feeds log2(s) into the
+    # Linear(1,·) embed so a dyadic schedule spans a well-conditioned range
+    # (~[-7,0]) instead of crushing the fine end near zero. Use "linear" to
+    # feed s directly (also fine since it is now bounded).
+    step_level_transform: log2
     allow_dummy_concat_condition: true
 
 conditioning:
@@ -84,9 +90,28 @@ training:
   extra:
     amp_dtype: bf16
     shortcut_step_level_key: step_level
-    shortcut_step_level_min: 1
-    shortcut_step_level_max: 4
     shortcut_anchor_prob: 0.6
+    # Paper-faithful step-size schedule (Frans et al. 2024). Canonical unit is a
+    # NORMALISED step size s ∈ (0,1]: s=1 is one-step generation, s=1/128 the
+    # finest. This single schedule drives BOTH training (a step size sampled per
+    # batch; the finest level is the anchor/grounding step) AND the eval grid
+    # (each level s → num_steps = round(1/s), injecting step_level = s).
+    #
+    #   units: normalized | timesteps   (timesteps values are divided by T=1000)
+    #   mode:  log2 | explicit | uniform
+    #     log2     -> dyadic ladder from min to max (set below = paper's 8 sizes)
+    #     explicit -> values: [..] list in `units`
+    #     uniform  -> sample continuously in [min, max]
+    # Bounds/values accept readable fractions (parsed to floats), e.g. 1/128.
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128   # finest — grounded by the standard loss
+      max: 1       # one-step
+      base: 2
+    # Eval grid is derived from shortcut_step_schedule above (levels →
+    # 1/2/4/.../128 steps). Override here with an explicit eval_step_schedule
+    # (list of {num_steps, step_level}) only to probe levels outside training.
     video_logging:
       enable: true
       num_samples: 2

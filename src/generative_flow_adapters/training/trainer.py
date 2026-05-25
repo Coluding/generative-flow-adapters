@@ -13,6 +13,7 @@ from generative_flow_adapters.inference import DiffusionInferenceSampler
 from generative_flow_adapters.losses.diffusion import DiffusionTrainingObjective
 from generative_flow_adapters.losses.flow_matching import FlowMatchingTrainingObjective
 from generative_flow_adapters.losses.registry import LossRegistry
+from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
 
 
 class Trainer:
@@ -63,6 +64,16 @@ class Trainer:
             )
         else:
             self.base_inference_sampler = None
+        # Paper-faithful step-size schedule (normalised s ∈ (0,1]). When set it
+        # drives both training (sampled step size per batch) and the eval grid,
+        # and the injected step_level becomes normalised. Absent → legacy raw-
+        # timestep dyadic behaviour (`shortcut_step_level_max`).
+        raw_schedule = config.extra.get("shortcut_step_schedule")
+        self.step_schedule: ShortcutStepSchedule | None = (
+            ShortcutStepSchedule.from_config(raw_schedule, timesteps=self.diffusion_objective.timesteps)
+            if isinstance(raw_schedule, Mapping)
+            else None
+        )
         self.flow_objective = FlowMatchingTrainingObjective(
             sigma_min=float(config.extra.get("flow_sigma_min", 1e-5)),
             shift_schedule=bool(config.extra.get("flow_shift_schedule", True)),
@@ -175,6 +186,12 @@ class Trainer:
             prediction = prediction.float()
             loss = self.loss_fn(prediction, target)
 
+        # Record each loss term separately so wandb shows the base loss and
+        # every shortcut-consistency term next to the combined total. For
+        # shortcut training their relative magnitudes are the key signal for
+        # spotting collapse or a mis-weighted term.
+        loss_components: dict[str, float] = {"base_loss": float(loss.detach().cpu())}
+
         batch = dict(batch)
         if shortcut_target is not None:
             batch.setdefault("shortcut_target", shortcut_target)
@@ -185,6 +202,7 @@ class Trainer:
             if not isinstance(shortcut_target, Tensor):
                 raise TypeError("batch['shortcut_target'] must be a tensor.")
             consistency = LossRegistry.get_consistency_loss("local_consistency")(prediction, shortcut_target)
+            loss_components["local_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.local_consistency_weight * consistency
 
         if self.config.shortcut_direction_weight > 0.0 and "shortcut_target" in batch:
@@ -192,6 +210,7 @@ class Trainer:
             if not isinstance(shortcut_target, Tensor):
                 raise TypeError("batch['shortcut_target'] must be a tensor.")
             shortcut_loss = LossRegistry.get_consistency_loss("shortcut_direction")(prediction, shortcut_target)
+            loss_components["shortcut_direction_loss"] = float(shortcut_loss.detach().cpu())
             loss = loss + self.config.shortcut_direction_weight * shortcut_loss
 
         if self.config.multistep_consistency_weight > 0.0 and "self_consistency_target" in batch:
@@ -199,6 +218,7 @@ class Trainer:
             if not isinstance(self_consistency_target, Tensor):
                 raise TypeError("batch['self_consistency_target'] must be a tensor.")
             consistency = LossRegistry.get_consistency_loss("multistep_self_consistency")(prediction, self_consistency_target)
+            loss_components["multistep_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.multistep_consistency_weight * consistency
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -209,11 +229,9 @@ class Trainer:
         self.global_step += 1
 
         metrics: dict[str, object] = {"loss": float(loss.detach().cpu())}
-        if self.config.shortcut_direction_weight > 0.0 and "shortcut_target" in batch:
-            shortcut_target = batch["shortcut_target"]
-            if isinstance(shortcut_target, Tensor):
-                shortcut_metric = LossRegistry.get_consistency_loss("shortcut_direction")(prediction.detach(), shortcut_target.detach())
-                metrics["shortcut_direction_loss"] = float(shortcut_metric.detach().cpu())
+        # Components were captured during the forward (pre-backward), so they
+        # reflect the loss at the params actually used — no redundant re-forward.
+        metrics.update(loss_components)
         generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
         if generated_samples is not None:
             metrics["generated_samples"] = generated_samples.detach().cpu()
@@ -370,13 +388,38 @@ class Trainer:
                 anchor_prob > 0.0
                 and bool(torch.rand((), device="cpu").item() < anchor_prob)
             )
+
+            if self.step_schedule is not None:
+                # Paper-faithful path: step sizes are normalised s ∈ (0,1] drawn
+                # from the configured schedule. Anchor grounds the model at the
+                # finest step with the standard loss (the schedule's empirical-
+                # velocity end); otherwise sample a larger s and supervise it
+                # against the average of two chained calls at s/2 (the rung
+                # below), converting s/2 to a timestep jump for the micro-step.
+                if do_anchor:
+                    step_level = torch.full(
+                        (batch_size,), float(self.step_schedule.smallest()), device=device, dtype=dtype
+                    )
+                    return self._inject_step_level(cond, step_level_key, step_level), None
+                s_full = self.step_schedule.sample(exclude_smallest=True)
+                s_half = s_full / 2.0
+                jump = self.step_schedule.to_timestep_jump(s_half)
+                step_level_full = torch.full((batch_size,), float(s_full), device=device, dtype=dtype)
+                step_level_half = torch.full((batch_size,), float(s_half), device=device, dtype=dtype)
+                new_cond = self._inject_step_level(cond, step_level_key, step_level_full)
+                cond_half = self._inject_step_level(cond, step_level_key, step_level_half)
+                target = self._compute_self_consistency_target_v(
+                    x_t=x_t, t=t, cond_half=cond_half, d=jump
+                )
+                return new_cond, target
+
+            # Legacy self-consistency (no schedule): dyadic d in raw timesteps,
+            # supervise the adapter at step_level=2d against two calls at d.
             if do_anchor:
                 step_level = torch.ones(batch_size, device=device, dtype=dtype)
                 new_cond = self._inject_step_level(cond, step_level_key, step_level)
                 return new_cond, None
 
-            # Self-consistency mode: sample dyadic d, supervise the adapter at
-            # step_level=2d against the average of two adapter calls at d.
             dyadic_max = int(self.config.extra.get("shortcut_step_level_max", 4))
             d_value = self._sample_dyadic_d(dyadic_max=dyadic_max)
             step_level_full = torch.full(
@@ -550,6 +593,46 @@ class Trainer:
         steps = num_inference_steps or self.config.inference_num_steps
         return self.inference_sampler.sample_from_batch(batch=batch, num_inference_steps=steps)
 
+    def _eval_step_schedule(self) -> list[tuple[int, float | None]]:
+        """``(num_steps, step_level)`` pairs for the multi-step eval grid.
+
+        Priority:
+        1. An explicit ``training.extra.eval_step_schedule`` (ints, or
+           ``{num_steps, step_level}`` mappings) — wins if present.
+        2. Otherwise, if a paper-faithful ``shortcut_step_schedule`` with
+           discrete levels is set, derive the grid from it: each normalised
+           level ``s`` gives ``num_steps = round(1/s)`` and injects
+           ``step_level = s`` (so train and eval share one source of truth).
+
+        ``step_level = None`` means "inject nothing" (correct for the frozen
+        base / non-shortcut adapters). Empty when neither is configured (eval
+        falls back to the single-step path)."""
+        raw = self.config.extra.get("eval_step_schedule")
+        if raw:
+            schedule: list[tuple[int, float | None]] = []
+            for entry in raw:
+                if isinstance(entry, Mapping):
+                    num_steps = int(entry["num_steps"])
+                    step_level = entry.get("step_level")
+                    step_level = None if step_level is None else float(step_level)
+                elif isinstance(entry, (int, float)):
+                    num_steps = int(entry)
+                    step_level = None
+                else:
+                    raise ValueError(
+                        "eval_step_schedule entries must be ints or mappings with "
+                        f"a 'num_steps' key; got {entry!r}."
+                    )
+                schedule.append((num_steps, step_level))
+            return schedule
+
+        if self.step_schedule is not None:
+            levels = self.step_schedule.discrete_levels()
+            if levels:
+                # Largest step first → fewest sampling steps at the top row.
+                return [(max(1, int(round(1.0 / s))), float(s)) for s in sorted(levels, reverse=True)]
+        return []
+
     def _maybe_generate_samples(self, batch: Mapping[str, Tensor | object], model_type: str | None) -> Tensor | None:
         if model_type != "diffusion":
             return None
@@ -557,6 +640,10 @@ class Trainer:
             return None
         if self.global_step % self.config.inference_every_n_steps - 1 != 0:
             return None
+
+        schedule = self._eval_step_schedule()
+        if schedule:
+            return self._generate_step_size_grid(batch=batch, schedule=schedule)
 
         target = batch.get("target")
         steps = self.config.inference_num_steps
@@ -588,6 +675,65 @@ class Trainer:
                 step=self.global_step,
             )
         return samples
+
+    def _generate_step_size_grid(
+        self,
+        *,
+        batch: Mapping[str, Tensor | object],
+        schedule: list[tuple[int, float | None]],
+    ) -> Tensor | None:
+        """Sample the adapted model (and the frozen base) at every step count
+        in ``schedule`` and log a stacked comparison grid.
+
+        For a shortcut model the per-entry ``step_level`` is injected into the
+        adapted cond so the adapter knows which multi-step horizon it is
+        approximating; the base never sees step_level. All rollouts share one
+        noise draw so differences across step counts and against the base are
+        purely model-driven. Returns the highest-step-count adapted sample (so
+        the caller can keep the existing ``generated_samples`` metric) or
+        ``None`` when prerequisites are missing.
+        """
+        target = batch.get("target")
+        if self.wandb_logger is None or not isinstance(target, Tensor):
+            return None
+
+        shared_noise = torch.randn_like(target)
+        step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
+        cond = batch.get("cond")
+        base_cond = _strip_adapter_only_keys(cond)
+
+        adapted_by_steps: list[tuple[int, Tensor]] = []
+        base_by_steps: list[tuple[int, Tensor]] = []
+        for num_steps, step_level in schedule:
+            adapted_cond = cond
+            if step_level is not None:
+                level = torch.full(
+                    (target.shape[0],), float(step_level), device=target.device, dtype=target.dtype
+                )
+                adapted_cond = self._inject_step_level(cond, step_level_key, level)
+            adapted = self.inference_sampler.sample_from_batch(
+                batch={"target": target, "cond": adapted_cond},
+                num_inference_steps=num_steps,
+                initial_sample=shared_noise,
+            )
+            adapted_by_steps.append((num_steps, adapted))
+
+            if self.base_inference_sampler is not None:
+                base = self.base_inference_sampler.sample_from_batch(
+                    batch={"target": target, "cond": base_cond},
+                    num_inference_steps=num_steps,
+                    initial_sample=shared_noise,
+                )
+                base_by_steps.append((num_steps, base))
+
+        self.wandb_logger.log_step_size_grid(
+            target_latents=target,
+            adapted_by_steps=adapted_by_steps,
+            base_by_steps=base_by_steps or None,
+            cond=cond,
+            step=self.global_step,
+        )
+        return adapted_by_steps[-1][1] if adapted_by_steps else None
 
 
 def _call_preprocessor(preprocessor: Callable[..., Mapping[str, object]], raw_batch: object) -> Mapping[str, object]:

@@ -38,6 +38,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         use_step_level_conditioning: bool = False,
         step_level_key: str = "step_level",
         step_level_hidden_dim: int | None = None,
+        step_level_transform: str = "linear",
         use_factorized_memory_position: bool = True,
         update_mode: str = "stepwise",
         piecewise_progress_markers: tuple[float, ...] = (0.0, 0.05, 0.20),
@@ -62,6 +63,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
         self.num_decoder_heads = num_decoder_heads
         self.use_step_level_conditioning = use_step_level_conditioning
         self.step_level_key = step_level_key
+        self.step_level_transform = step_level_transform
         self.step_level_hidden_dim = int(step_level_hidden_dim or (cond_hidden_dim or cond_dim or 128))
         self.use_factorized_memory_position = bool(use_factorized_memory_position)
         self.update_mode = _normalize_update_mode(update_mode)
@@ -213,6 +215,7 @@ class HyperAlignAdapter(HyperNetworkAdapterInterface):
             use_step_level_conditioning=self.use_step_level_conditioning,
             step_level_key=self.step_level_key,
             step_level_embed=self.step_level_embed,
+            step_level_transform=self.step_level_transform,
         )
 
     def _build_condition_tokens(self, condition_embedding: Tensor, *, frames: int) -> Tensor:
