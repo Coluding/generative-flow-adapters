@@ -43,6 +43,7 @@ class DynamicCrafterUNetWrapper(BaseGenerativeModel):
         allow_missing_checkpoint: bool = False,
         allow_dummy_concat_condition: bool = False,
         load_first_stage_model: bool = False,
+        dtype: torch.dtype | None = None,
     ) -> "DynamicCrafterUNetWrapper":
         from generative_flow_adapters.backbones.dynamicrafter.modules.networks.openaimodel3d import UNetModel
 
@@ -59,9 +60,17 @@ class DynamicCrafterUNetWrapper(BaseGenerativeModel):
             first_stage_model=first_stage_model,
         )
         if checkpoint_path:
-            if allow_missing_checkpoint and not Path(checkpoint_path).exists():
-                return wrapper
-            wrapper.load_checkpoint(checkpoint_path=checkpoint_path, strict=strict_checkpoint)
+            if not (allow_missing_checkpoint and not Path(checkpoint_path).exists()):
+                wrapper.load_checkpoint(checkpoint_path=checkpoint_path, strict=strict_checkpoint)
+        if dtype is not None:
+            # Cast the frozen base after weight load so checkpoint tensors are
+            # downcast in one shot. We also stamp `module.dtype` because the
+            # vendored UNet reads it in several places (e.g. input projection
+            # casts in `hyperalign._build_encoder_memory`).
+            wrapper.module.to(dtype)
+            wrapper.module.dtype = dtype
+            if wrapper.first_stage_model is not None:
+                wrapper.first_stage_model.to(dtype)
         return wrapper
 
     def load_checkpoint(self, checkpoint_path: str, strict: bool = False) -> None:
@@ -96,7 +105,15 @@ class DynamicCrafterUNetWrapper(BaseGenerativeModel):
             )
         return self.first_stage_model.decode_video(latents)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return getattr(self.module, "dtype", next(self.module.parameters()).dtype)
+
     def forward(self, x_t: Tensor, t: Tensor, cond: object | None = None) -> Tensor:
+        target_dtype = self.dtype
+        if x_t.is_floating_point() and x_t.dtype != target_dtype:
+            x_t = x_t.to(target_dtype)
+
         model_input = x_t
         context = None
         act = None
@@ -105,7 +122,11 @@ class DynamicCrafterUNetWrapper(BaseGenerativeModel):
 
         if isinstance(cond, dict):
             context = cond.get("context")
+            if isinstance(context, Tensor) and context.is_floating_point() and context.dtype != target_dtype:
+                context = context.to(target_dtype)
             act = cond.get("act")
+            if isinstance(act, Tensor) and act.is_floating_point() and act.dtype != target_dtype:
+                act = act.to(target_dtype)
             fs = cond.get("fs")
             concat = cond.get("concat")
             if "dropout_actions" in cond:

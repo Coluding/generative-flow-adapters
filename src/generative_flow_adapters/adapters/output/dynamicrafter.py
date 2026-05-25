@@ -46,6 +46,13 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         if self.use_adapter_conditioning and self.cond_dim is not None and self.cond_dim > 0:
             params["adapter_condition_dim"] = self.cond_dim
             params["adapter_condition_hidden_dim"] = self.cond_hidden_dim
+            # The UNet's concat path (add_act_time_emb=False) was designed for
+            # action_conditioned=True, where time_emb and action_emb are each
+            # half embed_dim and concat produces a full-width emb. When we feed
+            # an adapter_embedding instead (action_conditioned=False), both
+            # vectors are full embed_dim; concat would double the width and
+            # break fs_embed + ResBlock addition. Force the ADD branch.
+            params.setdefault("add_act_time_emb", True)
         if self.condition_on_base_outputs:
             params["in_channels"] = int(params["in_channels"]) + int(params["out_channels"])
         if self.output_mask:

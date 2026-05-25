@@ -1,0 +1,95 @@
+name: diffusion_hyperalign_metaworld
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: false
+  include_base_condition: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: false
+    allow_missing_checkpoint: false
+    # Set to true to attach the DynamiCrafter VAE so eval-time samples can be
+    # decoded to RGB and logged to wandb. Requires the checkpoint to contain
+    # `first_stage_model.*` keys (the official DynamiCrafter release does).
+    load_first_stage_model: true
+
+adapter:
+  type: hyper
+  hidden_dim: 128
+  rank: 4
+  alpha: 1.0
+  # How the adapter's output is mixed with the frozen base prediction:
+  #   add       - prediction = base + (adapted - base) = adapted (default).
+  #   replace   - prediction = adapted (functionally same as add for HyperAlign).
+  #   mask_mix  - prediction = base * sigmoid(gate) + adapted * (1 - sigmoid(gate))
+  #               The adapter learns per-channel (or per-spatial) gates that
+  #               decide where to trust the base vs the adapter.
+  composition: add
+  extra:
+    architecture: hyperalign
+    aux_down_dim: 16
+    aux_up_dim: 16
+    num_decoder_layers: 12
+    num_decoder_heads: 8
+    update_mode: stepwise
+    # Only consulted when composition == "mask_mix":
+    #   channel  - one gate scalar per output channel, broadcast over T/H/W.
+    #              Cheapest, most stable. (default)
+    #   spatial  - per-spatial-location gate produced by a small Conv2d off the
+    #              shallowest captured encoder feature. Per (B, C, T, H, W).
+    mask_mix_gate_kind: channel
+    # How the condition embedding (from the structured condition encoder) enters
+    # the hypernetwork. Options:
+    #   memory_tokens   - per-frame condition tokens concatenated to the decoder
+    #                     memory (Option B). Decoder cross-attention pulls
+    #                     whichever frames each LoRA layer needs.
+    #   cross_attention - dedicated cross-attention block where the queries
+    #                     attend over the condition sequence before the decoder
+    #                     (Option A).
+    #   none            - ablation: no condition signal reaches the hypernetwork.
+    # The frozen base UNet never receives the condition embedding in any mode.
+    condition_injection_mode: memory_tokens
+    condition_cross_attention_heads: 4
+
+conditioning:
+  type: structured
+  output_dim: 512
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  # Run inference + decode every N steps. Requires model.extra.load_first_stage_model=true.
+  inference_every_n_steps: 10
+  inference_num_steps: 25
+  extra:
+    # Mixed-precision autocast for the model forward. bf16 lets the frozen
+    # DynamiCrafter UNet's SDPA route to the Flash kernel on Ampere+ while
+    # weights stay fp32 and the loss/backward run in fp32 (no GradScaler).
+    # Set to fp32/none to disable.
+    amp_dtype: bf16
+    video_logging:
+      enable: true              # set true to push videos to wandb
+      num_samples: 2            # two side-by-side (ground truth | prediction) clips per eval
+      fps: 4
+      wandb_project: hyperalign-metaworld
+      # wandb_run_name: <set to override the experiment name>
+

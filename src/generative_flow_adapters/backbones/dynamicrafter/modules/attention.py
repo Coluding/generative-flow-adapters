@@ -72,10 +72,15 @@ class CrossAttention(nn.Module):
             assert temporal_length is not None
             self.relative_position_k = RelativePosition(num_units=dim_head, max_relative_position=temporal_length)
             self.relative_position_v = RelativePosition(num_units=dim_head, max_relative_position=temporal_length)
-        else:
-            ## only used for spatial attention, while NOT for temporal attention
-            if XFORMERS_IS_AVAILBLE and temporal_length is None:
-                self.forward = self.efficient_forward
+        # NOTE: We intentionally do NOT route spatial attention to
+        # `efficient_forward` (xformers), even when xformers is importable. The
+        # SDPA path in `forward` already dispatches to the Flash / mem-efficient
+        # backend, runs under autocast (bf16 -> Flash kernel), and additionally
+        # supports masks and relative position. The xformers path added nothing
+        # over SDPA here and broke outright when a CPU-only xformers wheel was
+        # installed (`memory_efficient_attention` has no CUDA op, and autocast
+        # doesn't cast into it so it stays fp32). `efficient_forward` is kept
+        # below only as dead reference code.
 
         self.video_length = video_length
         self.image_cross_attention = image_cross_attention
@@ -108,26 +113,29 @@ class CrossAttention(nn.Module):
             k = self.to_k(context)
             v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
+        # Reshape to 4D (B, H, N, D) so PyTorch's SDPA dispatcher can route to
+        # the Flash / mem-efficient backends — they require a 4D layout and
+        # fall back to the math backend (which materializes the full (N, N)
+        # scores matrix) for any other rank. Saves multiple GB at high spatial
+        # resolution / long temporal length.
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
-        # When the relative-position branch and the explicit causal mask aren't
-        # in play, route through PyTorch's SDPA — Flash / mem-efficient backend
-        # never materializes the (N, N) attention matrix, saving multiple GB
-        # at high spatial resolution / long temporal length. Falls back to the
-        # original manual softmax otherwise so the relative-position math is
-        # preserved.
         use_sdpa = (not self.relative_position) and (not exists(mask))
         if use_sdpa:
-            out = F.scaled_dot_product_attention(q, k, v)              # (b*h, n, d)
+            out = F.scaled_dot_product_attention(q, k, v)          # (b, h, n, d)
             del k
         else:
-            sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
+            # Manual softmax path keeps the original (b*h, n, d) layout.
+            q3 = rearrange(q, "b h n d -> (b h) n d")
+            k3 = rearrange(k, "b h n d -> (b h) n d")
+            v3 = rearrange(v, "b h n d -> (b h) n d")
+            sim = torch.einsum("b i d, b j d -> b i j", q3, k3) * self.scale
             if self.relative_position:
-                len_q, len_k, len_v = q.shape[1], k.shape[1], v.shape[1]
+                len_q, len_k, len_v = q3.shape[1], k3.shape[1], v3.shape[1]
                 k2 = self.relative_position_k(len_q, len_k)
-                sim2 = einsum("b t d, t s d -> b t s", q, k2) * self.scale
+                sim2 = einsum("b t d, t s d -> b t s", q3, k2) * self.scale
                 sim += sim2
-            del k
+            del k, k3
 
             if exists(mask):
                 max_neg_value = -torch.finfo(sim.dtype).max
@@ -135,19 +143,21 @@ class CrossAttention(nn.Module):
                 sim.masked_fill_(~(mask > 0.5), max_neg_value)
 
             sim = sim.softmax(dim=-1)
-            out = torch.einsum("b i j, b j d -> b i d", sim, v)
+            out3 = torch.einsum("b i j, b j d -> b i d", sim, v3)
             if self.relative_position:
                 v2 = self.relative_position_v(len_q, len_v)
                 out2 = einsum("b t s, t s d -> b t d", sim, v2)
-                out += out2
-        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
+                out3 = out3 + out2
+            out = rearrange(out3, "(b h) n d -> b h n d", h=h)
+        out = rearrange(out, "b h n d -> b n (h d)")
 
         ## for image cross-attention
         if k_ip is not None:
-            k_ip, v_ip = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (k_ip, v_ip))
-            out_ip = F.scaled_dot_product_attention(q, k_ip, v_ip)     # same memory benefit
+            k_ip = rearrange(k_ip, "b n (h d) -> b h n d", h=h)
+            v_ip = rearrange(v_ip, "b n (h d) -> b h n d", h=h)
+            out_ip = F.scaled_dot_product_attention(q, k_ip, v_ip)  # 4D as above
             del k_ip
-            out_ip = rearrange(out_ip, "(b h) n d -> b n (h d)", h=h)
+            out_ip = rearrange(out_ip, "b h n d -> b n (h d)")
 
         if out_ip is not None:
             if self.image_cross_attention_scale_learnable:

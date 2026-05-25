@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+
+# Important Guideline
+Everytime you implement a new feature or a change, find a bug, raise a question that could not be dicussed 
+within the running session, add this to ../thesis-vault. It is the second brain of the thesis proejct and we track 
+everything about the thesis implementation and code in there.
+
 ## Build and Test Commands
 
 ```bash
@@ -101,6 +107,7 @@ New backbones go in `models/base/`. Current providers:
 - `avid_utils/`: AVID evaluation utilities
 
 `backbones/dynamicrafter/` contains adapted DynamiCrafter model code.
+
 
 ## Extension Points
 

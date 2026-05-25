@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -29,6 +30,7 @@ class Trainer:
         self.config = config
         self.wandb_logger = wandb_logger
         self.global_step = 0
+        self._amp_dtype = self._resolve_amp_dtype(config.extra.get("amp_dtype"))
         diffusion_schedule = getattr(model, "diffusion_schedule_config", None) or {}
         self.diffusion_objective = DiffusionTrainingObjective(
             timesteps=int(diffusion_schedule.get("timesteps", config.diffusion_timesteps)),
@@ -71,6 +73,33 @@ class Trainer:
             temporal_sqrt_scaling=bool(config.extra.get("flow_temporal_sqrt_scaling", True)),
         )
 
+    @staticmethod
+    def _resolve_amp_dtype(value: object | None) -> torch.dtype | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.dtype):
+            return value
+        key = str(value).strip().lower()
+        if key in {"none", "fp32", "float32", ""}:
+            return None
+        mapping = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+        }
+        if key not in mapping:
+            raise ValueError(f"Unsupported amp_dtype: {value!r}. Expected one of bf16/fp16/none.")
+        return mapping[key]
+
+    def _autocast(self):
+        """Autocast context for the model forward (no-op unless amp_dtype is set)."""
+        if self._amp_dtype is None:
+            return contextlib.nullcontext()
+        device_type = next(self.model.parameters()).device.type
+        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
+
     def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
         self.model.train()
         model_type = getattr(self.model, "model_type", None)
@@ -94,7 +123,12 @@ class Trainer:
             cond, shortcut_target = self._maybe_prepare_shortcut(
                 batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
             )
-            prediction = self.model(x_t, t, cond)
+            with self._autocast():
+                prediction = self.model(x_t, t, cond)
+            # Upcast the (possibly bf16) prediction back to fp32 so the loss and
+            # backward run in full precision — keeps autograd dtypes consistent
+            # and the diffusion loss numerically stable. No-op when amp is off.
+            prediction = prediction.float()
             target_tensor = self.diffusion_objective.get_target(
                 prediction_type=prediction_type or "noise",
                 x_start=target_scaled,
@@ -134,7 +168,11 @@ class Trainer:
             cond, shortcut_target = self._maybe_prepare_shortcut(
                 batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
             )
-            prediction = self.model(x_t, t, cond)
+            with self._autocast():
+                prediction = self.model(x_t, t, cond)
+            # See diffusion branch: upcast to fp32 for a precision-consistent
+            # loss/backward. No-op when amp is off.
+            prediction = prediction.float()
             loss = self.loss_fn(prediction, target)
 
         batch = dict(batch)
