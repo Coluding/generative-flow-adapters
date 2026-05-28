@@ -8,9 +8,19 @@ version = "0.1.0"
 description = "Adapter-first research framework for action-conditioned diffusion and flow world models"
 readme = "README.md"
 requires-python = ">=3.10"
+
 dependencies = [
-  "torch>=2.2",
+  "torch==2.9.0",
+  "torchvision==0.24.0",
+  "torchaudio==2.9.0",
+  "xformers==0.0.33.post1",
   "PyYAML>=6.0",
+  "einops>=0.8.2",
+  "diffusers>=0.37.1",
+  "wandb[media]>=0.27.0",
+  "open-clip-torch>=3.3.0",
+  "h5py>=3.16.0",
+  "moviepy>=2.2.1",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +29,7 @@ diffusers = [
   "accelerate>=0.33",
   "transformers>=4.44",
 ]
+
 dynamicrafter = [
   "einops>=0.7",
   "numpy>=1.26",
@@ -43,3 +54,15 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+xformers = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+

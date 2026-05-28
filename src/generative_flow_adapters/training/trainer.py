@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -12,6 +13,11 @@ from generative_flow_adapters.inference import DiffusionInferenceSampler
 from generative_flow_adapters.losses.diffusion import DiffusionTrainingObjective
 from generative_flow_adapters.losses.flow_matching import FlowMatchingTrainingObjective
 from generative_flow_adapters.losses.registry import LossRegistry
+from generative_flow_adapters.training.shortcut_targets import (
+    compute_self_consistency_target_v,
+    compute_two_step_target_v,
+)
+from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
 
 
 class Trainer:
@@ -29,6 +35,7 @@ class Trainer:
         self.config = config
         self.wandb_logger = wandb_logger
         self.global_step = 0
+        self._amp_dtype = self._resolve_amp_dtype(config.extra.get("amp_dtype"))
         diffusion_schedule = getattr(model, "diffusion_schedule_config", None) or {}
         self.diffusion_objective = DiffusionTrainingObjective(
             timesteps=int(diffusion_schedule.get("timesteps", config.diffusion_timesteps)),
@@ -61,6 +68,16 @@ class Trainer:
             )
         else:
             self.base_inference_sampler = None
+        # Paper-faithful step-size schedule (normalised s ∈ (0,1]). When set it
+        # drives both training (sampled step size per batch) and the eval grid,
+        # and the injected step_level becomes normalised. Absent → legacy raw-
+        # timestep dyadic behaviour (`shortcut_step_level_max`).
+        raw_schedule = config.extra.get("shortcut_step_schedule")
+        self.step_schedule: ShortcutStepSchedule | None = (
+            ShortcutStepSchedule.from_config(raw_schedule, timesteps=self.diffusion_objective.timesteps)
+            if isinstance(raw_schedule, Mapping)
+            else None
+        )
         self.flow_objective = FlowMatchingTrainingObjective(
             sigma_min=float(config.extra.get("flow_sigma_min", 1e-5)),
             shift_schedule=bool(config.extra.get("flow_shift_schedule", True)),
@@ -70,6 +87,33 @@ class Trainer:
             shift_x2=float(config.extra.get("flow_shift_x2", 4096.0)),
             temporal_sqrt_scaling=bool(config.extra.get("flow_temporal_sqrt_scaling", True)),
         )
+
+    @staticmethod
+    def _resolve_amp_dtype(value: object | None) -> torch.dtype | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.dtype):
+            return value
+        key = str(value).strip().lower()
+        if key in {"none", "fp32", "float32", ""}:
+            return None
+        mapping = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+        }
+        if key not in mapping:
+            raise ValueError(f"Unsupported amp_dtype: {value!r}. Expected one of bf16/fp16/none.")
+        return mapping[key]
+
+    def _autocast(self):
+        """Autocast context for the model forward (no-op unless amp_dtype is set)."""
+        if self._amp_dtype is None:
+            return contextlib.nullcontext()
+        device_type = next(self.model.parameters()).device.type
+        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
 
     def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
         self.model.train()
@@ -94,7 +138,12 @@ class Trainer:
             cond, shortcut_target = self._maybe_prepare_shortcut(
                 batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
             )
-            prediction = self.model(x_t, t, cond)
+            with self._autocast():
+                prediction = self.model(x_t, t, cond)
+            # Upcast the (possibly bf16) prediction back to fp32 so the loss and
+            # backward run in full precision — keeps autograd dtypes consistent
+            # and the diffusion loss numerically stable. No-op when amp is off.
+            prediction = prediction.float()
             target_tensor = self.diffusion_objective.get_target(
                 prediction_type=prediction_type or "noise",
                 x_start=target_scaled,
@@ -134,8 +183,18 @@ class Trainer:
             cond, shortcut_target = self._maybe_prepare_shortcut(
                 batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
             )
-            prediction = self.model(x_t, t, cond)
+            with self._autocast():
+                prediction = self.model(x_t, t, cond)
+            # See diffusion branch: upcast to fp32 for a precision-consistent
+            # loss/backward. No-op when amp is off.
+            prediction = prediction.float()
             loss = self.loss_fn(prediction, target)
+
+        # Record each loss term separately so wandb shows the base loss and
+        # every shortcut-consistency term next to the combined total. For
+        # shortcut training their relative magnitudes are the key signal for
+        # spotting collapse or a mis-weighted term.
+        loss_components: dict[str, float] = {"base_loss": float(loss.detach().cpu())}
 
         batch = dict(batch)
         if shortcut_target is not None:
@@ -147,6 +206,7 @@ class Trainer:
             if not isinstance(shortcut_target, Tensor):
                 raise TypeError("batch['shortcut_target'] must be a tensor.")
             consistency = LossRegistry.get_consistency_loss("local_consistency")(prediction, shortcut_target)
+            loss_components["local_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.local_consistency_weight * consistency
 
         if self.config.shortcut_direction_weight > 0.0 and "shortcut_target" in batch:
@@ -154,6 +214,7 @@ class Trainer:
             if not isinstance(shortcut_target, Tensor):
                 raise TypeError("batch['shortcut_target'] must be a tensor.")
             shortcut_loss = LossRegistry.get_consistency_loss("shortcut_direction")(prediction, shortcut_target)
+            loss_components["shortcut_direction_loss"] = float(shortcut_loss.detach().cpu())
             loss = loss + self.config.shortcut_direction_weight * shortcut_loss
 
         if self.config.multistep_consistency_weight > 0.0 and "self_consistency_target" in batch:
@@ -161,6 +222,7 @@ class Trainer:
             if not isinstance(self_consistency_target, Tensor):
                 raise TypeError("batch['self_consistency_target'] must be a tensor.")
             consistency = LossRegistry.get_consistency_loss("multistep_self_consistency")(prediction, self_consistency_target)
+            loss_components["multistep_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.multistep_consistency_weight * consistency
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -171,11 +233,9 @@ class Trainer:
         self.global_step += 1
 
         metrics: dict[str, object] = {"loss": float(loss.detach().cpu())}
-        if self.config.shortcut_direction_weight > 0.0 and "shortcut_target" in batch:
-            shortcut_target = batch["shortcut_target"]
-            if isinstance(shortcut_target, Tensor):
-                shortcut_metric = LossRegistry.get_consistency_loss("shortcut_direction")(prediction.detach(), shortcut_target.detach())
-                metrics["shortcut_direction_loss"] = float(shortcut_metric.detach().cpu())
+        # Components were captured during the forward (pre-backward), so they
+        # reflect the loss at the params actually used — no redundant re-forward.
+        metrics.update(loss_components)
         generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
         if generated_samples is not None:
             metrics["generated_samples"] = generated_samples.detach().cpu()
@@ -321,8 +381,10 @@ class Trainer:
                 device=device,
                 dtype=dtype,
             )
-            target = self._compute_two_step_target_v(
-                base_model=base_model, x_t=x_t, t=t, cond=new_cond
+            alphas, scale_arr = self._diffusion_tables(device=device, dtype=dtype)
+            target = compute_two_step_target_v(
+                base_model=base_model, x_t=x_t, t=t, cond=new_cond,
+                alphas_cumprod=alphas, scale_arr=scale_arr,
             )
             return new_cond, target
 
@@ -332,13 +394,40 @@ class Trainer:
                 anchor_prob > 0.0
                 and bool(torch.rand((), device="cpu").item() < anchor_prob)
             )
+
+            if self.step_schedule is not None:
+                # Paper-faithful path: step sizes are normalised s ∈ (0,1] drawn
+                # from the configured schedule. Anchor grounds the model at the
+                # finest step with the standard loss (the schedule's empirical-
+                # velocity end); otherwise sample a larger s and supervise it
+                # against the average of two chained calls at s/2 (the rung
+                # below), converting s/2 to a timestep jump for the micro-step.
+                if do_anchor:
+                    step_level = torch.full(
+                        (batch_size,), float(self.step_schedule.smallest()), device=device, dtype=dtype
+                    )
+                    return self._inject_step_level(cond, step_level_key, step_level), None
+                s_full = self.step_schedule.sample(exclude_smallest=True)
+                s_half = s_full / 2.0
+                jump = self.step_schedule.to_timestep_jump(s_half)
+                step_level_full = torch.full((batch_size,), float(s_full), device=device, dtype=dtype)
+                step_level_half = torch.full((batch_size,), float(s_half), device=device, dtype=dtype)
+                new_cond = self._inject_step_level(cond, step_level_key, step_level_full)
+                cond_half = self._inject_step_level(cond, step_level_key, step_level_half)
+                alphas, scale_arr = self._diffusion_tables(device=device, dtype=dtype)
+                target = compute_self_consistency_target_v(
+                    model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=jump,
+                    alphas_cumprod=alphas, scale_arr=scale_arr,
+                )
+                return new_cond, target
+
+            # Legacy self-consistency (no schedule): dyadic d in raw timesteps,
+            # supervise the adapter at step_level=2d against two calls at d.
             if do_anchor:
                 step_level = torch.ones(batch_size, device=device, dtype=dtype)
                 new_cond = self._inject_step_level(cond, step_level_key, step_level)
                 return new_cond, None
 
-            # Self-consistency mode: sample dyadic d, supervise the adapter at
-            # step_level=2d against the average of two adapter calls at d.
             dyadic_max = int(self.config.extra.get("shortcut_step_level_max", 4))
             d_value = self._sample_dyadic_d(dyadic_max=dyadic_max)
             step_level_full = torch.full(
@@ -349,8 +438,10 @@ class Trainer:
             )
             new_cond  = self._inject_step_level(cond, step_level_key, step_level_full)
             cond_half = self._inject_step_level(cond, step_level_key, step_level_half)
-            target = self._compute_self_consistency_target_v(
-                x_t=x_t, t=t, cond_half=cond_half, d=d_value
+            alphas, scale_arr = self._diffusion_tables(device=device, dtype=dtype)
+            target = compute_self_consistency_target_v(
+                model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=d_value,
+                alphas_cumprod=alphas, scale_arr=scale_arr,
             )
             return new_cond, target
 
@@ -426,63 +517,6 @@ class Trainer:
         j = int(torch.randint(0, log2_max + 1, (1,)).item())
         return 1 << j
 
-    def _compute_two_step_target_v(
-        self,
-        *,
-        base_model: nn.Module,
-        x_t: Tensor,
-        t: Tensor,
-        cond: object | None,
-    ) -> Tensor:
-        """Base-anchored Heun-corrected 2-step target for v-prediction.
-
-        Runs one proper DDIM micro-step under the frozen base and averages the
-        two velocities. Drops the bogus ``*step_size`` scaling the old
-        implementation did, since both ``v0`` and ``v1`` already live in
-        v-space.
-        """
-        alphas, scale_arr = self._diffusion_tables(device=x_t.device, dtype=x_t.dtype)
-        with torch.no_grad():
-            v0 = base_model(x_t, t, cond=cond)
-            prev_t = (t - 1).clamp_min(0)
-            x_mid = _ddim_micro_step_v(
-                x=x_t, v=v0, t=t, prev_t=prev_t,
-                alphas_cumprod=alphas, scale_arr=scale_arr,
-            )
-            v1 = base_model(x_mid, prev_t, cond=cond)
-        return ((v0 + v1) / 2.0).detach()
-
-    def _compute_self_consistency_target_v(
-        self,
-        *,
-        x_t: Tensor,
-        t: Tensor,
-        cond_half: object | None,
-        d: int,
-    ) -> Tensor:
-        """Paper-faithful self-consistency target (Frans et al. 2024, eq. 4).
-
-        Two no-grad calls of the *adapted* model at ``step_level=d``, chained
-        across one ``d``-sized DDIM micro-step. The adapter is its own teacher;
-        the frozen base only contributes implicitly through the composition
-        inside ``self.model``.
-        """
-        alphas, scale_arr = self._diffusion_tables(device=x_t.device, dtype=x_t.dtype)
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            with torch.no_grad():
-                v1 = self.model(x_t, t, cond_half)
-                prev_t = (t - d).clamp_min(0)
-                x_mid = _ddim_micro_step_v(
-                    x=x_t, v=v1, t=t, prev_t=prev_t,
-                    alphas_cumprod=alphas, scale_arr=scale_arr,
-                )
-                v2 = self.model(x_mid, prev_t, cond_half)
-        finally:
-            self.model.train(was_training)
-        return ((v1 + v2) / 2.0).detach()
-
     def _diffusion_tables(
         self,
         *,
@@ -512,6 +546,46 @@ class Trainer:
         steps = num_inference_steps or self.config.inference_num_steps
         return self.inference_sampler.sample_from_batch(batch=batch, num_inference_steps=steps)
 
+    def _eval_step_schedule(self) -> list[tuple[int, float | None]]:
+        """``(num_steps, step_level)`` pairs for the multi-step eval grid.
+
+        Priority:
+        1. An explicit ``training.extra.eval_step_schedule`` (ints, or
+           ``{num_steps, step_level}`` mappings) — wins if present.
+        2. Otherwise, if a paper-faithful ``shortcut_step_schedule`` with
+           discrete levels is set, derive the grid from it: each normalised
+           level ``s`` gives ``num_steps = round(1/s)`` and injects
+           ``step_level = s`` (so train and eval share one source of truth).
+
+        ``step_level = None`` means "inject nothing" (correct for the frozen
+        base / non-shortcut adapters). Empty when neither is configured (eval
+        falls back to the single-step path)."""
+        raw = self.config.extra.get("eval_step_schedule")
+        if raw:
+            schedule: list[tuple[int, float | None]] = []
+            for entry in raw:
+                if isinstance(entry, Mapping):
+                    num_steps = int(entry["num_steps"])
+                    step_level = entry.get("step_level")
+                    step_level = None if step_level is None else float(step_level)
+                elif isinstance(entry, (int, float)):
+                    num_steps = int(entry)
+                    step_level = None
+                else:
+                    raise ValueError(
+                        "eval_step_schedule entries must be ints or mappings with "
+                        f"a 'num_steps' key; got {entry!r}."
+                    )
+                schedule.append((num_steps, step_level))
+            return schedule
+
+        if self.step_schedule is not None:
+            levels = self.step_schedule.discrete_levels()
+            if levels:
+                # Largest step first → fewest sampling steps at the top row.
+                return [(max(1, int(round(1.0 / s))), float(s)) for s in sorted(levels, reverse=True)]
+        return []
+
     def _maybe_generate_samples(self, batch: Mapping[str, Tensor | object], model_type: str | None) -> Tensor | None:
         if model_type != "diffusion":
             return None
@@ -519,6 +593,10 @@ class Trainer:
             return None
         if self.global_step % self.config.inference_every_n_steps - 1 != 0:
             return None
+
+        schedule = self._eval_step_schedule()
+        if schedule:
+            return self._generate_step_size_grid(batch=batch, schedule=schedule)
 
         target = batch.get("target")
         steps = self.config.inference_num_steps
@@ -551,6 +629,65 @@ class Trainer:
             )
         return samples
 
+    def _generate_step_size_grid(
+        self,
+        *,
+        batch: Mapping[str, Tensor | object],
+        schedule: list[tuple[int, float | None]],
+    ) -> Tensor | None:
+        """Sample the adapted model (and the frozen base) at every step count
+        in ``schedule`` and log a stacked comparison grid.
+
+        For a shortcut model the per-entry ``step_level`` is injected into the
+        adapted cond so the adapter knows which multi-step horizon it is
+        approximating; the base never sees step_level. All rollouts share one
+        noise draw so differences across step counts and against the base are
+        purely model-driven. Returns the highest-step-count adapted sample (so
+        the caller can keep the existing ``generated_samples`` metric) or
+        ``None`` when prerequisites are missing.
+        """
+        target = batch.get("target")
+        if self.wandb_logger is None or not isinstance(target, Tensor):
+            return None
+
+        shared_noise = torch.randn_like(target)
+        step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
+        cond = batch.get("cond")
+        base_cond = _strip_adapter_only_keys(cond)
+
+        adapted_by_steps: list[tuple[int, Tensor]] = []
+        base_by_steps: list[tuple[int, Tensor]] = []
+        for num_steps, step_level in schedule:
+            adapted_cond = cond
+            if step_level is not None:
+                level = torch.full(
+                    (target.shape[0],), float(step_level), device=target.device, dtype=target.dtype
+                )
+                adapted_cond = self._inject_step_level(cond, step_level_key, level)
+            adapted = self.inference_sampler.sample_from_batch(
+                batch={"target": target, "cond": adapted_cond},
+                num_inference_steps=num_steps,
+                initial_sample=shared_noise,
+            )
+            adapted_by_steps.append((num_steps, adapted))
+
+            if self.base_inference_sampler is not None:
+                base = self.base_inference_sampler.sample_from_batch(
+                    batch={"target": target, "cond": base_cond},
+                    num_inference_steps=num_steps,
+                    initial_sample=shared_noise,
+                )
+                base_by_steps.append((num_steps, base))
+
+        self.wandb_logger.log_step_size_grid(
+            target_latents=target,
+            adapted_by_steps=adapted_by_steps,
+            base_by_steps=base_by_steps or None,
+            cond=cond,
+            step=self.global_step,
+        )
+        return adapted_by_steps[-1][1] if adapted_by_steps else None
+
 
 def _call_preprocessor(preprocessor: Callable[..., Mapping[str, object]], raw_batch: object) -> Mapping[str, object]:
     """Call ``preprocessor(batch, train=True)`` when its signature accepts
@@ -565,76 +702,6 @@ def _call_preprocessor(preprocessor: Callable[..., Mapping[str, object]], raw_ba
     if "train" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         return preprocessor(raw_batch, train=True)
     return preprocessor(raw_batch)
-
-
-def _ddim_micro_step_v(
-    *,
-    x: Tensor,
-    v: Tensor,
-    t: Tensor,
-    prev_t: Tensor,
-    alphas_cumprod: Tensor,
-    scale_arr: Tensor | None,
-) -> Tensor:
-    """Single-timestep DDIM update for v-prediction, per-sample t/prev_t.
-
-    Matches :func:`inference.diffusion.DiffusionInferenceSampler._dynamic_rescale_ddim_step`
-    semantically, but takes raw schedule tables instead of a diffusers
-    ``DDIMScheduler``, accepts (B,) timestep tensors, and is autograd-friendly.
-
-    With ``scale_arr`` provided, applies DynamiCrafter's data-side SNR rescale
-    (``pred_x0 *= prev_scale / cur_scale``) between v-decode and recomposition.
-
-    Args:
-        x: ``(B, ..., d)`` sample at timestep ``t``.
-        v: ``(B, ..., d)`` v-prediction at ``(x, t)`` (same shape as ``x``).
-        t: ``(B,)`` long tensor of current timesteps.
-        prev_t: ``(B,)`` long tensor of target timesteps (``< t``, clamped at 0).
-        alphas_cumprod: ``(T_train,)`` lookup table from the training schedule.
-        scale_arr: ``(T_train,)`` dynamic-rescale table, or ``None`` for no rescale.
-
-    Returns:
-        ``(B, ..., d)`` sample at timestep ``prev_t``.
-    """
-    def _gather(table: Tensor, indices: Tensor) -> Tensor:
-        idx = indices.to(dtype=torch.long, device=table.device).clamp(min=0, max=table.shape[0] - 1)
-        out = table.index_select(0, idx)
-        return out.view(-1, *[1] * (x.dim() - 1)).to(device=x.device, dtype=x.dtype)
-
-    alpha_t    = _gather(alphas_cumprod, t)
-    alpha_prev = _gather(alphas_cumprod, prev_t)
-    sqrt_alpha_t    = alpha_t.sqrt()
-    sqrt_sigma_t    = (1.0 - alpha_t).clamp_min(0.0).sqrt()
-    sqrt_alpha_prev = alpha_prev.sqrt()
-    sqrt_sigma_prev = (1.0 - alpha_prev).clamp_min(0.0).sqrt()
-
-    pred_x0  = sqrt_alpha_t * x - sqrt_sigma_t * v
-    pred_eps = sqrt_alpha_t * v + sqrt_sigma_t * x
-
-    if scale_arr is not None:
-        cur_scale  = _gather(scale_arr, t)
-        prev_scale = _gather(scale_arr, prev_t)
-        pred_x0 = pred_x0 * (prev_scale / cur_scale)
-
-    return sqrt_alpha_prev * pred_x0 + sqrt_sigma_prev * pred_eps
-
-
-def _reshape_step_size_for_base(step_size: Tensor, base_direction: Tensor) -> Tensor:
-    if base_direction.dim() == 2:
-        if step_size.dim() == 1:
-            return step_size.unsqueeze(-1)
-        if step_size.dim() == 2 and step_size.shape[-1] == 1:
-            return step_size
-    if base_direction.dim() == 5:
-        if step_size.dim() == 1:
-            return step_size[:, None, None, None, None]
-        if step_size.dim() == 2:
-            return step_size[:, None, :, None, None]
-        if step_size.dim() == 3 and step_size.shape[-1] == 1:
-            return step_size.permute(0, 2, 1)[:, :, :, None, None]
-    while step_size.dim() < base_direction.dim():
-        step_size = step_size.unsqueeze(-1)
-    return step_size
 
 
 def _strip_adapter_only_keys(cond: object | None) -> object | None:

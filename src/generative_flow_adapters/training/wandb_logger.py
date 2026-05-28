@@ -109,6 +109,63 @@ class WandbLogger:
             )
         self._wandb.log(videos, step=int(step))
 
+    def log_step_size_grid(
+        self,
+        *,
+        target_latents: Tensor,
+        adapted_by_steps: list[tuple[int, Tensor]],
+        base_by_steps: list[tuple[int, Tensor]] | None,
+        cond: object | None,
+        step: int,
+    ) -> None:
+        """Log one video per sample, stacking a row for each sampling step
+        count so few-step vs. many-step rollouts can be compared at a glance.
+
+        Each row is ``[ground_truth | base@N | adapted@N]`` concatenated along
+        width; rows (top→bottom) follow the order of ``adapted_by_steps``. This
+        is the shortcut-model diagnostic: a well-trained adapter should stay
+        close to the high-N reference as N drops, while the frozen base
+        degrades. ``base_by_steps`` may be ``None`` (then rows omit the base
+        column); when given it must cover the same step counts as
+        ``adapted_by_steps``.
+        """
+        if self._decode_fn is None:
+            raise RuntimeError("WandbLogger.log_step_size_grid requires a decode_fn (set at construction).")
+        if not adapted_by_steps:
+            return
+        sample_count = min(self.num_samples, target_latents.shape[0])
+        target_pixels = self._decode_to_uint8(target_latents[:sample_count])
+        adapted_pixels = [(n, self._decode_to_uint8(lat[:sample_count])) for n, lat in adapted_by_steps]
+        base_pixels = (
+            {n: self._decode_to_uint8(lat[:sample_count]) for n, lat in base_by_steps}
+            if base_by_steps is not None
+            else {}
+        )
+        actions = _maybe_extract_actions(cond)
+
+        videos: dict[str, Any] = {}
+        for i in range(sample_count):
+            rows = []
+            for num_steps, pixels in adapted_pixels:
+                panels = [target_pixels[i]]
+                if num_steps in base_pixels:
+                    panels.append(base_pixels[num_steps][i])
+                panels.append(pixels[i])
+                rows.append(torch.cat(panels, dim=-1))
+            grid = torch.cat(rows, dim=-2)
+            cols = "gt | base | adapted" if base_pixels else "gt | adapted"
+            order = ", ".join(f"N={n}" for n, _ in adapted_pixels)
+            caption = f"sample={i} | rows top→bottom: {order} | cols: {cols}"
+            if isinstance(actions, Tensor) and actions.shape[0] > i:
+                caption += self._format_action_block(actions[i])
+            videos[f"eval_step_grid/sample_{i}"] = self._wandb.Video(
+                grid.numpy(),
+                fps=self.fps,
+                format="mp4",
+                caption=caption,
+            )
+        self._wandb.log(videos, step=int(step))
+
     # --------------------------------------------------------------- internals
 
     @torch.no_grad()
@@ -128,12 +185,18 @@ class WandbLogger:
         header = f"sample={sample_index} | {layout}"
         if not (isinstance(actions, Tensor) and actions.shape[0] > sample_index):
             return header
-        sample_actions = actions[sample_index].detach().cpu()
+        return header + WandbLogger._format_action_block(actions[sample_index])
+
+    @staticmethod
+    def _format_action_block(sample_actions: Tensor) -> str:
+        """Render a single sample's per-frame actions as an aligned text table,
+        prefixed so it can be appended to any caption."""
+        sample_actions = sample_actions.detach().cpu()
         rows = ["t " + " ".join(f"a{j}" for j in range(sample_actions.shape[-1]))]
         for frame_index in range(sample_actions.shape[0]):
             row = sample_actions[frame_index].tolist()
             rows.append(f"{frame_index} " + " ".join(f"{x:+.2f}" for x in row))
-        return header + "\nactions:\n" + "\n".join(rows)
+        return "\nactions:\n" + "\n".join(rows)
 
 
 def _coerce_scalar(value: object) -> float | None:

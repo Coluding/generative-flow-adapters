@@ -13,6 +13,7 @@ def prepare_dynamicrafter_condition(
     use_step_level_conditioning: bool = False,
     step_level_key: str = "step_level",
     step_level_embed: nn.Module | None = None,
+    step_level_transform: str = "linear",
 ) -> object | None:
     if not isinstance(cond, Mapping):
         return cond
@@ -27,10 +28,27 @@ def prepare_dynamicrafter_condition(
             step_level_embed=step_level_embed,
             device=x_t.device,
             dtype=x_t.dtype,
+            transform=step_level_transform,
         )
         runtime_cond["embedding"] = combine_adapter_embeddings(adapter_embedding, step_level_embedding)
 
     return runtime_cond
+
+
+def _apply_step_level_transform(step_level: Tensor, transform: str) -> Tensor:
+    """Map the raw step-size scalar to the value fed into ``step_level_embed``.
+
+    ``"linear"`` passes it through (fine when the value is a bounded normalised
+    ``s ∈ (0,1]``); ``"log2"`` feeds ``log2(s)``, which spreads the fine end of
+    a dyadic schedule into a well-conditioned range (e.g. ``[-7, 0]`` for
+    ``s ∈ [1/128, 1]``) instead of crushing it near zero. Both keep the 1-D
+    shape the ``Linear(1, ·)`` embed expects."""
+    key = transform.lower()
+    if key in {"linear", "raw", "none"}:
+        return step_level
+    if key == "log2":
+        return torch.log2(step_level.clamp_min(1e-8))
+    raise ValueError(f"Unknown step_level_transform={transform!r}; expected 'linear' or 'log2'.")
 
 
 def encode_step_level_embedding(
@@ -39,10 +57,11 @@ def encode_step_level_embedding(
     step_level_embed: nn.Module | None,
     device: torch.device,
     dtype: torch.dtype,
+    transform: str = "linear",
 ) -> Tensor | None:
     if step_level_embed is None or not isinstance(step_level, Tensor):
         return None
-    step_level = step_level.to(device=device, dtype=dtype)
+    step_level = _apply_step_level_transform(step_level.to(device=device, dtype=dtype), transform)
     if step_level.dim() == 1:
         return step_level_embed(step_level.unsqueeze(-1))
     if step_level.dim() == 2:

@@ -43,6 +43,7 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
                 step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
                 step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         if architecture in {"shortcut_direction", "shortcut"}:
             return ShortcutDirectionOutputAdapter(
@@ -153,6 +154,7 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
                 step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
                 step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
                 use_factorized_memory_position=bool(adapter.extra.get("use_factorized_memory_position", True)),
                 update_mode=str(adapter.extra.get("update_mode", "stepwise")),
                 piecewise_progress_markers=tuple(adapter.extra.get("piecewise_progress_markers", (0.0, 0.05, 0.20))),

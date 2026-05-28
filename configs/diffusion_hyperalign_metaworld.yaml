@@ -81,6 +81,11 @@ training:
   inference_every_n_steps: 10
   inference_num_steps: 25
   extra:
+    # Mixed-precision autocast for the model forward. bf16 lets the frozen
+    # DynamiCrafter UNet's SDPA route to the Flash kernel on Ampere+ while
+    # weights stay fp32 and the loss/backward run in fp32 (no GradScaler).
+    # Set to fp32/none to disable.
+    amp_dtype: bf16
     video_logging:
       enable: true              # set true to push videos to wandb
       num_samples: 2            # two side-by-side (ground truth | prediction) clips per eval

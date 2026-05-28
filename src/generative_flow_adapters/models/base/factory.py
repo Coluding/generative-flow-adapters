@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import torch
+
 from generative_flow_adapters.config import ModelConfig
 from generative_flow_adapters.models.base.dynamicrafter import DynamicCrafterUNetWrapper
 from generative_flow_adapters.models.base.diffusers import DiffusersUNetWrapper
 from generative_flow_adapters.models.base.dummy import DummyVectorField
+
+
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+}
+
+
+def _parse_dtype(value: object | None) -> torch.dtype | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    key = str(value).strip().lower()
+    if key in _DTYPE_MAP:
+        return _DTYPE_MAP[key]
+    raise ValueError(f"Unsupported dtype: {value!r}. Expected one of {sorted(_DTYPE_MAP)}.")
 
 
 def build_base_model(config: ModelConfig):
@@ -37,6 +61,7 @@ def build_base_model(config: ModelConfig):
             allow_missing_checkpoint=bool(config.extra.get("allow_missing_checkpoint", False)),
             allow_dummy_concat_condition=bool(config.extra.get("allow_dummy_concat_condition", False)),
             load_first_stage_model=bool(config.extra.get("load_first_stage_model", False)),
+            dtype=_parse_dtype(config.extra.get("dtype")),
         )
     elif provider == "opensora":
         model = _build_opensora_model(config)

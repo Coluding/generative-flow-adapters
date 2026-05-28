@@ -5,7 +5,7 @@ from pathlib import Path
 
 from generative_flow_adapters.config import load_config
 from generative_flow_adapters.testing import build_fake_dataloader
-from generative_flow_adapters.training import Trainer, attach_shortcut_targets_from_base, build_experiment
+from generative_flow_adapters.training import Trainer, build_experiment
 
 
 def main() -> None:
@@ -40,19 +40,7 @@ def main() -> None:
     if config.model.extra.get("allow_dummy_concat_condition"):
         print("conditioning=dummy_concat_enabled")
 
-    step_size_key = config.conditioning.step_size_key
-    if config.conditioning.conditions and not any(spec.key == step_size_key for spec in config.conditioning.conditions):
-        if any(spec.key == "step_level" for spec in config.conditioning.conditions):
-            step_size_key = "step_level"
-
     for step, batch in enumerate(dataloader, start=1):
-        batch = attach_shortcut_targets_from_base(
-            experiment.model,
-            batch,
-            step_size_key=step_size_key,
-            normalize_base_direction=bool(config.conditioning.extra.get("normalize_base_direction", True)),
-            method=config.training.shortcut_target_method,
-        )
         metrics = trainer.training_step(batch)
         loss = metrics["loss"]
         shortcut_loss = metrics.get("shortcut_direction_loss")

@@ -1,171 +1,126 @@
-"""Shortcut target computation for accelerated diffusion/flow matching training.
+"""Shortcut target computation for accelerated diffusion training.
 
-This module provides utilities for computing shortcut targets from a frozen base model,
-which can be used to train adapter models to predict multi-step trajectories in a single step.
+Pure functions used by :class:`~generative_flow_adapters.training.trainer.Trainer`
+to build self-supervised targets for shortcut adapters. All dependencies
+(schedule tables, models) are passed in explicitly so these helpers stay
+testable without spinning up a trainer.
+
+Two target families live here:
+
+- :func:`compute_two_step_target_v` — base-anchored Heun-corrected 2-step
+  target for v-prediction. One proper DDIM micro-step under the frozen base,
+  velocities averaged. No collapse risk; ``step_level`` on the adapter is
+  decorative.
+
+- :func:`compute_self_consistency_target_v` — paper-faithful self-consistency
+  target (Frans et al. 2024, eq. 4). Two no-grad calls of the *adapted* model
+  at the half step, chained across one ``d``-sized DDIM micro-step. The
+  adapter is its own teacher; the frozen base contributes only implicitly via
+  the composition inside the model.
+
+:func:`ddim_micro_step_v` is the underlying single-step DDIM update for
+v-prediction; it matches
+:meth:`DiffusionInferenceSampler._dynamic_rescale_ddim_step` semantically but
+takes raw schedule tables and per-sample timestep tensors.
 """
 
 from __future__ import annotations
-
-from collections.abc import Mapping
 
 import torch
 from torch import Tensor, nn
 
 
-def attach_shortcut_targets_from_base(
-    model: nn.Module,
-    batch: Mapping[str, Tensor | object],
+def compute_two_step_target_v(
     *,
-    step_size_key: str = "step_size",
-    normalize_base_direction: bool = True,
-    method: str = "linear",
-) -> dict[str, Tensor | object]:
-    """Attach deterministic shortcut supervision derived from frozen base predictions.
+    base_model: nn.Module,
+    x_t: Tensor,
+    t: Tensor,
+    cond: object | None,
+    alphas_cumprod: Tensor,
+    scale_arr: Tensor | None,
+) -> Tensor:
+    """Base-anchored Heun-corrected 2-step target for v-prediction."""
+    with torch.no_grad():
+        v0 = base_model(x_t, t, cond=cond)
+        prev_t = (t - 1).clamp_min(0)
+        x_mid = ddim_micro_step_v(
+            x=x_t, v=v0, t=t, prev_t=prev_t,
+            alphas_cumprod=alphas_cumprod, scale_arr=scale_arr,
+        )
+        v1 = base_model(x_mid, prev_t, cond=cond)
+    return ((v0 + v1) / 2.0).detach()
+
+
+def compute_self_consistency_target_v(
+    *,
+    model: nn.Module,
+    x_t: Tensor,
+    t: Tensor,
+    cond_half: object | None,
+    d: int,
+    alphas_cumprod: Tensor,
+    scale_arr: Tensor | None,
+) -> Tensor:
+    """Paper-faithful self-consistency target (Frans et al. 2024, eq. 4)."""
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            v1 = model(x_t, t, cond_half)
+            prev_t = (t - d).clamp_min(0)
+            x_mid = ddim_micro_step_v(
+                x=x_t, v=v1, t=t, prev_t=prev_t,
+                alphas_cumprod=alphas_cumprod, scale_arr=scale_arr,
+            )
+            v2 = model(x_mid, prev_t, cond_half)
+    finally:
+        model.train(was_training)
+    return ((v1 + v2) / 2.0).detach()
+
+
+def ddim_micro_step_v(
+    *,
+    x: Tensor,
+    v: Tensor,
+    t: Tensor,
+    prev_t: Tensor,
+    alphas_cumprod: Tensor,
+    scale_arr: Tensor | None,
+) -> Tensor:
+    """Single-timestep DDIM update for v-prediction, per-sample t/prev_t.
+
+    With ``scale_arr`` provided, applies DynamiCrafter's data-side SNR rescale
+    (``pred_x0 *= prev_scale / cur_scale``) between v-decode and recomposition.
 
     Args:
-        model: The model (or adapted model) to extract base model from
-        batch: Training batch containing x_t, t, cond
-        step_size_key: Key in cond dict for step size (default "step_size")
-        normalize_base_direction: Whether to normalize 2D outputs (default True)
-        method: Target construction method:
-            - "linear": shortcut_target = base_output * step_size (fast, 1 forward pass)
-            - "two_step": Two-step averaging as in official shortcut-models (accurate, 2 forward passes)
+        x: ``(B, ..., d)`` sample at timestep ``t``.
+        v: ``(B, ..., d)`` v-prediction at ``(x, t)`` (same shape as ``x``).
+        t: ``(B,)`` long tensor of current timesteps.
+        prev_t: ``(B,)`` long tensor of target timesteps (``< t``, clamped at 0).
+        alphas_cumprod: ``(T_train,)`` lookup table from the training schedule.
+        scale_arr: ``(T_train,)`` dynamic-rescale table, or ``None`` for no rescale.
 
     Returns:
-        Updated batch with shortcut_target and self_consistency_target added
+        ``(B, ..., d)`` sample at timestep ``prev_t``.
     """
-    x_t = _as_tensor(batch, "x_t")
-    t = _as_tensor(batch, "t")
-    cond = batch.get("cond")
+    def _gather(table: Tensor, indices: Tensor) -> Tensor:
+        idx = indices.to(dtype=torch.long, device=table.device).clamp(min=0, max=table.shape[0] - 1)
+        out = table.index_select(0, idx)
+        return out.view(-1, *[1] * (x.dim() - 1)).to(device=x.device, dtype=x.dtype)
 
-    base_model = getattr(model, "base_model", model)
-    step_size = _resolve_step_size(cond, step_size_key=step_size_key, batch_size=x_t.shape[0], device=x_t.device, dtype=x_t.dtype)
+    alpha_t    = _gather(alphas_cumprod, t)
+    alpha_prev = _gather(alphas_cumprod, prev_t)
+    sqrt_alpha_t    = alpha_t.sqrt()
+    sqrt_sigma_t    = (1.0 - alpha_t).clamp_min(0.0).sqrt()
+    sqrt_alpha_prev = alpha_prev.sqrt()
+    sqrt_sigma_prev = (1.0 - alpha_prev).clamp_min(0.0).sqrt()
 
-    if method.lower() == "linear":
-        shortcut_target = _compute_linear_shortcut_target(
-            base_model=base_model,
-            x_t=x_t,
-            t=t,
-            cond=cond,
-            step_size=step_size,
-            normalize_base_direction=normalize_base_direction,
-        )
-    elif method.lower() == "two_step":
-        shortcut_target = _compute_two_step_shortcut_target(
-            base_model=base_model,
-            x_t=x_t,
-            t=t,
-            cond=cond,
-            step_size=step_size,
-        )
-    else:
-        raise ValueError(f"Unknown shortcut target method: {method}. Use 'linear' or 'two_step'.")
+    pred_x0  = sqrt_alpha_t * x - sqrt_sigma_t * v
+    pred_eps = sqrt_alpha_t * v + sqrt_sigma_t * x
 
-    updated_batch = dict(batch)
-    updated_batch["shortcut_target"] = shortcut_target.detach()
-    updated_batch["self_consistency_target"] = shortcut_target.detach()
-    return updated_batch
+    if scale_arr is not None:
+        cur_scale  = _gather(scale_arr, t)
+        prev_scale = _gather(scale_arr, prev_t)
+        pred_x0 = pred_x0 * (prev_scale / cur_scale)
 
-
-def _compute_linear_shortcut_target(
-    base_model: nn.Module,
-    x_t: Tensor,
-    t: Tensor,
-    cond: object | None,
-    step_size: Tensor,
-    normalize_base_direction: bool,
-) -> Tensor:
-    """Linear scaling method: target = base_output * step_size.
-
-    This is a fast approximation that requires only a single forward pass through
-    the base model. Optionally normalizes the direction for 2D outputs.
-    """
-    with torch.no_grad():
-        base_output = base_model(x_t, t, cond=cond)
-
-    base_direction = base_output
-    if normalize_base_direction and base_direction.dim() == 2:
-        base_direction = base_direction / base_direction.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-
-    step_size = _reshape_step_size_for_base(step_size=step_size, base_direction=base_direction)
-    return base_direction * step_size
-
-
-def _compute_two_step_shortcut_target(
-    base_model: nn.Module,
-    x_t: Tensor,
-    t: Tensor,
-    cond: object | None,
-    step_size: Tensor,
-) -> Tensor:
-    """Two-step averaging method as in official shortcut-models paper.
-
-    Process:
-        1. v_b1 = model(x_t, t, cond)
-        2. x_t2 = x_t + step_size * v_b1
-        3. v_b2 = model(x_t2, t, cond)  # Use same t (simplified)
-        4. target = (v_b1 + v_b2) / 2
-
-    This method is more accurate but requires two forward passes through the base model.
-    """
-    with torch.no_grad():
-        # First prediction
-        v_b1 = base_model(x_t, t, cond=cond)
-
-        # Reshape step_size for broadcasting
-        step_size_reshaped = _reshape_step_size_for_base(step_size=step_size, base_direction=v_b1)
-
-        # Step forward
-        x_t2 = x_t + step_size_reshaped * v_b1
-
-        # Second prediction (at stepped-forward state)
-        v_b2 = base_model(x_t2, t, cond=cond)
-
-        # Average the two predictions
-        return (v_b1 + v_b2) / 2.0
-
-
-def _resolve_step_size(
-    cond: object | None,
-    *,
-    step_size_key: str,
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    """Extract step size from conditioning or return default ones."""
-    if isinstance(cond, Mapping):
-        step_size = cond.get(step_size_key)
-        if step_size is None and step_size_key != "horizon":
-            step_size = cond.get("horizon")
-        if isinstance(step_size, Tensor):
-            return step_size.to(device=device, dtype=dtype)
-    return torch.ones(batch_size, device=device, dtype=dtype)
-
-
-def _as_tensor(batch: Mapping[str, Tensor | object], key: str) -> Tensor:
-    """Extract tensor from batch and validate type."""
-    value = batch.get(key)
-    if not isinstance(value, Tensor):
-        raise TypeError(f"batch['{key}'] must be a tensor.")
-    return value
-
-
-def _reshape_step_size_for_base(step_size: Tensor, base_direction: Tensor) -> Tensor:
-    """Reshape step_size tensor to match base_direction dimensions for broadcasting."""
-    if base_direction.dim() == 2:
-        if step_size.dim() == 1:
-            return step_size.unsqueeze(-1)
-        if step_size.dim() == 2 and step_size.shape[-1] == 1:
-            return step_size
-    if base_direction.dim() == 5:
-        if step_size.dim() == 1:
-            return step_size[:, None, None, None, None]
-        if step_size.dim() == 2:
-            return step_size[:, None, :, None, None]
-        if step_size.dim() == 3 and step_size.shape[-1] == 1:
-            return step_size.permute(0, 2, 1)[:, :, :, None, None]
-
-    while step_size.dim() < base_direction.dim():
-        step_size = step_size.unsqueeze(-1)
-    return step_size
+    return sqrt_alpha_prev * pred_x0 + sqrt_sigma_prev * pred_eps
