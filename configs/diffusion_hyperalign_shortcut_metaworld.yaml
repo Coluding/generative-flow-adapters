@@ -101,7 +101,7 @@ training:
     # bf16 autocast for the model forward -> Flash SDPA on the frozen UNet
     # (weights/loss stay fp32, no GradScaler). Set to fp32/none to disable.
     amp_dtype: bf16
-    shortcut_step_level_key: step_level
+    shortcut_step_level_key: distillation
     # `two_step`: step_level is sampled uniformly in [min, max] and only fed
     # to the adapter's step_level branch (the target ignores it). Set min==max
     # to pin a single value while debugging.
@@ -113,8 +113,13 @@ training:
     # path (step_level=1, standard diffusion loss only). 0.75 matches the
     # paper's batch-split fraction (1 - 1/4).
     shortcut_anchor_prob: 0.75
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 25, step_level: 0.04}
     video_logging:
       enable: true
-      num_samples: 2
+      num_samples: 4
       fps: 4
       wandb_project: hyperalign-shortcut-metaworld

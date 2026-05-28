@@ -4,7 +4,7 @@ import argparse
 
 from generative_flow_adapters.config import load_config
 from generative_flow_adapters.testing import build_fake_dataloader
-from generative_flow_adapters.training import Trainer, attach_shortcut_targets_from_base, build_experiment
+from generative_flow_adapters.training import Trainer, build_experiment
 
 
 def main() -> None:
@@ -30,13 +30,6 @@ def main() -> None:
     print(f"step_size_key={config.conditioning.step_size_key}")
 
     for step, batch in enumerate(dataloader, start=1):
-        batch = attach_shortcut_targets_from_base(
-            experiment.model,
-            batch,
-            step_size_key=config.conditioning.step_size_key,
-            normalize_base_direction=bool(config.conditioning.extra.get("normalize_base_direction", True)),
-            method=config.training.shortcut_target_method,
-        )
         metrics = trainer.training_step(batch)
         print(
             f"step={step} loss={metrics['loss']:.6f} "
