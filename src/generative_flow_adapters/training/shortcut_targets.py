@@ -122,5 +122,9 @@ def ddim_micro_step_v(
         cur_scale  = _gather(scale_arr, t)
         prev_scale = _gather(scale_arr, prev_t)
         pred_x0 = pred_x0 * (prev_scale / cur_scale)
-
+    # this gives us the prediction at timestep t- s --> We  determine x_0 by using the velocity pred
+    # --> Then use this rpedicted x_0 as our stsarting point and add predicted noise to
+    # --> The preditec noise is scaled by the imestep of t-s (using the alpha and sigma scalings)
+    # --> This gives us a predction of the previous timestep using our current prediction
+    # CAVEAT: The previosu timestep is a denoising timestep, so we are just doing the simple denoising step
     return sqrt_alpha_prev * pred_x0 + sqrt_sigma_prev * pred_eps

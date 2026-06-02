@@ -12,6 +12,9 @@ from generative_flow_adapters.adapters.common import resolve_condition_embedding
 from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
 from generative_flow_adapters.backbones.dynamicrafter.models.utils_diffusion import timestep_embedding
 from generative_flow_adapters.backbones.dynamicrafter.utils.helpers import prob_mask_like
+from generative_flow_adapters.conditioning.utils.dynamicrafter_conditioning import (
+    prepare_dynamicrafter_condition,
+)
 
 
 class UniConHiddenStateAdapter(Adapter):
@@ -25,6 +28,10 @@ class UniConHiddenStateAdapter(Adapter):
         connector_type: str = "zeroft",
         output_mask: bool = False,
         output_kind: str = "prediction",
+        use_step_level_conditioning: bool = False,
+        step_level_key: str = "step_level",
+        step_level_hidden_dim: int | None = None,
+        step_level_transform: str = "linear",
     ) -> None:
         super().__init__()
         self.cond_dim = cond_dim
@@ -33,8 +40,17 @@ class UniConHiddenStateAdapter(Adapter):
         self.connector_type = connector_type
         self.output_mask = output_mask
         self.output_kind = output_kind
+        self.use_step_level_conditioning = use_step_level_conditioning
+        self.step_level_key = step_level_key
+        self.step_level_transform = step_level_transform
+        self.step_level_hidden_dim = int(step_level_hidden_dim or (cond_hidden_dim or cond_dim or 128))
         self._prepared = False
         self._feature_store = _UNetFeatureStore()
+        self.step_level_embed = _build_step_level_embed(
+            enabled=self.use_step_level_conditioning,
+            cond_dim=self.cond_dim,
+            step_level_hidden_dim=self.step_level_hidden_dim,
+        )
 
     def attach_base_model(self, base_model) -> None:
         super().attach_base_model(base_model)
@@ -55,6 +71,14 @@ class UniConHiddenStateAdapter(Adapter):
         del base_output
         module = self._require_module()
         features = self._feature_store.require()
+        cond = prepare_dynamicrafter_condition(
+            cond,
+            x_t=x_t,
+            use_step_level_conditioning=self.use_step_level_conditioning,
+            step_level_key=self.step_level_key,
+            step_level_embed=self.step_level_embed,
+            step_level_transform=self.step_level_transform,
+        )
         emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond, adapter=self)
 
         h = self.middle_connector(features.middle)
@@ -113,6 +137,10 @@ class ReplaceDecoderHiddenStateAdapter(Adapter):
         use_adapter_conditioning: bool = True,
         output_mask: bool = False,
         output_kind: str = "prediction",
+        use_step_level_conditioning: bool = False,
+        step_level_key: str = "step_level",
+        step_level_hidden_dim: int | None = None,
+        step_level_transform: str = "linear",
     ) -> None:
         super().__init__()
         self.cond_dim = cond_dim
@@ -120,8 +148,17 @@ class ReplaceDecoderHiddenStateAdapter(Adapter):
         self.use_adapter_conditioning = use_adapter_conditioning
         self.output_mask = output_mask
         self.output_kind = output_kind
+        self.use_step_level_conditioning = use_step_level_conditioning
+        self.step_level_key = step_level_key
+        self.step_level_transform = step_level_transform
+        self.step_level_hidden_dim = int(step_level_hidden_dim or (cond_hidden_dim or cond_dim or 128))
         self._prepared = False
         self._feature_store = _UNetFeatureStore()
+        self.step_level_embed = _build_step_level_embed(
+            enabled=self.use_step_level_conditioning,
+            cond_dim=self.cond_dim,
+            step_level_hidden_dim=self.step_level_hidden_dim,
+        )
 
     def attach_base_model(self, base_model) -> None:
         super().attach_base_model(base_model)
@@ -142,6 +179,14 @@ class ReplaceDecoderHiddenStateAdapter(Adapter):
         del base_output
         module = self._require_module()
         features = self._feature_store.require()
+        cond = prepare_dynamicrafter_condition(
+            cond,
+            x_t=x_t,
+            use_step_level_conditioning=self.use_step_level_conditioning,
+            step_level_key=self.step_level_key,
+            step_level_embed=self.step_level_embed,
+            step_level_transform=self.step_level_transform,
+        )
         emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond, adapter=self)
 
         h = features.middle
@@ -187,6 +232,10 @@ class FullSkipLayerControlAdapter(Adapter):
         connector_type: str = "zeroconv",
         output_mask: bool = False,
         output_kind: str = "prediction",
+        use_step_level_conditioning: bool = False,
+        step_level_key: str = "step_level",
+        step_level_hidden_dim: int | None = None,
+        step_level_transform: str = "linear",
     ) -> None:
         super().__init__()
         self.cond_dim = cond_dim
@@ -195,8 +244,17 @@ class FullSkipLayerControlAdapter(Adapter):
         self.connector_type = connector_type
         self.output_mask = output_mask
         self.output_kind = output_kind
+        self.use_step_level_conditioning = use_step_level_conditioning
+        self.step_level_key = step_level_key
+        self.step_level_transform = step_level_transform
+        self.step_level_hidden_dim = int(step_level_hidden_dim or (cond_hidden_dim or cond_dim or 128))
         self._prepared = False
         self._feature_store = _UNetFeatureStore()
+        self.step_level_embed = _build_step_level_embed(
+            enabled=self.use_step_level_conditioning,
+            cond_dim=self.cond_dim,
+            step_level_hidden_dim=self.step_level_hidden_dim,
+        )
 
     def attach_base_model(self, base_model) -> None:
         super().attach_base_model(base_model)
@@ -217,6 +275,14 @@ class FullSkipLayerControlAdapter(Adapter):
         del base_output
         module = self._require_module()
         features = self._feature_store.require()
+        cond = prepare_dynamicrafter_condition(
+            cond,
+            x_t=x_t,
+            use_step_level_conditioning=self.use_step_level_conditioning,
+            step_level_key=self.step_level_key,
+            step_level_embed=self.step_level_embed,
+            step_level_transform=self.step_level_transform,
+        )
         emb, context, batch_size = _prepare_unet_runtime(module, x_t, t, cond, adapter=self)
         h = rearrange(x_t, "b c frames h w -> (b frames) c h w").type(module.dtype)
 
@@ -369,6 +435,27 @@ class _UNetFeatures:
         self.middle = middle
         self.output_activations = output_activations
         self.final_dtype = final_dtype
+
+
+def _build_step_level_embed(
+    *,
+    enabled: bool,
+    cond_dim: int | None,
+    step_level_hidden_dim: int,
+) -> nn.Module | None:
+    """Build the (1 → h → cond_dim) MLP that lifts a scalar step size into the
+    adapter's structured-condition space. Matches the embed used by
+    HyperAlign/AVID so the trainer's shortcut path can drive any of the three
+    families through the same key (``cond[step_level_key]``)."""
+    if not enabled:
+        return None
+    if cond_dim is None or cond_dim <= 0:
+        raise ValueError("Step-level conditioning requires a positive cond_dim.")
+    return nn.Sequential(
+        nn.Linear(1, step_level_hidden_dim),
+        nn.SiLU(),
+        nn.Linear(step_level_hidden_dim, int(cond_dim)),
+    )
 
 
 def build_connector(connector_type: str, channels: int) -> nn.Module:

@@ -1,0 +1,94 @@
+name: diffusion_unicon_metaworld
+
+# UniCon Figure-3(d) hidden-state adapter on DynamiCrafter, trained on
+# MetaWorld HDF5.
+#
+# The frozen DynamiCrafter UNet provides the base velocity prediction. The
+# adapter copies the decoder + final head and injects per-step zero-init
+# connectors at the middle, each skip, and each decoder block. The base
+# encoder is reused (its hidden states are captured via forward hooks).
+#
+# Composition modes:
+#   - add        : prediction = base + adapter (use when adapter.output_kind
+#                  is "delta"; not the default UniCon shape)
+#   - replace    : prediction = adapter (set output_kind=prediction, no gate)
+#   - mask_mix   : prediction = base * sigmoid(gate) + adapter * (1 - sigmoid(gate))
+#                  Requires adapter.extra.output_mask=true so the deep-copied
+#                  out_mask head emits the gate.
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: false
+  include_base_condition: true
+  extra:
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/dynamicrafter_512.yaml
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: false
+    allow_missing_checkpoint: false
+    # Attach the DynamiCrafter VAE so eval-time samples can be decoded to RGB
+    # and logged to wandb. Requires the checkpoint to contain
+    # `first_stage_model.*` keys (the official DynamiCrafter release does).
+    load_first_stage_model: true
+
+adapter:
+  type: hidden_state
+  hidden_dim: 128
+  # See header for the composition semantics.
+  composition: mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: unicon
+    # Connectors fused into the captured base activations. `zeroft` does both
+    # an additive zero-conv and a multiplicative zero-conv (UniCon's default
+    # design). `zeroconv` is the ControlNet-style additive-only fallback.
+    connector_type: zeroft
+    # Enables the deep-copied `out_mask` head so the adapter emits a per-pixel
+    # gate consumed by `mask_mix` composition. Set false for `add`/`replace`.
+    output_mask: true
+    output_kind: prediction
+    # Time/action embedding stays the same as the base; we add a learnable
+    # projection of cond["embedding"] (from the structured encoder below) and
+    # fuse it into the U-Net `emb` via a zero-init linear so training starts
+    # from the unmodified base.
+    use_adapter_conditioning: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.05
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  # Run inference + decode every N steps. Requires model.extra.load_first_stage_model=true.
+  inference_every_n_steps: 5000
+  inference_num_steps: 25
+  extra:
+    # Mixed-precision autocast for the model forward. bf16 lets the frozen
+    # DynamiCrafter UNet's SDPA route to the Flash kernel on Ampere+ while
+    # weights stay fp32 and the loss/backward run in fp32 (no GradScaler).
+    # Set to fp32/none to disable.
+    amp_dtype: bf16
+    video_logging:
+      enable: true
+      num_samples: 2
+      fps: 4
+      wandb_project: unicon-metaworld
