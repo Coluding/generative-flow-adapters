@@ -11,6 +11,7 @@ from generative_flow_adapters.adapters.hypernetworks import HyperAlignAdapter, S
 from generative_flow_adapters.adapters.low_rank.common import PAPER_HYPERALIGN_TARGET_MODULES
 from generative_flow_adapters.adapters.low_rank.lora import LoRAAdapter
 from generative_flow_adapters.adapters.output.affine import AffineOutputAdapter
+from generative_flow_adapters.adapters.output.output_head import OutputHeadAdapter
 from generative_flow_adapters.config import AdapterConfig, ConditioningConfig, ModelConfig
 from generative_flow_adapters.adapters.output.shortcut_direction import ShortcutDirectionOutputAdapter
 
@@ -21,30 +22,15 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
     cond_dim = conditioning.output_dim
 
     if adapter_type == "output":
-        architecture = str(adapter.extra.get("architecture", "affine")).lower()
+        # The default output adapter is the unified DynamiCrafter-backed one;
+        # `extra.backbone` (unet | transformer | mlp) and `extra.output_format`
+        # (direct | affine) choose its form. `affine`, `shortcut_direction`, and
+        # the hidden-state architectures remain reachable as explicit legacy keys.
+        architecture = str(adapter.extra.get("architecture", "dynamicrafter")).lower()
         if architecture == "affine":
             return AffineOutputAdapter(feature_dim=feature_dim, cond_dim=cond_dim, hidden_dim=adapter.hidden_dim)
-        if architecture == "dynamicrafter":
-            unet_config_path = adapter.extra.get("unet_config_path")
-            if not isinstance(unet_config_path, str) or not unet_config_path:
-                raise ValueError("DynamicCrafter output adapter requires adapter.extra.unet_config_path")
-            return DynamicCrafterOutputAdapter(
-                unet_config_path=unet_config_path,
-                checkpoint_path=adapter.extra.get("checkpoint_path"),
-                condition_on_base_outputs=bool(adapter.extra.get("condition_on_base_outputs", True)),
-                output_mask=bool(adapter.extra.get("output_mask", False)),
-                strict_checkpoint=bool(adapter.extra.get("strict_checkpoint", False)),
-                cond_dim=cond_dim,
-                cond_hidden_dim=adapter.hidden_dim,
-                use_adapter_conditioning=bool(adapter.extra.get("use_adapter_conditioning", True)),
-                allow_dummy_concat_condition=bool(
-                    adapter.extra.get("allow_dummy_concat_condition", model.extra.get("allow_dummy_concat_condition", False))
-                ),
-                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
-                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
-                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
-                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
-            )
+        if architecture in {"dynamicrafter", "output", "output_v2", "output_head", "head", "default"}:
+            return _build_output(model, adapter, conditioning, feature_dim=feature_dim, cond_dim=cond_dim)
         if architecture in {"shortcut_direction", "shortcut"}:
             return ShortcutDirectionOutputAdapter(
                 feature_dim=feature_dim,
@@ -64,6 +50,10 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 connector_type=str(adapter.extra.get("connector_type", "zeroft")),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
                 output_kind=str(adapter.extra.get("output_kind", "prediction")),
+                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         if architecture in {"replace_decoder", "replace_diffusion_decoder"}:
             return ReplaceDecoderHiddenStateAdapter(
@@ -72,6 +62,10 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 use_adapter_conditioning=bool(adapter.extra.get("use_adapter_conditioning", True)),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
                 output_kind=str(adapter.extra.get("output_kind", "prediction")),
+                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         if architecture in {"full_skip_controlnet", "skip_layer_controlnet"}:
             return FullSkipLayerControlAdapter(
@@ -81,6 +75,10 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 connector_type=str(adapter.extra.get("connector_type", "zeroconv")),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
                 output_kind=str(adapter.extra.get("output_kind", "prediction")),
+                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         raise ValueError(f"Unsupported output adapter architecture: {architecture}")
     if adapter_type in {"hidden", "hidden_state", "controlnet", "residual"}:
@@ -95,6 +93,10 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 connector_type=str(adapter.extra.get("connector_type", "zeroft")),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
                 output_kind=str(adapter.extra.get("output_kind", "prediction")),
+                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         if architecture in {"replace_decoder", "replace_diffusion_decoder"}:
             return ReplaceDecoderHiddenStateAdapter(
@@ -103,6 +105,10 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 use_adapter_conditioning=bool(adapter.extra.get("use_adapter_conditioning", True)),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
                 output_kind=str(adapter.extra.get("output_kind", "prediction")),
+                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         if architecture in {"full_skip_controlnet", "skip_layer_controlnet"}:
             return FullSkipLayerControlAdapter(
@@ -112,6 +118,10 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
                 connector_type=str(adapter.extra.get("connector_type", "zeroconv")),
                 output_mask=bool(adapter.extra.get("output_mask", False)),
                 output_kind=str(adapter.extra.get("output_kind", "prediction")),
+                use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+                step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+                step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+                step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             )
         raise ValueError(f"Unsupported hidden-state adapter architecture: {architecture}")
     if adapter_type in {"hyper", "hypernetwork"}:
@@ -169,3 +179,76 @@ def build_adapter(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
     if adapter_type == "lora":
         return LoRAAdapter(rank=adapter.rank, alpha=adapter.alpha, target_modules=adapter.target_modules)
     raise ValueError(f"Unsupported adapter type: {adapter.type}")
+
+
+def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: ConditioningConfig, *, feature_dim, cond_dim):
+    """Unified output adapter.
+
+    The form is chosen by ``extra``:
+    - ``backbone``: ``unet`` (default — the DynamiCrafter 3D UNet), ``transformer``
+      (DiT-style over patchified latents), or ``mlp`` (lightweight FiLM head).
+    - ``output_format``: ``direct`` (emit the delta) or ``affine`` (emit
+      ``scale, shift`` → ``base*scale + shift``); plus ``affine_granularity``
+      (``dense`` | ``channel``) and ``gate_kind`` for the head backbones.
+
+    `unet` reuses ``DynamicCrafterOutputAdapter``; `transformer`/`mlp` use
+    ``OutputHeadAdapter``. (The old ``architecture: output_v2`` key still routes
+    here.)
+    """
+    backbone = str(adapter.extra.get("backbone", "unet")).lower()
+    output_format = str(adapter.extra.get("output_format", "direct"))
+    affine_granularity = str(adapter.extra.get("affine_granularity", "dense"))
+
+    if backbone in {"unet", "dynamicrafter"}:
+        unet_config_path = adapter.extra.get("unet_config_path")
+        if not isinstance(unet_config_path, str) or not unet_config_path:
+            raise ValueError("output adapter with backbone='unet' requires adapter.extra.unet_config_path")
+        return DynamicCrafterOutputAdapter(
+            unet_config_path=unet_config_path,
+            checkpoint_path=adapter.extra.get("checkpoint_path"),
+            condition_on_base_outputs=bool(adapter.extra.get("condition_on_base_outputs", True)),
+            output_mask=bool(adapter.extra.get("output_mask", False)),
+            strict_checkpoint=bool(adapter.extra.get("strict_checkpoint", False)),
+            cond_dim=cond_dim,
+            cond_hidden_dim=adapter.hidden_dim,
+            use_adapter_conditioning=bool(adapter.extra.get("use_adapter_conditioning", True)),
+            allow_dummy_concat_condition=bool(
+                adapter.extra.get("allow_dummy_concat_condition", model.extra.get("allow_dummy_concat_condition", False))
+            ),
+            use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+            step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+            step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+            step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
+            output_format=output_format,
+            affine_granularity=affine_granularity,
+        )
+
+    # The head operates in latent space, so the channel count must be the true
+    # latent width. Prefer an explicit override, then the adapter/model latent
+    # channels, and only fall back to the generic feature_dim (which defaults to
+    # 64 and would otherwise shadow a 4-channel video latent).
+    channels = (
+        adapter.extra.get("output_channels")
+        or adapter.feature_dim
+        or model.extra.get("latent_channels")
+        or model.feature_dim
+    )
+    channels = int(channels) if channels else 0
+    if not channels:
+        raise ValueError(
+            "output adapter with backbone='mlp'/'transformer' needs a channel count: set adapter.extra.output_channels, "
+            "adapter.feature_dim, or model.extra.latent_channels."
+        )
+    return OutputHeadAdapter(
+        feature_dim=int(channels),
+        cond_dim=cond_dim,
+        hidden_dim=adapter.hidden_dim,
+        backbone=backbone,
+        output_format=output_format,
+        affine_granularity=affine_granularity,
+        gate_kind=str(adapter.extra.get("gate_kind", "none")),
+        condition_on_base_outputs=bool(adapter.extra.get("condition_on_base_outputs", True)),
+        patch_size=int(adapter.extra.get("patch_size", 2)),
+        num_layers=int(adapter.extra.get("num_layers", 4)),
+        num_heads=int(adapter.extra.get("num_heads", 8)),
+    )

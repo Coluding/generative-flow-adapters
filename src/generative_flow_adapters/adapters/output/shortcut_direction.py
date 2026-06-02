@@ -9,7 +9,9 @@ from generative_flow_adapters.adapters.output.interface import OutputAdapterInte
 
 
 class ShortcutDirectionOutputAdapter(OutputAdapterInterface):
-    """Predicts a shortcut direction directly in output space."""
+    """Predicts a shortcut direction directly in output space.
+        DEPRECATED!
+    """
 
     def __init__(
         self,

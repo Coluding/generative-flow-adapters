@@ -8,6 +8,12 @@ import yaml
 from torch import Tensor, nn
 
 from generative_flow_adapters.conditioning.utils.dynamicrafter_conditioning import prepare_dynamicrafter_condition
+from generative_flow_adapters.adapters.output.format import (
+    build_output_result,
+    normalize_affine_granularity,
+    normalize_output_format,
+    output_channel_multiplier,
+)
 from generative_flow_adapters.adapters.output.interface import OutputAdapterInterface, OutputAdapterResult
 from generative_flow_adapters.backbones.dynamicrafter.modules.networks.openaimodel3d import UNetModel
 from generative_flow_adapters.losses.diffusion import DiffusionScheduleConfig
@@ -30,6 +36,8 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         step_level_key: str = "step_level",
         step_level_hidden_dim: int | None = None,
         step_level_transform: str = "linear",
+        output_format: str = "direct",
+        affine_granularity: str = "dense",
     ) -> None:
         super().__init__()
 
@@ -37,6 +45,18 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         params = _load_unet_params(unet_config_path)
         self.condition_on_base_outputs = condition_on_base_outputs
         self.output_mask = output_mask
+        self.output_format = normalize_output_format(output_format)
+        self.affine_granularity = normalize_affine_granularity(affine_granularity)
+        # Channels of the base prediction the adapter operates on, captured
+        # before any affine doubling so the base-output channel-concat below
+        # still uses the true latent width.
+        self._base_channels = int(params["out_channels"])
+        if self.output_format == "affine" and self.output_mask:
+            raise ValueError(
+                "DynamicCrafter output adapter cannot combine output_format='affine' with output_mask=True: "
+                "affine returns a delta (output_kind='delta'), while the mask/gate path requires a full "
+                "prediction. Use output_format='direct' for mask_mix composition."
+            )
         self.cond_dim = cond_dim
         self.cond_hidden_dim = cond_hidden_dim
         self.use_adapter_conditioning = use_adapter_conditioning
@@ -59,6 +79,9 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
             params["in_channels"] = int(params["in_channels"]) + int(params["out_channels"])
         if self.output_mask:
             params["output_mask"] = True
+        # For the affine format the UNet must emit 2C channels (scale + shift);
+        # `build_output_result` splits them back into the residual delta.
+        params["out_channels"] = self._base_channels * output_channel_multiplier(self.output_format)
         self.module = UNetModel(**params)
 
         if checkpoint_path:
@@ -153,6 +176,16 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
             fs=fs,
             adapter_embedding=adapter_embedding,
         )
+        if self.output_format == "affine":
+            # The UNet emitted 2C channels; split into (scale, shift) and return
+            # the residual delta base*scale + shift (composed as base*(1+scale)+shift).
+            reference = base_output if base_output is not None else x_t
+            return build_output_result(
+                output,
+                reference,
+                output_format="affine",
+                affine_granularity=self.affine_granularity,
+            )
         if self.output_mask:
             if not isinstance(output, tuple) or len(output) != 2:
                 raise TypeError("Expected DynamicCrafter output adapter with output_mask=True to return (prediction, mask).")

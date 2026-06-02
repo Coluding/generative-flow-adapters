@@ -86,12 +86,24 @@ class AdaptedModel(nn.Module):
         elif composition in {"replace", "adapter_only"}:
             return adapter_result.adapter_output
         elif composition in {"mask_mix", "avid_mask_mix"}:
+            # AVID prediction-blend: the adapter output is a *standalone*
+            # prediction competing with the base. gate≈1 ⇒ keep base.
             if output_kind != "prediction":
                 raise ValueError("Mask-mix composition requires adapter outputs with output_kind='prediction'.")
             if adapter_result.gate is None:
                 raise ValueError("Mask-mix composition requires an adapter gate output.")
             gate = torch.sigmoid(adapter_result.gate + self.gate_bias)
             return base_output * gate + adapter_result.adapter_output * (1.0 - gate)
+        elif composition in {"gated_residual", "gated_add", "residual_mask"}:
+            # Gated residual: the adapter output is a *contribution* added to the
+            # base, with a learned gate deciding where/how much to apply it
+            # (the thesis core rule f = base + g·Δ). Works for any contribution
+            # regardless of how it was formed (direct delta or affine scale/shift),
+            # and is identity at init whenever Δ→0 — no gate_bias needed.
+            if adapter_result.gate is None:
+                raise ValueError("gated_residual composition requires an adapter gate output.")
+            gate = torch.sigmoid(adapter_result.gate + self.gate_bias)
+            return base_output + gate * adapter_result.adapter_output
 
         raise ValueError(f"Unsupported output composition: {self.output_composition}")
 
