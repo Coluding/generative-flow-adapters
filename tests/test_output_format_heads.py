@@ -1,10 +1,10 @@
 """Tests for the output-format ablation machinery.
 
-Covers the shared ``format.py`` math (direct vs. affine, dense vs. channel
-granularity) and the new ``OutputHeadAdapter`` (mlp / transformer backbones),
-end-to-end through ``AdaptedModel``. The DynamiCrafter ``unet`` backbone is
-exercised by the existing DynamiCrafter tests; here we only verify the format
-helper it now delegates to.
+Covers the shared ``format.py`` math (direct vs. channel-wise affine) and the
+new ``OutputHeadAdapter`` (mlp / transformer backbones), end-to-end through
+``AdaptedModel``. The DynamiCrafter ``unet`` backbone is exercised by the
+existing DynamiCrafter tests; here we only verify the format helper it now
+delegates to.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from torch import Tensor, nn
 
 from generative_flow_adapters.adapters.output.format import (
     build_output_result,
-    normalize_affine_granularity,
+    normalize_granularity,
     normalize_output_format,
     output_channel_multiplier,
 )
@@ -46,8 +46,8 @@ class FormatNormalizationTest(unittest.TestCase):
     def test_aliases(self):
         self.assertEqual(normalize_output_format("delta"), "direct")
         self.assertEqual(normalize_output_format("scale_shift"), "affine")
-        self.assertEqual(normalize_affine_granularity("per_channel"), "channel")
-        self.assertEqual(normalize_affine_granularity("spatial"), "dense")
+        self.assertEqual(normalize_granularity("per_channel"), "channel")
+        self.assertEqual(normalize_granularity("spatial"), "dense")
 
     def test_multiplier(self):
         self.assertEqual(output_channel_multiplier("direct"), 1)
@@ -65,21 +65,15 @@ class FormatMathTest(unittest.TestCase):
         self.assertEqual(result.output_kind, "delta")
         self.assertTrue(torch.equal(result.adapter_output, raw))
 
-    def test_affine_dense_computes_scale_shift(self):
+    def test_affine_always_pools_per_channel(self):
+        # Affine is channel-wise only: scale/shift are pooled over T,H,W
+        # regardless of the raw map's resolution (no dense option exists).
         reference = torch.randn(2, 4, 3, 8, 8)
         scale = torch.randn(2, 4, 3, 8, 8)
         shift = torch.randn(2, 4, 3, 8, 8)
         raw = torch.cat([scale, shift], dim=1)
-        result = build_output_result(raw, reference, output_format="affine", affine_granularity="dense")
+        result = build_output_result(raw, reference, output_format="affine")
         self.assertEqual(result.output_kind, "delta")
-        self.assertTrue(torch.allclose(result.adapter_output, reference * scale + shift))
-
-    def test_affine_channel_pools_spatial(self):
-        reference = torch.randn(2, 4, 3, 8, 8)
-        scale = torch.randn(2, 4, 3, 8, 8)
-        shift = torch.randn(2, 4, 3, 8, 8)
-        raw = torch.cat([scale, shift], dim=1)
-        result = build_output_result(raw, reference, output_format="affine", affine_granularity="channel")
         pooled_scale = scale.mean(dim=(2, 3, 4), keepdim=True)
         pooled_shift = shift.mean(dim=(2, 3, 4), keepdim=True)
         self.assertTrue(torch.allclose(result.adapter_output, reference * pooled_scale + pooled_shift))
@@ -96,14 +90,13 @@ class FormatMathTest(unittest.TestCase):
 
 
 class OutputHeadAdapterTest(unittest.TestCase):
-    def _run(self, backbone: str, output_format: str, affine_granularity: str = "dense", condition_on_base_outputs: bool = True):
+    def _run(self, backbone: str, output_format: str, condition_on_base_outputs: bool = True):
         adapter = OutputHeadAdapter(
             feature_dim=4,
             cond_dim=16,
             hidden_dim=32,
             backbone=backbone,
             output_format=output_format,
-            affine_granularity=affine_granularity,
             condition_on_base_outputs=condition_on_base_outputs,
             patch_size=2,
             num_layers=2,
@@ -115,7 +108,7 @@ class OutputHeadAdapterTest(unittest.TestCase):
         return adapter, base, model, x_t, t, cond
 
     def test_mlp_affine_shape_and_identity_at_init(self):
-        adapter, base, model, x_t, t, cond = self._run("mlp", "affine", "channel")
+        adapter, base, model, x_t, t, cond = self._run("mlp", "affine")
         out = model(x_t, t, cond)
         self.assertEqual(tuple(out.shape), tuple(x_t.shape))
         # Zero-init head => delta 0 => composed output equals the base prediction.
@@ -125,8 +118,8 @@ class OutputHeadAdapterTest(unittest.TestCase):
         _, _, model, x_t, t, cond = self._run("mlp", "direct")
         self.assertEqual(tuple(model(x_t, t, cond).shape), tuple(x_t.shape))
 
-    def test_transformer_affine_dense_shape_and_identity(self):
-        adapter, base, model, x_t, t, cond = self._run("transformer", "affine", "dense")
+    def test_transformer_affine_shape_and_identity(self):
+        adapter, base, model, x_t, t, cond = self._run("transformer", "affine")
         out = model(x_t, t, cond)
         self.assertEqual(tuple(out.shape), tuple(x_t.shape))
         self.assertTrue(torch.allclose(out, base(x_t, t, cond), atol=1e-6))
@@ -136,7 +129,7 @@ class OutputHeadAdapterTest(unittest.TestCase):
         self.assertEqual(tuple(model(x_t, t, cond).shape), tuple(x_t.shape))
 
     def test_transformer_without_base_output_conditioning(self):
-        _, _, model, x_t, t, cond = self._run("transformer", "affine", "dense", condition_on_base_outputs=False)
+        _, _, model, x_t, t, cond = self._run("transformer", "affine", condition_on_base_outputs=False)
         self.assertEqual(tuple(model(x_t, t, cond).shape), tuple(x_t.shape))
 
     def test_affine_channel_count_doubles(self):
@@ -147,7 +140,7 @@ class OutputHeadAdapterTest(unittest.TestCase):
 
     def test_trains_a_step(self):
         # Backward should reach the adapter (and not the frozen base).
-        adapter, base, model, x_t, t, cond = self._run("transformer", "affine", "dense")
+        adapter, base, model, x_t, t, cond = self._run("transformer", "affine")
         out = model(x_t, t, cond)
         loss = (out - torch.randn_like(out)).pow(2).mean()
         loss.backward()

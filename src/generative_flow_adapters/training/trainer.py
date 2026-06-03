@@ -16,6 +16,7 @@ from generative_flow_adapters.losses.registry import LossRegistry
 from generative_flow_adapters.training.shortcut_targets import (
     compute_self_consistency_target_v,
     compute_two_step_target_v,
+    ddim_micro_step_v,
 )
 from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
 
@@ -224,6 +225,16 @@ class Trainer:
             consistency = LossRegistry.get_consistency_loss("multistep_self_consistency")(prediction, self_consistency_target)
             loss_components["multistep_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.multistep_consistency_weight * consistency
+
+        # Heun-smoothness regularizer (opt-in, orthogonal to shortcut training):
+        # penalize the velocity field's material derivative along its own
+        # predicted one-step trajectory. Adds one extra adapter forward (v0,
+        # with grad) plus one no-grad reference forward (v1). See thesis-vault
+        # theory/heun-smoothness-regularizer.md.
+        if self.config.heun_smoothness_weight > 0.0:
+            heun_loss = self._compute_heun_smoothness(x_t=x_t, t=t, cond=cond)
+            loss_components["heun_smoothness_loss"] = float(heun_loss.detach().cpu())
+            loss = loss + self.config.heun_smoothness_weight * heun_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -516,6 +527,63 @@ class Trainer:
             log2_max += 1
         j = int(torch.randint(0, log2_max + 1, (1,)).item())
         return 1 << j
+
+    def _compute_heun_smoothness(
+        self,
+        *,
+        x_t: Tensor,
+        t: Tensor,
+        cond: object | None,
+    ) -> Tensor:
+        """Heun-derived velocity-field smoothness regularizer ``L_heun_smooth``.
+
+        Approximates the material derivative of the composed velocity field by a
+        finite difference along one DDIM micro-step and penalizes its magnitude:
+        ``||v0 - sg(v1)||^2`` where ``v0`` has grad and ``v1`` (the model's
+        velocity at the predicted endpoint) is a detached "future-self"
+        reference. See thesis-vault theory/heun-smoothness-regularizer.md eq.(S).
+
+        Orthogonal to shortcut training. The step size only sets the *interval*
+        over which smoothness is enforced — drawn from ``shortcut_step_schedule``
+        if configured, else a unit timestep jump. ``step_level`` is deliberately
+        **not** injected: the regularizer sees the same ``cond`` the model sees
+        during standard training.
+        """
+        model_type = getattr(self.model, "model_type", None)
+        if model_type != "diffusion":
+            raise NotImplementedError(
+                "heun_smoothness_weight is implemented for diffusion "
+                "(v-prediction) backbones only; flow-matching support is deferred. "
+                "See thesis-vault refactor-shortcut-deprecate-twostep-add-heun-"
+                "smoothness (patch 1.5)."
+            )
+
+        if self.step_schedule is not None:
+            jump = self.step_schedule.to_timestep_jump(self.step_schedule.sample())
+        else:
+            jump = 1
+        jump = max(int(jump), 1)
+
+        with self._autocast():
+            v0 = self.model(x_t, t, cond)
+        v0 = v0.float()
+
+        alphas, scale_arr = self._diffusion_tables(device=x_t.device, dtype=v0.dtype)
+        prev_t = (t - jump).clamp_min(0)
+        x_prev = ddim_micro_step_v(
+            x=x_t.float(), v=v0, t=t, prev_t=prev_t,
+            alphas_cumprod=alphas, scale_arr=scale_arr,
+        )
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad(), self._autocast():
+                v1 = self.model(x_prev, prev_t, cond)
+        finally:
+            self.model.train(was_training)
+
+        return LossRegistry.get_consistency_loss("heun_smoothness")(v0, v1.float())
 
     def _diffusion_tables(
         self,

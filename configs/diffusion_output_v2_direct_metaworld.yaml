@@ -5,13 +5,14 @@ name: diffusion_output_v2_direct_metaworld
 # A transformer output adapter on the frozen DynamiCrafter UNet. The adapter
 # reads the detached base velocity (condition_on_base_outputs) and emits the
 # residual delta DIRECTLY: the backbone produces C channels added to the base
-# under `add` composition, so prediction = base + delta.
+# under `add` composition, so prediction = base + delta — a free,
+# full-resolution residual.
 #
 # Pair this with `diffusion_output_v2_affine_metaworld.yaml` (identical except
-# output_format: affine) to isolate the effect of the scale-shift output
-# format vs. predicting the residual delta directly. Same backbone, same
-# capacity — only the output head differs. (affine_granularity below is
-# inert for the direct format; left in place so the two configs diff cleanly.)
+# output_format: affine). The two arms test a difference in INDUCTIVE BIAS, not
+# capacity: direct emits a free full-resolution residual; affine emits a cheap
+# per-channel FiLM modulation of the frozen base. Same transformer trunk, only
+# the readout structure differs.
 
 model:
   type: diffusion
@@ -38,7 +39,6 @@ adapter:
     # type: output defaults to the DynamiCrafter adapter; `backbone` picks the form.
     backbone: transformer
     output_format: direct        # <-- the ablated axis (affine in the sibling config)
-    affine_granularity: dense     # dense per-element scale/shift maps
     condition_on_base_outputs: true
     # Transformer backbone hyperparameters (DiT-style over patchified latents).
     patch_size: 2

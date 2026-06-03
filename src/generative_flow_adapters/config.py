@@ -65,6 +65,10 @@ class TrainingConfig:
     shortcut_direction_weight: float = 0.0
     local_consistency_weight: float = 0.0
     multistep_consistency_weight: float = 0.0
+    # Opt-in Heun-derived velocity-field smoothness regularizer. Orthogonal to
+    # shortcut training (works on any diffusion run); default 0 keeps behaviour
+    # unchanged. See thesis-vault theory/heun-smoothness-regularizer.md.
+    heun_smoothness_weight: float = 0.0
     shortcut_target_method: str = "linear"  # "linear" or "two_step"
     grad_clip_norm: float | None = None
     diffusion_timesteps: int = 1000

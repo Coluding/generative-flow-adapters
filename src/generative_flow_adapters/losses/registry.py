@@ -5,6 +5,7 @@ from collections.abc import Callable
 from torch import Tensor
 
 from generative_flow_adapters.losses.consistency import (
+    heun_smoothness_loss,
     local_consistency_loss,
     multistep_self_consistency_loss,
     shortcut_direction_loss,
@@ -23,6 +24,7 @@ class LossRegistry:
         "shortcut_direction": shortcut_direction_loss,
         "local_consistency": local_consistency_loss,
         "multistep_self_consistency": multistep_self_consistency_loss,
+        "heun_smoothness": heun_smoothness_loss,
     }
 
     @classmethod

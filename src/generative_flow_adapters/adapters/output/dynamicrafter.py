@@ -10,7 +10,6 @@ from torch import Tensor, nn
 from generative_flow_adapters.conditioning.utils.dynamicrafter_conditioning import prepare_dynamicrafter_condition
 from generative_flow_adapters.adapters.output.format import (
     build_output_result,
-    normalize_affine_granularity,
     normalize_output_format,
     output_channel_multiplier,
 )
@@ -37,7 +36,6 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         step_level_hidden_dim: int | None = None,
         step_level_transform: str = "linear",
         output_format: str = "direct",
-        affine_granularity: str = "dense",
     ) -> None:
         super().__init__()
 
@@ -46,7 +44,6 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         self.condition_on_base_outputs = condition_on_base_outputs
         self.output_mask = output_mask
         self.output_format = normalize_output_format(output_format)
-        self.affine_granularity = normalize_affine_granularity(affine_granularity)
         # Channels of the base prediction the adapter operates on, captured
         # before any affine doubling so the base-output channel-concat below
         # still uses the true latent width.
@@ -177,14 +174,14 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
             adapter_embedding=adapter_embedding,
         )
         if self.output_format == "affine":
-            # The UNet emitted 2C channels; split into (scale, shift) and return
-            # the residual delta base*scale + shift (composed as base*(1+scale)+shift).
+            # The UNet emitted 2C channels; split into per-channel (scale, shift)
+            # and return the residual delta base*scale + shift (composed as
+            # base*(1+scale)+shift). Affine is channel-wise only — see format.py.
             reference = base_output if base_output is not None else x_t
             return build_output_result(
                 output,
                 reference,
                 output_format="affine",
-                affine_granularity=self.affine_granularity,
             )
         if self.output_mask:
             if not isinstance(output, tuple) or len(output) != 2:

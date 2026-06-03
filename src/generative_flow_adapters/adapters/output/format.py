@@ -2,32 +2,34 @@
 
 The point of this module is to make the *output parameterisation* an axis
 that is orthogonal to the adapter backbone, so we can ask a clean research
-question: holding the backbone fixed, does emitting an affine ``(scale,
-shift)`` modulation of the base prediction beat emitting the residual delta
-directly?
+question: holding the backbone fixed, does emitting a per-channel affine
+``(scale, shift)`` modulation of the base prediction beat emitting the
+residual delta directly?
 
 Two formats:
 
 - ``direct``: the backbone emits ``C`` channels which are the delta added to
-  the base output (``prediction = base + delta``).
+  the base output (``prediction = base + delta``) — a free, full-resolution
+  residual.
 - ``affine``: the backbone emits ``2C`` channels split into ``(scale,
-  shift)``; the returned delta is ``base * scale + shift``. Because every
-  output adapter returns ``output_kind="delta"`` and ``AdaptedModel`` adds it
-  back, the realised transform is ``base * (1 + scale) + shift`` — a residual
-  FiLM, identical in spirit to ``AffineOutputAdapter`` but driven by an
-  arbitrary backbone.
+  shift)``; both are pooled to **one value per channel** and the returned delta
+  is ``base * scale + shift``. Because every output adapter returns
+  ``output_kind="delta"`` and ``AdaptedModel`` adds it back, the realised
+  transform is ``base * (1 + scale) + shift`` — a per-channel residual FiLM,
+  identical in spirit to ``AffineOutputAdapter`` but driven by an arbitrary
+  backbone.
 
-Two granularities (affine only):
-
-- ``dense``: per-element scale/shift maps (the full ``2C`` spatial/temporal
-  tensor). Capacity-matched to a dense delta, so it is the fair "format only"
-  comparison.
-- ``channel``: one scale/shift per channel, pooled over space/time and
-  broadcast back. Matches the lightweight FiLM of the original affine head.
+**Affine is channel-wise only — by design.** A dense (per-element) scale/shift
+map would make ``shift`` full-rank, so ``base + shift`` could already represent
+*any* residual: dense affine would just be ``direct`` plus an expressivity-
+redundant multiplicative term, collapsing the format distinction. The
+meaningful contrast is therefore ``direct`` (a free dense delta) vs ``affine``
+(a cheap, structured per-channel modulation of the frozen base) — different
+inductive biases, not the same head with extra channels. See the
+``affine-output-granularity`` note in the thesis vault for the full argument.
 
 Both formats are returned as ``output_kind="delta"`` so they compose as
-residuals on the frozen base — that is what makes the comparison apples to
-apples.
+residuals on the frozen base.
 """
 
 from __future__ import annotations
@@ -45,7 +47,10 @@ _OUTPUT_FORMAT_ALIASES = {
     "film": "affine",
 }
 
-_AFFINE_GRANULARITY_ALIASES = {
+# Granularity aliases for the *gate* (``gate_kind``): per-element (``dense``)
+# vs pooled per-channel (``channel``). The affine *format* no longer takes a
+# granularity — it is always per-channel (see module docstring).
+_GRANULARITY_ALIASES = {
     "dense": "dense",
     "spatial": "dense",
     "per_element": "dense",
@@ -65,14 +70,15 @@ def normalize_output_format(value: str) -> str:
     return _OUTPUT_FORMAT_ALIASES[key]
 
 
-def normalize_affine_granularity(value: str) -> str:
+def normalize_granularity(value: str) -> str:
+    """Normalize a ``dense``/``channel`` granularity (used by the gate)."""
     key = str(value).strip().lower()
-    if key not in _AFFINE_GRANULARITY_ALIASES:
+    if key not in _GRANULARITY_ALIASES:
         raise ValueError(
-            f"Unsupported affine_granularity: {value!r} (expected one of "
-            f"{sorted(set(_AFFINE_GRANULARITY_ALIASES.values()))})."
+            f"Unsupported granularity: {value!r} (expected one of "
+            f"{sorted(set(_GRANULARITY_ALIASES.values()))})."
         )
-    return _AFFINE_GRANULARITY_ALIASES[key]
+    return _GRANULARITY_ALIASES[key]
 
 
 def output_channel_multiplier(output_format: str) -> int:
@@ -88,7 +94,6 @@ def build_output_result(
     reference: Tensor | None,
     *,
     output_format: str,
-    affine_granularity: str = "dense",
     channel_dim: int = 1,
     gate: Tensor | None = None,
 ) -> OutputAdapterResult:
@@ -112,7 +117,6 @@ def build_output_result(
     if reference is None:
         raise ValueError("affine output_format requires a reference tensor (base_output or x_t).")
 
-    granularity = normalize_affine_granularity(affine_granularity)
     channels = raw.shape[channel_dim]
     if channels % 2 != 0:
         raise ValueError(
@@ -121,9 +125,12 @@ def build_output_result(
         )
     scale, shift = raw.chunk(2, dim=channel_dim)
 
-    if granularity == "channel":
-        scale = _pool_spatial(scale, channel_dim)
-        shift = _pool_spatial(shift, channel_dim)
+    # Affine is per-channel only. A dense per-element shift map would be full-rank
+    # and thus subsume the `direct` delta (base + shift), so affine would degenerate
+    # into "direct + a redundant multiplicative term". Pool to one (scale, shift)
+    # per channel so the format is a genuine, cheap FiLM inductive bias.
+    scale = _pool_spatial(scale, channel_dim)
+    shift = _pool_spatial(shift, channel_dim)
 
     scale = _broadcast_to_rank(scale, reference.dim())
     shift = _broadcast_to_rank(shift, reference.dim())
@@ -145,7 +152,7 @@ def prepare_gate(
     returned — the mixing layer applies ``sigmoid(gate + gate_bias)``.
     """
     gate = gate_raw
-    if normalize_affine_granularity(granularity) == "channel":
+    if normalize_granularity(granularity) == "channel":
         gate = _pool_spatial(gate, channel_dim)
     return _broadcast_to_rank(gate, reference.dim())
 

@@ -11,6 +11,7 @@ from generative_flow_adapters.adapters.hypernetworks import HyperAlignAdapter, S
 from generative_flow_adapters.adapters.low_rank.common import PAPER_HYPERALIGN_TARGET_MODULES
 from generative_flow_adapters.adapters.low_rank.lora import LoRAAdapter
 from generative_flow_adapters.adapters.output.affine import AffineOutputAdapter
+from generative_flow_adapters.adapters.output.format import normalize_granularity, normalize_output_format
 from generative_flow_adapters.adapters.output.output_head import OutputHeadAdapter
 from generative_flow_adapters.config import AdapterConfig, ConditioningConfig, ModelConfig
 from generative_flow_adapters.adapters.output.shortcut_direction import ShortcutDirectionOutputAdapter
@@ -188,8 +189,8 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
     - ``backbone``: ``unet`` (default — the DynamiCrafter 3D UNet), ``transformer``
       (DiT-style over patchified latents), or ``mlp`` (lightweight FiLM head).
     - ``output_format``: ``direct`` (emit the delta) or ``affine`` (emit
-      ``scale, shift`` → ``base*scale + shift``); plus ``affine_granularity``
-      (``dense`` | ``channel``) and ``gate_kind`` for the head backbones.
+      ``scale, shift`` → ``base*scale + shift``, per-channel only); plus
+      ``gate_kind`` for the head backbones.
 
     `unet` reuses ``DynamicCrafterOutputAdapter``; `transformer`/`mlp` use
     ``OutputHeadAdapter``. (The old ``architecture: output_v2`` key still routes
@@ -197,7 +198,23 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
     """
     backbone = str(adapter.extra.get("backbone", "unet")).lower()
     output_format = str(adapter.extra.get("output_format", "direct"))
-    affine_granularity = str(adapter.extra.get("affine_granularity", "dense"))
+
+    # Affine is channel-wise only (a dense per-element scale/shift map subsumes
+    # the direct delta and collapses the format distinction — see format.py).
+    # Reject a leftover affine_granularity so stale configs fail loud rather than
+    # silently behaving as channel.
+    requested_granularity = adapter.extra.get("affine_granularity")
+    if (
+        normalize_output_format(output_format) == "affine"
+        and requested_granularity is not None
+        and normalize_granularity(str(requested_granularity)) != "channel"
+    ):
+        raise ValueError(
+            "output_format='affine' is channel-wise only; affine_granularity="
+            f"{requested_granularity!r} is no longer supported (a dense per-element "
+            "scale/shift map subsumes the direct delta). Remove affine_granularity "
+            "or set it to 'channel'."
+        )
 
     if backbone in {"unet", "dynamicrafter"}:
         unet_config_path = adapter.extra.get("unet_config_path")
@@ -220,7 +237,6 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
             step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
             step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             output_format=output_format,
-            affine_granularity=affine_granularity,
         )
 
     # The head operates in latent space, so the channel count must be the true
@@ -245,7 +261,6 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
         hidden_dim=adapter.hidden_dim,
         backbone=backbone,
         output_format=output_format,
-        affine_granularity=affine_granularity,
         gate_kind=str(adapter.extra.get("gate_kind", "none")),
         condition_on_base_outputs=bool(adapter.extra.get("condition_on_base_outputs", True)),
         patch_size=int(adapter.extra.get("patch_size", 2)),
