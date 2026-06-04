@@ -3,6 +3,7 @@ from generative_flow_adapters.data.batch_preprocessor import (
     CaptionEncoder,
     DynamiCrafterBatchPreprocessor,
 )
+from generative_flow_adapters.data.builders import build_metaworld_clip_dataset
 from generative_flow_adapters.data.dataset import TranslatedClipDataset
 from generative_flow_adapters.data.latent_encoder import (
     SD_VAE_DDCONFIG,
@@ -29,6 +30,7 @@ __all__ = [
     "TranslatedClipDataset",
     "Translator",
     "VideoAutoencoderKL",
+    "build_metaworld_clip_dataset",
     "encode_with_openclip",
     "precompute_null_text_embedding",
 ]

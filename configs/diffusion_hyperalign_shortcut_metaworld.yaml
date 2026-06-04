@@ -10,6 +10,18 @@ name: diffusion_hyperalign_shortcut_metaworld
 # ``step_level`` so the adapter knows which multi-step horizon it is being
 # trained for.
 
+data:
+  # Dataset shape lives here (config-driven, not CLI). `frame_stride` subsamples
+  # every k-th frame for a longer temporal window — 16 *contiguous* frames are
+  # only ~5% of a 300-frame MetaWorld episode, too short for visible action
+  # effect; dropped delta-actions are SUM-aggregated. `fs_value` is the constant
+  # fed to the frozen base's fps channel, decoupled from the stride. See
+  # thesis-vault decided/metaworld-frame-stride-load-time.
+  frame_stride: 4
+  fs_value: 1
+  # env: reach-v3       # str or list of env names; omit = all environments
+  # camera: corner2     # str or list of cameras (camera-split layout); omit = all cameras
+
 model:
   type: diffusion
   provider: dynamicrafter

@@ -7,10 +7,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from generative_flow_adapters.config import DataConfig, load_config
 from generative_flow_adapters.data import (
     EpisodeRef,
     MetaWorldTranslator,
     TranslatedClipDataset,
+    build_metaworld_clip_dataset,
 )
 
 h5py = pytest.importorskip("h5py")
@@ -86,6 +88,106 @@ def fake_metaworld_hdf5(tmp_path: Path) -> Path:
     return path
 
 
+CAM_ENVS = ("reach-v3", "push-v3")
+CAMERAS = ("corner2", "topview")
+CAM_EPISODE_LEN = 8
+
+
+@pytest.fixture
+def fake_camera_hdf5(tmp_path: Path) -> Path:
+    """Camera-split layout: <env>/<camera>/episode_N/{pixels,depth} +
+    <env>/sensors/episode_N/{action,proprio,...}."""
+    path = tmp_path / "cam.hdf5"
+    with h5py.File(path, "w") as f:
+        for env_name in CAM_ENVS:
+            env = f.create_group(env_name)
+            env.attrs["task_name"] = env_name
+            env.attrs["camera_names"] = list(CAMERAS)
+            env.attrs["frame_stride"] = 2
+            env.attrs["frame_aggregation"] = "sum"
+            for cam_i, camera in enumerate(CAMERAS):
+                cam = env.create_group(camera)
+                for ep in ("episode_0", "episode_1"):
+                    g = cam.create_group(ep)
+                    pixels = np.zeros((CAM_EPISODE_LEN, H, W, 3), dtype=np.uint8)
+                    pixels[:, :, :, 0] = cam_i  # channel 0 encodes the camera index
+                    for t in range(CAM_EPISODE_LEN):
+                        pixels[t, :, :, 1] = t   # channel 1 encodes the frame index
+                    g.create_dataset("pixels", data=pixels)
+                    g.create_dataset("depth", data=np.full((CAM_EPISODE_LEN, H, W), cam_i, dtype=np.float32))
+            sensors = env.create_group("sensors")
+            for ep in ("episode_0", "episode_1"):
+                g = sensors.create_group(ep)
+                g.create_dataset(
+                    "action",
+                    data=np.arange(CAM_EPISODE_LEN * ACTION_DIM, dtype=np.float32).reshape(CAM_EPISODE_LEN, ACTION_DIM),
+                )
+                g.create_dataset(
+                    "proprio",
+                    data=np.arange(CAM_EPISODE_LEN * PROPRIO_DIM, dtype=np.float32).reshape(CAM_EPISODE_LEN, PROPRIO_DIM),
+                )
+                g.attrs["policy_type"] = "noisy_expert"
+                g.attrs["task_name"] = env_name
+    return path
+
+
+def test_camera_layout_indexes_env_camera_episode(fake_camera_hdf5: Path) -> None:
+    translator = MetaWorldTranslator(fake_camera_hdf5)
+    eps = translator.list_episodes()
+    # 2 envs * 2 cameras * 2 episodes
+    assert len(eps) == 8
+    assert all(len(ep.identifier) == 3 for ep in eps)
+    assert {ep.identifier[1] for ep in eps} == set(CAMERAS)
+
+
+def test_camera_layout_joins_view_and_sensors(fake_camera_hdf5: Path) -> None:
+    translator = MetaWorldTranslator(fake_camera_hdf5)
+    ref = next(ep for ep in translator.list_episodes() if ep.identifier == ("reach-v3", "topview", "episode_0"))
+    clip = translator.load_clip(ref, start=0, length=4, stride=1)
+    assert clip["camera"] == "topview"
+    assert clip["video"].shape == (4, H, W, 3)
+    assert clip["video"][:, 0, 0, 0].tolist() == [1, 1, 1, 1]   # camera index (topview=1)
+    assert clip["video"][:, 0, 0, 1].tolist() == [0, 1, 2, 3]   # frame index
+    assert clip["depth"].shape == (4, H, W)                      # depth from the camera group
+    assert torch.all(clip["depth"] == 1.0)
+    assert clip["act"].shape == (4, ACTION_DIM)                  # action from the sensors group
+    assert clip["proprio"].shape == (4, PROPRIO_DIM)
+    assert clip["fs"] == 1
+    assert clip["policy_type"] == "noisy_expert"
+
+
+def test_camera_selection_filters(fake_camera_hdf5: Path) -> None:
+    translator = MetaWorldTranslator(fake_camera_hdf5, cameras="corner2")
+    eps = translator.list_episodes()
+    assert len(eps) == 4  # 2 envs * 1 camera * 2 episodes
+    assert {ep.identifier[1] for ep in eps} == {"corner2"}
+
+
+def test_env_selection_filters(fake_camera_hdf5: Path) -> None:
+    translator = MetaWorldTranslator(fake_camera_hdf5, envs=["reach-v3"])
+    eps = translator.list_episodes()
+    assert len(eps) == 4  # 1 env * 2 cameras * 2 episodes
+    assert {ep.identifier[0] for ep in eps} == {"reach-v3"}
+
+
+def test_camera_layout_action_summation(fake_camera_hdf5: Path) -> None:
+    translator = MetaWorldTranslator(fake_camera_hdf5)
+    ref = next(ep for ep in translator.list_episodes() if ep.identifier == ("reach-v3", "corner2", "episode_0"))
+    raw = translator.load_clip(ref, start=0, length=8, stride=1)["act"]
+    strided = translator.load_clip(ref, start=0, length=4, stride=2)["act"]
+    for i in range(4):
+        assert torch.allclose(strided[i], raw[2 * i] + raw[2 * i + 1])
+
+
+def test_build_from_config_selects_env_and_camera(fake_camera_hdf5: Path) -> None:
+    data = DataConfig(hdf5=str(fake_camera_hdf5), env="reach-v3", camera="corner2", frame_stride=1)
+    translator, dataset = build_metaworld_clip_dataset(data, default_window_width=4)
+    eps = translator.list_episodes()
+    assert {ep.identifier[0] for ep in eps} == {"reach-v3"}
+    assert {ep.identifier[1] for ep in eps} == {"corner2"}
+    assert dataset[0]["camera"] == "corner2"
+
+
 def test_translator_indexes_all_episodes(fake_metaworld_hdf5: Path) -> None:
     translator = MetaWorldTranslator(fake_metaworld_hdf5)
     episodes = translator.list_episodes()
@@ -146,6 +248,56 @@ def test_load_clip_with_stride(fake_metaworld_hdf5: Path) -> None:
     clip = translator.load_clip(ref, start=0, length=4, stride=2)
     assert clip["video"][:, 0, 0, 1].tolist() == [0, 2, 4, 6]
     assert clip["frame_stride"] == 2
+
+
+def test_load_clip_sums_actions_under_stride(fake_metaworld_hdf5: Path) -> None:
+    # Actions are per-step deltas: a strided clip's kept action must be the SUM
+    # of the `stride` raw actions in its window (net control over the window).
+    translator = MetaWorldTranslator(fake_metaworld_hdf5)
+    ref = next(ep for ep in translator.list_episodes() if ep.identifier == ("assembly-v3", "episode_0"))
+    raw = translator.load_clip(ref, start=0, length=8, stride=1)["act"]   # rows 0..7
+    strided = translator.load_clip(ref, start=0, length=4, stride=2)["act"]
+    assert strided.shape == (4, ACTION_DIM)
+    for i in range(4):
+        assert torch.allclose(strided[i], raw[2 * i] + raw[2 * i + 1])
+
+
+def test_fs_is_decoupled_from_slice_stride(fake_metaworld_hdf5: Path) -> None:
+    # The fps-channel value fed to the base is a fixed constant, independent of
+    # the actual subsample stride recorded in `frame_stride`.
+    translator = MetaWorldTranslator(fake_metaworld_hdf5)  # fs_value defaults to 1
+    ref = next(ep for ep in translator.list_episodes() if ep.identifier == ("assembly-v3", "episode_0"))
+    clip = translator.load_clip(ref, start=0, length=4, stride=2)
+    assert clip["fs"] == 1
+    assert clip["frame_stride"] == 2  # provenance: the real slice stride
+
+    custom = MetaWorldTranslator(fake_metaworld_hdf5, fs_value=7)
+    clip2 = custom.load_clip(ref, start=0, length=4, stride=2)
+    assert clip2["fs"] == 7
+
+
+def test_load_clip_stride_bound_accounts_for_action_window(fake_metaworld_hdf5: Path) -> None:
+    # Episode assembly-v3/episode_0 has length 12. length=4, stride=3 needs
+    # length*stride = 12 raw frames for the action windows, so start=1 overruns.
+    translator = MetaWorldTranslator(fake_metaworld_hdf5)
+    ref = next(ep for ep in translator.list_episodes() if ep.identifier == ("assembly-v3", "episode_0"))
+    translator.load_clip(ref, start=0, length=4, stride=3)  # 0 + 12 == 12, OK
+    with pytest.raises(IndexError):
+        translator.load_clip(ref, start=1, length=4, stride=3)  # 1 + 12 > 12
+
+
+def test_extract_fs_prefers_explicit_fs_key() -> None:
+    from generative_flow_adapters.data.batch_preprocessor import DynamiCrafterBatchPreprocessor
+
+    # _extract_fs uses no instance state, so a bare object stands in for self.
+    extract = DynamiCrafterBatchPreprocessor._extract_fs
+    dev = torch.device("cpu")
+    # explicit fs wins over frame_stride/fps
+    fs = extract(object(), batch={"fs": 1, "frame_stride": 4, "fps": 5}, batch_size=2, device=dev)
+    assert fs.tolist() == [1, 1]
+    # fallback to frame_stride when fs absent (legacy datasets)
+    fs2 = extract(object(), batch={"frame_stride": 3, "fps": 5}, batch_size=2, device=dev)
+    assert fs2.tolist() == [3, 3]
 
 
 def test_load_clip_rejects_out_of_range(fake_metaworld_hdf5: Path) -> None:
@@ -260,6 +412,52 @@ def test_dataset_index_bounds(fake_metaworld_hdf5: Path) -> None:
     dataset = TranslatedClipDataset(translator, window_width=4, sampling="exhaustive")
     with pytest.raises(IndexError):
         _ = dataset[len(dataset)]
+
+
+def test_build_from_config_uses_data_fields(fake_metaworld_hdf5: Path) -> None:
+    # frame_stride / fs_value / sampling come from the DataConfig (the YAML
+    # `data:` block), not from CLI flags.
+    data = DataConfig(hdf5=str(fake_metaworld_hdf5), frame_stride=2, fs_value=1, sampling="exhaustive")
+    translator, dataset = build_metaworld_clip_dataset(data, default_window_width=4)
+    assert dataset.frame_stride == 2
+    assert dataset.sampling == "exhaustive"
+    assert dataset.window_width == 4  # fell back to default_window_width (data.window_width unset)
+    assert translator.fs_value == 1
+    sample = dataset[0]
+    assert sample["fs"] == 1            # constant fed to the base
+    assert sample["frame_stride"] == 2  # real slice stride (provenance)
+
+
+def test_build_from_config_overrides_win_when_provided(fake_metaworld_hdf5: Path) -> None:
+    data = DataConfig(hdf5=str(fake_metaworld_hdf5), frame_stride=2, window_width=3)
+    _, dataset = build_metaworld_clip_dataset(
+        data, default_window_width=8, frame_stride=1, sampling="exhaustive"
+    )
+    assert dataset.frame_stride == 1        # CLI-style override wins over config's 2
+    assert dataset.sampling == "exhaustive"
+    assert dataset.window_width == 3        # data.window_width wins over default_window_width
+
+
+def test_build_requires_hdf5() -> None:
+    with pytest.raises(ValueError):
+        build_metaworld_clip_dataset(DataConfig(), default_window_width=4)
+
+
+def test_config_parses_data_section(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "exp.yaml"
+    cfg_path.write_text(
+        "name: t\n"
+        "model:\n  type: diffusion\n"
+        "adapter:\n  type: output\n"
+        "data:\n  frame_stride: 8\n  fs_value: 1\n  hdf5: ds/x.hdf5\n"
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.data.frame_stride == 8
+    assert cfg.data.fs_value == 1
+    assert cfg.data.hdf5 == "ds/x.hdf5"
+    # default when the section is absent
+    cfg_path.write_text("name: t\nmodel:\n  type: diffusion\nadapter:\n  type: output\n")
+    assert load_config(cfg_path).data.frame_stride == 1
 
 
 def test_episode_ref_dataclass() -> None:

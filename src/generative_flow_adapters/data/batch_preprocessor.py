@@ -254,7 +254,10 @@ class DynamiCrafterBatchPreprocessor:
         return encoded.to(device=self.device, dtype=self.dtype)
 
     def _extract_fs(self, *, batch: Mapping[str, Any], batch_size: int, device: torch.device) -> Tensor | None:
-        fs = batch.get("frame_stride", batch.get("fps"))
+        # Prefer the explicit `fs` key (the constant the translator feeds to the
+        # base's fps channel, decoupled from the real slice stride). Fall back to
+        # `frame_stride`/`fps` for datasets/translators that don't emit `fs`.
+        fs = batch.get("fs", batch.get("frame_stride", batch.get("fps")))
         if fs is None:
             return None
         if isinstance(fs, Tensor):

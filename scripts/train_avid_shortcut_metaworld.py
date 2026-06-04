@@ -41,6 +41,7 @@ from generative_flow_adapters.data import (
     SD_VAE_DDCONFIG,
     TranslatedClipDataset,
     VideoAutoencoderKL,
+    build_metaworld_clip_dataset,
     precompute_null_text_embedding,
 )
 from generative_flow_adapters.data.clip import (
@@ -64,8 +65,18 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
-    parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--sampling", choices=["random", "exhaustive"], default=None,
+                        help="Override data.sampling from the config when set.")
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=None,
+        help=(
+            "Override data.frame_stride from the config when set. The frame stride "
+            "subsamples every k-th frame (longer window + action-SUM); prefer setting "
+            "it in the config's `data:` block."
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=1)
@@ -317,10 +328,10 @@ def main() -> None:
         image_resampler=image_resampler,
     )
 
-    translator = MetaWorldTranslator(args.hdf5, caption_mode="empty")
-    dataset = TranslatedClipDataset(
-        translator,
-        window_width=temporal_length,
+    translator, dataset = build_metaworld_clip_dataset(
+        config.data,
+        default_window_width=temporal_length,
+        hdf5=args.hdf5,
         frame_stride=args.frame_stride,
         sampling=args.sampling,
     )
@@ -345,7 +356,7 @@ def main() -> None:
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=(args.sampling == "exhaustive"),
+        shuffle=(dataset.sampling == "exhaustive"),
         num_workers=args.num_workers,
         drop_last=True,
     )
@@ -368,7 +379,8 @@ def main() -> None:
     print(f"adapter={config.adapter.type}/{config.adapter.extra.get('architecture')}")
     print(f"composition={config.adapter.composition}")
     print(f"vae={vae_status} params={vae_params:,}")
-    print(f"dataset_size={len(dataset)} (sampling={args.sampling}, window={temporal_length})")
+    print(f"dataset_size={len(dataset)} (sampling={dataset.sampling}, window={dataset.window_width}, "
+          f"frame_stride={dataset.frame_stride}, fs={translator.fs_value})")
     print(f"params trainable={trainable:,} total={total:,} ({100.0 * trainable / max(total, 1):.2f}% trainable)")
     print(
         f"shortcut: weight={config.training.shortcut_direction_weight} "

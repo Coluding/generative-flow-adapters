@@ -1,18 +1,21 @@
-name: diffusion_avid_shortcut_metaworld
+name: diffusion_avid_shortcut_affine_metaworld
 
-# AVID-style output adapter on DynamiCrafter, trained with shortcut
-# supervision on the MetaWorld HDF5 dataset.
+# AVID-style output adapter on DynamiCrafter with shortcut supervision —
+# AFFINE-CHANNEL output format variant of `diffusion_avid_shortcut_metaworld.yaml`.
 #
-# The frozen DynamiCrafter UNet provides the base velocity prediction. The
-# adapter is a small action-conditioned UNet (AVID 11M) that produces a
-# delta + a per-pixel gate ("avid_mask_mix" composition):
+# Same frozen base and same action-conditioned UNet (AVID 11M) trained with the
+# same shortcut schedule. The ONE difference is the output parameterisation:
+# instead of emitting a full prediction blended by a per-pixel gate
+# (`avid_mask_mix`), the adapter emits a per-channel AFFINE modulation of the
+# base velocity — the UNet produces 2C channels split into (scale, shift),
+# pooled to one value per channel, and the returned delta is base*scale + shift
+# (composed as base*(1+scale)+shift under `add`).
 #
-#     prediction = base * sigmoid(gate) + adapted * (1 - sigmoid(gate))
-#
-# The trainer samples a random ``step_level`` per batch, injects it into the
-# cond mapping, and supervises the *adapted* output toward
-# ``base(x_t, t, cond) * step_level``. The adapter's own step-level branch
-# consumes the same value so it learns which multi-step horizon is active.
+# Why `add`, not a mask: affine returns a delta (output_kind="delta"), which the
+# mask/gate path cannot consume — the DynamiCrafter output adapter raises on
+# affine+output_mask. So this arm composes additively. Affine is channel-wise
+# only by design (a dense per-element map would subsume the direct delta); see
+# thesis-vault tech/affine-output-granularity and decided/output-format-affine-vs-direct.
 
 data:
   frame_stride: 4
@@ -40,17 +43,24 @@ model:
 adapter:
   type: output
   hidden_dim: 512
-  composition: avid_mask_mix
-  gate_bias: 0.0
+  # Affine returns a delta, so it composes additively (base + base*scale+shift).
+  # mask_mix is unavailable for the affine format (it needs a full prediction).
+  composition: add
   extra:
     architecture: dynamicrafter
     unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    # The ablated axis vs `diffusion_avid_shortcut_metaworld.yaml`: affine
+    # (per-channel scale+shift) instead of a masked full prediction.
+    output_format: affine
+    output_mask: false
     condition_on_base_outputs: true
-    output_mask: true
     strict_checkpoint: false
+    # Step-level conditioning on the adapter side; trainer must use the same key.
     use_step_level_conditioning: true
     step_level_key: step_level
     step_level_hidden_dim: 64
+    # log2 feeds log2(s) into the Linear(1,·) embed so a dyadic step schedule
+    # spans a well-conditioned range (~[-7,0]). Use "linear" to feed s directly.
     step_level_transform: log2
     allow_dummy_concat_condition: true
 
@@ -76,18 +86,12 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0
   shortcut_target_method: distillation
-  inference_every_n_steps: 2000
+  inference_every_n_steps: 3000
   inference_num_steps: 50
-  # Run artifacts: metrics.jsonl + checkpoints/ are written under output_dir
-  # (CLI --output-dir overrides; defaults to outputs/<name> in the script).
-  output_dir: outputs/diffusion_avid_shortcut_metaworld
+  output_dir: outputs/diffusion_avid_shortcut_affine_metaworld
   log_metrics_jsonl: true
-  # Periodic checkpointing of the trainable adapter/encoder weights + optimizer.
   checkpoint_every_n_steps: 2000
   keep_last_checkpoints: 3
-  # Eval cycle: every N steps, average the loss over `eval_num_batches` held-out
-  # batches and save best.pt when `eval_metric` improves. base_loss (the honest
-  # denoising loss) drives selection rather than the self-distilled total.
   eval_every_n_steps: 2000
   eval_num_batches: 8
   eval_metric: base_loss
@@ -111,4 +115,4 @@ training:
       enable: true
       num_samples: 1
       fps: 2
-      wandb_project: avid-shortcut-metaworld
+      wandb_project: avid-shortcut-affine-metaworld
