@@ -116,6 +116,15 @@ class HeunSmoothnessTrainerTest(unittest.TestCase):
         moved = sum(float((a - b0).abs().sum()) for a, b0 in zip(after, before))
         self.assertGreater(moved, 0.0, "Heun term did not propagate gradients to the adapter")
 
+    def test_two_step_method_is_rejected(self):
+        # The deprecated 'two_step' shortcut mode was removed; selecting it must
+        # now fail loudly rather than silently doing something.
+        trainer, config = _build_trainer(heun_weight=0.0)
+        trainer.config.shortcut_direction_weight = 1.0  # force a shortcut target
+        trainer.config.shortcut_target_method = "two_step"
+        with self.assertRaises(ValueError):
+            trainer.training_step(_batches(config, n=1)[0])
+
     def test_unit_jump_fallback_runs_without_schedule(self):
         # No `shortcut_step_schedule` configured ⇒ _compute_heun_smoothness must
         # fall back to a unit timestep jump and still produce a finite loss.

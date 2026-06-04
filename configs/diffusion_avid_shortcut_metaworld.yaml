@@ -22,7 +22,7 @@ model:
   pass_cond_to_base: true
   extra:
     unet_config_path: configs/base/dynamicrafter512.yaml
-    strict_checkpoint: false
+    strict_checkpoint: true
     latent_channels: 4
     latent_height: 16
     latent_width: 16
@@ -68,12 +68,6 @@ conditioning:
     - key: act
       input_dim: 4
       encoder: mlp
-    # step_level is intentionally NOT in the structured-condition list.
-    # The trainer injects a per-batch (B,) tensor under cond["step_level"];
-    # mixing it with per-frame ``act`` (B,T,A) in the StructuredConditionEncoder
-    # would crash on rank mismatch. The DynamicCrafter output adapter's
-    # ``use_step_level_conditioning`` branch consumes cond["step_level"]
-    # directly via its step_level_embed (Linear(1, ...)).
 
 training:
   loss: diffusion
@@ -81,12 +75,22 @@ training:
   diffusion_timesteps: 1000
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0
-  # See docs/comments in diffusion_hyperalign_shortcut_metaworld.yaml.
-  #   two_step      - Base-anchored Heun (one proper DDIM micro-step under base).
-  #   distillation  - Paper-faithful self-consistency with anchor split.
   shortcut_target_method: distillation
-  inference_every_n_steps: 5000
-  inference_num_steps: 25
+  inference_every_n_steps: 3000
+  inference_num_steps: 50
+  # Run artifacts: metrics.jsonl + checkpoints/ are written under output_dir
+  # (CLI --output-dir overrides; defaults to outputs/<name> in the script).
+  output_dir: outputs/diffusion_avid_shortcut_metaworld
+  log_metrics_jsonl: true
+  # Periodic checkpointing of the trainable adapter/encoder weights + optimizer.
+  checkpoint_every_n_steps: 2000
+  keep_last_checkpoints: 3
+  # Eval cycle: every N steps, average the loss over `eval_num_batches` held-out
+  # batches and save best.pt when `eval_metric` improves. base_loss (the honest
+  # denoising loss) drives selection rather than the self-distilled total.
+  eval_every_n_steps: 2000
+  eval_num_batches: 8
+  eval_metric: base_loss
   extra:
     amp_dtype: bf16
     shortcut_step_level_key: step_level
@@ -107,6 +111,7 @@ training:
       - { num_steps: 1,  step_level: 1.0 }
       - { num_steps: 2,  step_level: 0.5 }
       - { num_steps: 4,  step_level: 0.25 }
+      - { num_steps: 8,  step_level: 0.125 }
       - { num_steps: 25, step_level: 0.04 }
     shortcut_step_schedule:
       units: normalized
@@ -114,11 +119,8 @@ training:
       min: 1/128   # finest — grounded by the standard loss
       max: 1       # one-step
       base: 2
-    # Eval grid is derived from shortcut_step_schedule above (levels →
-    # 1/2/4/.../128 steps). Override here with an explicit eval_step_schedule
-    # (list of {num_steps, step_level}) only to probe levels outside training.
     video_logging:
       enable: true
       num_samples: 1
-      fps: 4
+      fps: 2
       wandb_project: avid-shortcut-metaworld

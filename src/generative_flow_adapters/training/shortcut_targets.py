@@ -5,18 +5,19 @@ to build self-supervised targets for shortcut adapters. All dependencies
 (schedule tables, models) are passed in explicitly so these helpers stay
 testable without spinning up a trainer.
 
-Two target families live here:
-
-- :func:`compute_two_step_target_v` — base-anchored Heun-corrected 2-step
-  target for v-prediction. One proper DDIM micro-step under the frozen base,
-  velocities averaged. No collapse risk; ``step_level`` on the adapter is
-  decorative.
+One target family lives here:
 
 - :func:`compute_self_consistency_target_v` — paper-faithful self-consistency
   target (Frans et al. 2024, eq. 4). Two no-grad calls of the *adapted* model
   at the half step, chained across one ``d``-sized DDIM micro-step. The
   adapter is its own teacher; the frozen base contributes only implicitly via
   the composition inside the model.
+
+The former ``compute_two_step_target_v`` (base-anchored Heun 2-step target)
+was removed when the ``two_step`` shortcut mode was deprecated — see
+thesis-vault decided/deprecate-twostep-shortcut-mode. Its Heun construction
+now lives on as an orthogonal regularizer (``heun_smoothness_weight``), built
+directly from :func:`ddim_micro_step_v` in the trainer.
 
 :func:`ddim_micro_step_v` is the underlying single-step DDIM update for
 v-prediction; it matches
@@ -28,27 +29,6 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
-
-
-def compute_two_step_target_v(
-    *,
-    base_model: nn.Module,
-    x_t: Tensor,
-    t: Tensor,
-    cond: object | None,
-    alphas_cumprod: Tensor,
-    scale_arr: Tensor | None,
-) -> Tensor:
-    """Base-anchored Heun-corrected 2-step target for v-prediction."""
-    with torch.no_grad():
-        v0 = base_model(x_t, t, cond=cond)
-        prev_t = (t - 1).clamp_min(0)
-        x_mid = ddim_micro_step_v(
-            x=x_t, v=v0, t=t, prev_t=prev_t,
-            alphas_cumprod=alphas_cumprod, scale_arr=scale_arr,
-        )
-        v1 = base_model(x_mid, prev_t, cond=cond)
-    return ((v0 + v1) / 2.0).detach()
 
 
 def compute_self_consistency_target_v(

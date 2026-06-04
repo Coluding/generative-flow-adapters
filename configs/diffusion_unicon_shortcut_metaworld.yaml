@@ -78,10 +78,10 @@ training:
   diffusion_timesteps: 1000
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0
-  # Shortcut target method. Supported values:
-  #   two_step      - Base-anchored Heun: target = (v0 + v1)/2 from one proper
-  #                   DDIM micro-step under the FROZEN BASE. No collapse risk;
-  #                   step_level is decorative on the adapter for this method.
+  # Shortcut target method. Only 'distillation' is supported; the former
+  # 'two_step' (base-anchored Heun) mode was removed — see thesis-vault
+  # deprecate-twostep-shortcut-mode. Its Heun construction survives as the
+  # orthogonal `heun_smoothness_weight` regularizer.
   #   distillation  - Paper-faithful self-consistency (Frans et al. 2024).
   #                   With prob `shortcut_anchor_prob` run anchor mode
   #                   (step_level=1, standard diffusion loss); otherwise

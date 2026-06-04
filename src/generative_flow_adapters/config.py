@@ -69,7 +69,7 @@ class TrainingConfig:
     # shortcut training (works on any diffusion run); default 0 keeps behaviour
     # unchanged. See thesis-vault theory/heun-smoothness-regularizer.md.
     heun_smoothness_weight: float = 0.0
-    shortcut_target_method: str = "linear"  # "linear" or "two_step"
+    shortcut_target_method: str = "distillation"  # only "distillation" (two_step removed)
     grad_clip_norm: float | None = None
     diffusion_timesteps: int = 1000
     diffusion_beta_schedule: str = "linear"
@@ -80,6 +80,28 @@ class TrainingConfig:
     inference_every_n_steps: int | None = None
     inference_num_steps: int = 50
     inference_scheduler: str = "ddim"
+    # --- run outputs: JSONL metrics, periodic checkpoints, periodic eval -----
+    # Root directory for this run's artifacts. When set, metrics.jsonl and a
+    # checkpoints/ subdirectory are written here. None disables file outputs
+    # (wandb-only / smoke runs) so existing scripts are unaffected.
+    output_dir: str | None = None
+    # Append every step's scalar metrics (and each eval) to output_dir/metrics.jsonl.
+    log_metrics_jsonl: bool = True
+    # Save a step-tagged checkpoint every N global steps (None/0 disables).
+    checkpoint_every_n_steps: int | None = None
+    # Keep only the most recent K step-tagged checkpoints (None keeps all; the
+    # best.pt / final.pt checkpoints are never rotated away).
+    keep_last_checkpoints: int | None = None
+    # Run an eval cycle every N steps (None/0 disables). Each cycle averages the
+    # loss over `eval_num_batches` held-out batches and, when it improves on the
+    # best `eval_metric` so far, writes a best.pt checkpoint.
+    eval_every_n_steps: int | None = None
+    eval_num_batches: int = 8
+    # Which eval loss component drives best-checkpoint selection. Defaults to the
+    # standard denoising loss ("base_loss") rather than the total — self-distilled
+    # shortcut/consistency terms can collapse to ~0 without the model improving,
+    # so the honest denoising loss is the safer selection signal.
+    eval_metric: str = "base_loss"
     extra: dict[str, Any] = field(default_factory=dict)
 
 
