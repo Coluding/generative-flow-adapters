@@ -50,7 +50,13 @@ class TranslatedClipDataset(Dataset):
         self.frame_stride = frame_stride
         self.sampling = sampling
 
-        span = (window_width - 1) * frame_stride + 1
+        # Episodes must hold the action-aggregation window, not just the pixel
+        # span: actions are summed over `frame_stride` raw steps per kept frame,
+        # which needs `window_width * frame_stride` raw frames (one window past
+        # the last kept frame). This is >= the pixel span `(W-1)*stride+1` and
+        # equals `window_width` when frame_stride == 1, so it is a no-op for the
+        # contiguous case. See MetaWorldTranslator.load_clip / _read_summed_actions.
+        span = window_width * frame_stride
         self._span = span
         self._episodes: list[EpisodeRef] = [
             ep for ep in translator.list_episodes() if ep.length >= span

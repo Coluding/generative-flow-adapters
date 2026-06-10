@@ -15,7 +15,7 @@ from generative_flow_adapters.losses.flow_matching import FlowMatchingTrainingOb
 from generative_flow_adapters.losses.registry import LossRegistry
 from generative_flow_adapters.training.shortcut_targets import (
     compute_self_consistency_target_v,
-    compute_two_step_target_v,
+    ddim_micro_step_v,
 )
 from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
 
@@ -28,12 +28,18 @@ class Trainer:
         loss_fn,
         config: TrainingConfig,
         wandb_logger: object | None = None,
+        jsonl_logger: object | None = None,
+        checkpoint_manager: object | None = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.config = config
         self.wandb_logger = wandb_logger
+        self.jsonl_logger = jsonl_logger
+        self.checkpoint_manager = checkpoint_manager
+        # Best eval metric seen so far (lower is better); drives best.pt saves.
+        self.best_eval_metric = float("inf")
         self.global_step = 0
         self._amp_dtype = self._resolve_amp_dtype(config.extra.get("amp_dtype"))
         diffusion_schedule = getattr(model, "diffusion_schedule_config", None) or {}
@@ -115,8 +121,18 @@ class Trainer:
         device_type = next(self.model.parameters()).device.type
         return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
 
-    def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
-        self.model.train()
+    def _forward_and_loss(
+        self, batch: Mapping[str, Tensor | object]
+    ) -> tuple[Tensor, dict[str, float], Tensor, Tensor, object, Tensor, dict]:
+        """Run the model forward and compute the total loss + per-term components.
+
+        Shared by :meth:`training_step` (which backprops the returned loss) and
+        :meth:`evaluate` (which calls it under ``eval()``/``no_grad``). The model
+        train/eval mode is the caller's responsibility — this method does not set
+        it. Returns ``(loss, loss_components, x_t, t, cond, prediction, batch)``
+        where ``loss_components`` holds detached scalar terms and ``batch`` is a
+        copy with any synthesized shortcut targets attached.
+        """
         model_type = getattr(self.model, "model_type", None)
         prediction_type = getattr(self.model, "prediction_type", None)
 
@@ -225,6 +241,23 @@ class Trainer:
             loss_components["multistep_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.multistep_consistency_weight * consistency
 
+        # Heun-smoothness regularizer (opt-in, orthogonal to shortcut training):
+        # penalize the velocity field's material derivative along its own
+        # predicted one-step trajectory. Adds one extra adapter forward (v0,
+        # with grad) plus one no-grad reference forward (v1). See thesis-vault
+        # theory/heun-smoothness-regularizer.md.
+        if self.config.heun_smoothness_weight > 0.0:
+            heun_loss = self._compute_heun_smoothness(x_t=x_t, t=t, cond=cond)
+            loss_components["heun_smoothness_loss"] = float(heun_loss.detach().cpu())
+            loss = loss + self.config.heun_smoothness_weight * heun_loss
+
+        return loss, loss_components, x_t, t, cond, prediction, batch
+
+    def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
+        self.model.train()
+        loss, loss_components, _x_t, _t, _cond, _prediction, batch = self._forward_and_loss(batch)
+        model_type = getattr(self.model, "model_type", None)
+
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if self.config.grad_clip_norm is not None:
@@ -246,6 +279,48 @@ class Trainer:
             self.wandb_logger.log_metrics(metrics, step=self.global_step)
         return metrics
 
+    @torch.no_grad()
+    def evaluate(
+        self,
+        loader: Iterable,
+        *,
+        max_batches: int | None = None,
+        preprocessor: Callable[..., Mapping[str, object]] | None = None,
+    ) -> dict[str, float]:
+        """Average the training loss (and every component) over held-out batches.
+
+        Runs the exact forward + loss path as training — denoising loss plus any
+        configured consistency / Heun terms — with the model in ``eval()`` and
+        grads disabled, so the numbers are directly comparable to the ``train``
+        metrics. ``global_step`` and parameters are untouched. Returns a dict of
+        mean components, each prefixed ``eval_`` (e.g. ``eval_base_loss``,
+        ``eval_loss``); empty if the loader yielded nothing.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        totals: dict[str, float] = {}
+        count = 0
+        try:
+            for raw_batch in loader:
+                if max_batches is not None and count >= max_batches:
+                    break
+                batch = (
+                    _call_preprocessor(preprocessor, raw_batch, train=False)
+                    if preprocessor is not None
+                    else raw_batch
+                )
+                loss, loss_components, *_ = self._forward_and_loss(batch)
+                loss_components["loss"] = float(loss.detach().cpu())
+                for key, value in loss_components.items():
+                    totals[key] = totals.get(key, 0.0) + value
+                count += 1
+        finally:
+            self.model.train(was_training)
+
+        if count == 0:
+            return {}
+        return {f"eval_{key}": value / count for key, value in totals.items()}
+
     def train(
         self,
         loader: Iterable,
@@ -254,6 +329,7 @@ class Trainer:
         preprocessor: Callable[..., Mapping[str, object]] | None = None,
         log_every: int = 1,
         on_step: Callable[[int, dict[str, object]], None] | None = None,
+        eval_loader: Iterable | None = None,
     ) -> dict[str, float]:
         """Run the standard outer training loop for ``max_steps`` global steps.
 
@@ -275,6 +351,16 @@ class Trainer:
             on_step: optional callback invoked after each step with
                 ``(global_step, metrics)`` — useful for custom logging or
                 early-stopping logic without subclassing the trainer.
+            eval_loader: optional iterable of held-out batches. When given and
+                ``config.eval_every_n_steps`` is set, an eval cycle runs at that
+                cadence (averaging over ``config.eval_num_batches`` batches) and
+                a ``best.pt`` checkpoint is saved whenever ``config.eval_metric``
+                improves. A final eval also runs at the end of training.
+
+        Side effects driven by ``config`` (all opt-in, no-ops when unset):
+            * ``jsonl_logger`` — every step's metrics and each eval are appended.
+            * ``checkpoint_manager`` — a step-tagged checkpoint every
+              ``config.checkpoint_every_n_steps`` plus ``best.pt`` / ``final.pt``.
 
         Returns:
             A dict with ``final_avg_loss``, ``elapsed_seconds``, ``steps``,
@@ -299,6 +385,8 @@ class Trainer:
                 loss_value = float(metrics["loss"])
                 running_loss += loss_value
                 running_count += 1
+                if self.jsonl_logger is not None:
+                    self.jsonl_logger.log(metrics, step=self.global_step, split="train")
                 if on_step is not None:
                     on_step(self.global_step, dict(metrics))
                 if log_every > 0 and self.global_step % log_every == 0:
@@ -308,9 +396,26 @@ class Trainer:
                         f"loss={loss_value:.5f} avg_loss={running_loss / running_count:.5f} "
                         f"steps/s={self.global_step / max(elapsed, 1e-6):.2f}"
                     )
+                if eval_loader is not None and self._cadence_due(self.config.eval_every_n_steps):
+                    self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
+                if self._cadence_due(self.config.checkpoint_every_n_steps):
+                    self._save_checkpoint(log=log_every > 0)
 
         elapsed = time.time() - start
         avg_loss = running_loss / max(running_count, 1)
+        # Final eval + checkpoint so a run always ends with up-to-date artifacts,
+        # regardless of where the last cadence boundary fell. Skip the final eval
+        # if the last step already landed on the eval cadence (no double-compute).
+        if (
+            eval_loader is not None
+            and self.config.eval_every_n_steps
+            and not self._cadence_due(self.config.eval_every_n_steps)
+        ):
+            self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
+        if self.checkpoint_manager is not None:
+            self._save_checkpoint(tag="final", log=log_every > 0)
+        if self.jsonl_logger is not None:
+            self.jsonl_logger.close()
         if log_every > 0:
             print(f"done. final_avg_loss={avg_loss:.5f} elapsed={elapsed:.1f}s")
         return {
@@ -319,6 +424,89 @@ class Trainer:
             "steps": float(self.global_step),
             "epochs": float(epoch),
         }
+
+    def _cadence_due(self, every_n: int | None) -> bool:
+        """True when ``global_step`` lands on a positive ``every_n`` boundary."""
+        return bool(every_n) and every_n > 0 and self.global_step % every_n == 0
+
+    def _run_eval_cycle(
+        self,
+        eval_loader: Iterable,
+        *,
+        preprocessor: Callable[..., Mapping[str, object]] | None,
+        log: bool,
+    ) -> dict[str, float]:
+        """Evaluate, log to wandb/jsonl, and save ``best.pt`` on improvement."""
+        eval_metrics = self.evaluate(
+            eval_loader,
+            max_batches=self.config.eval_num_batches,
+            preprocessor=preprocessor,
+        )
+        if not eval_metrics:
+            return {}
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_metrics(eval_metrics, step=self.global_step)
+        if self.jsonl_logger is not None:
+            self.jsonl_logger.log(eval_metrics, step=self.global_step, split="eval")
+
+        metric_key = f"eval_{self.config.eval_metric}"
+        value = eval_metrics.get(metric_key)
+        if log:
+            summary = " ".join(f"{k}={v:.5f}" for k, v in sorted(eval_metrics.items()))
+            print(f"  eval step={self.global_step} {summary}")
+        if value is not None and value < self.best_eval_metric and self.checkpoint_manager is not None:
+            self.best_eval_metric = value
+            path = self._save_checkpoint(
+                tag="best",
+                extra={"best_metric": metric_key, "best_value": value, "eval_metrics": eval_metrics},
+                log=False,
+            )
+            if log:
+                print(f"  new best {metric_key}={value:.5f} -> {path}")
+        return eval_metrics
+
+    def _save_checkpoint(
+        self,
+        *,
+        tag: str | None = None,
+        extra: dict[str, object] | None = None,
+        log: bool = False,
+    ) -> object | None:
+        if self.checkpoint_manager is None:
+            return None
+        payload_extra = {"best_eval_metric": self.best_eval_metric}
+        if extra:
+            payload_extra.update(extra)
+        path = self.checkpoint_manager.save(
+            model=self.model,
+            optimizer=self.optimizer,
+            global_step=self.global_step,
+            extra=payload_extra,
+            tag=tag,
+        )
+        if log and tag != "best":
+            print(f"  saved checkpoint -> {path}")
+        return path
+
+    def save_checkpoint(
+        self, *, tag: str | None = None, extra: dict[str, object] | None = None
+    ) -> object | None:
+        """Public manual checkpoint save (raises if no checkpoint_manager)."""
+        if self.checkpoint_manager is None:
+            raise RuntimeError("Trainer has no checkpoint_manager; cannot save a checkpoint.")
+        return self._save_checkpoint(tag=tag, extra=extra, log=True)
+
+    def load_checkpoint(self, path: str) -> dict[str, object]:
+        """Restore trainable weights + optimizer state and resume bookkeeping
+        (``global_step`` and ``best_eval_metric``) from a saved checkpoint."""
+        from generative_flow_adapters.training.checkpoint import CheckpointManager
+
+        payload = CheckpointManager.load(path, self.model, self.optimizer)
+        self.global_step = int(payload.get("global_step", self.global_step))
+        extra = payload.get("extra") or {}
+        if "best_eval_metric" in extra:
+            self.best_eval_metric = float(extra["best_eval_metric"])
+        return payload
 
     def _needs_shortcut_target(self) -> bool:
         return (
@@ -337,11 +525,10 @@ class Trainer:
     ) -> tuple[object | None, Tensor | None]:
         """Resolve step_level + shortcut target at the same (x_t, t) the adapter will see.
 
-        Two supported methods (see ``training.shortcut_target_method``):
-
-        - ``two_step``: target = ``(base(x_t,t) + base(x_mid, t-1))/2`` where
-          ``x_mid`` is one proper DDIM micro-step under the base. Anchored on
-          the frozen base; no collapse risk. ``step_level`` is decorative.
+        Single supported method (see ``training.shortcut_target_method``); the
+        ``two_step`` mode was removed — see thesis-vault
+        decided/deprecate-twostep-shortcut-mode. The Heun construction it used
+        survives as an orthogonal regularizer (``heun_smoothness_weight``).
 
         - ``distillation``: paper-faithful self-consistency (Frans et al. 2024,
           eq. 4). At each training step, with probability ``shortcut_anchor_prob``
@@ -372,21 +559,6 @@ class Trainer:
                 "Either pre-attach `batch['shortcut_target']` or wrap your "
                 "adapter in AdaptedModel."
             )
-
-        if method == "two_step":
-            new_cond, _ = self._resolve_step_level(
-                cond=cond,
-                step_level_key=step_level_key,
-                batch_size=batch_size,
-                device=device,
-                dtype=dtype,
-            )
-            alphas, scale_arr = self._diffusion_tables(device=device, dtype=dtype)
-            target = compute_two_step_target_v(
-                base_model=base_model, x_t=x_t, t=t, cond=new_cond,
-                alphas_cumprod=alphas, scale_arr=scale_arr,
-            )
-            return new_cond, target
 
         if method == "distillation":
             anchor_prob = float(self.config.extra.get("shortcut_anchor_prob", 0.75))
@@ -447,40 +619,9 @@ class Trainer:
 
         raise ValueError(
             f"Unknown shortcut_target_method={self.config.shortcut_target_method!r}; "
-            "expected 'two_step' or 'distillation'."
+            "expected 'distillation'. (The 'two_step' mode was removed — see "
+            "thesis-vault decided/deprecate-twostep-shortcut-mode.)"
         )
-
-    def _resolve_step_level(
-        self,
-        *,
-        cond: object | None,
-        step_level_key: str,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[object | None, Tensor]:
-        """Pluck step_level from ``cond`` or sample a new one. Used by
-        ``two_step`` mode where ``step_level`` is decorative on the adapter
-        but the user may still want to vary it via the YAML config."""
-        if isinstance(cond, Mapping):
-            existing = cond.get(step_level_key)
-            if isinstance(existing, Tensor):
-                return cond, existing.to(device=device, dtype=dtype)
-
-        max_step = int(self.config.extra.get("shortcut_step_level_max", 1))
-        min_step = int(self.config.extra.get("shortcut_step_level_min", 1))
-        max_step = max(max_step, 1)
-        min_step = max(min(min_step, max_step), 1)
-        if max_step == min_step:
-            step_level = torch.full(
-                (batch_size,), float(min_step), device=device, dtype=dtype
-            )
-        else:
-            step_level = torch.randint(
-                low=min_step, high=max_step + 1, size=(batch_size,), device=device
-            ).to(dtype=dtype)
-
-        return self._inject_step_level(cond, step_level_key, step_level), step_level
 
     def _inject_step_level(
         self,
@@ -516,6 +657,63 @@ class Trainer:
             log2_max += 1
         j = int(torch.randint(0, log2_max + 1, (1,)).item())
         return 1 << j
+
+    def _compute_heun_smoothness(
+        self,
+        *,
+        x_t: Tensor,
+        t: Tensor,
+        cond: object | None,
+    ) -> Tensor:
+        """Heun-derived velocity-field smoothness regularizer ``L_heun_smooth``.
+
+        Approximates the material derivative of the composed velocity field by a
+        finite difference along one DDIM micro-step and penalizes its magnitude:
+        ``||v0 - sg(v1)||^2`` where ``v0`` has grad and ``v1`` (the model's
+        velocity at the predicted endpoint) is a detached "future-self"
+        reference. See thesis-vault theory/heun-smoothness-regularizer.md eq.(S).
+
+        Orthogonal to shortcut training. The step size only sets the *interval*
+        over which smoothness is enforced — drawn from ``shortcut_step_schedule``
+        if configured, else a unit timestep jump. ``step_level`` is deliberately
+        **not** injected: the regularizer sees the same ``cond`` the model sees
+        during standard training.
+        """
+        model_type = getattr(self.model, "model_type", None)
+        if model_type != "diffusion":
+            raise NotImplementedError(
+                "heun_smoothness_weight is implemented for diffusion "
+                "(v-prediction) backbones only; flow-matching support is deferred. "
+                "See thesis-vault refactor-shortcut-deprecate-twostep-add-heun-"
+                "smoothness (patch 1.5)."
+            )
+
+        if self.step_schedule is not None:
+            jump = self.step_schedule.to_timestep_jump(self.step_schedule.sample())
+        else:
+            jump = 1
+        jump = max(int(jump), 1)
+
+        with self._autocast():
+            v0 = self.model(x_t, t, cond)
+        v0 = v0.float()
+
+        alphas, scale_arr = self._diffusion_tables(device=x_t.device, dtype=v0.dtype)
+        prev_t = (t - jump).clamp_min(0)
+        x_prev = ddim_micro_step_v(
+            x=x_t.float(), v=v0, t=t, prev_t=prev_t,
+            alphas_cumprod=alphas, scale_arr=scale_arr,
+        )
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad(), self._autocast():
+                v1 = self.model(x_prev, prev_t, cond)
+        finally:
+            self.model.train(was_training)
+
+        return LossRegistry.get_consistency_loss("heun_smoothness")(v0, v1.float())
 
     def _diffusion_tables(
         self,
@@ -689,18 +887,24 @@ class Trainer:
         return adapted_by_steps[-1][1] if adapted_by_steps else None
 
 
-def _call_preprocessor(preprocessor: Callable[..., Mapping[str, object]], raw_batch: object) -> Mapping[str, object]:
-    """Call ``preprocessor(batch, train=True)`` when its signature accepts
+def _call_preprocessor(
+    preprocessor: Callable[..., Mapping[str, object]],
+    raw_batch: object,
+    train: bool = True,
+) -> Mapping[str, object]:
+    """Call ``preprocessor(batch, train=train)`` when its signature accepts
     ``train``, otherwise ``preprocessor(batch)``. Lets the trainer accept
     both :class:`DynamiCrafterBatchPreprocessor` (expects the kwarg) and
     plain user lambdas. Signature is inspected instead of catching TypeError
-    so real bugs inside the preprocessor aren't silently swallowed."""
+    so real bugs inside the preprocessor aren't silently swallowed. ``train``
+    is forwarded so eval batches disable train-only augmentation (e.g. CFG
+    condition dropout)."""
     try:
         params = inspect.signature(preprocessor).parameters
     except (TypeError, ValueError):
         params = {}
     if "train" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return preprocessor(raw_batch, train=True)
+        return preprocessor(raw_batch, train=train)
     return preprocessor(raw_batch)
 
 

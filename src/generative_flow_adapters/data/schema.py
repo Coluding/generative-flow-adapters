@@ -28,8 +28,15 @@ Optional MetaWorld sensor channels (present when stored by the collector):
 Provenance:
 
 - ``env_name``      str
+- ``camera``        str   (camera-split layout only; absent for the flat layout)
 - ``episode_idx``   int
 - ``policy_type``   str
+
+The MetaWorld source comes in two HDF5 layouts (auto-detected by
+``MetaWorldTranslator``): a flat ``<env>/episode_N/{pixels,action,...}`` layout,
+and a camera-split layout ``<env>/<camera>/episode_N/{pixels,depth}`` +
+``<env>/sensors/episode_N/{action,proprio,...}`` joined by episode index. In the
+camera layout ``depth`` is per-camera; the other sensor channels are stored once.
 
 No image normalization, latent encoding, or rearrange happens in the dataset.
 Downstream code is responsible for any such processing.
@@ -51,6 +58,9 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     "episode_idx",
     "policy_type",
 )
+
+# Present only for the camera-split layout (which camera angle the clip is from).
+OPTIONAL_PROVENANCE_KEYS: tuple[str, ...] = ("camera",)
 
 METAWORLD_OPTIONAL_KEYS: tuple[str, ...] = (
     "proprio",

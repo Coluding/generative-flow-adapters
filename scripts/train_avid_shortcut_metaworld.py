@@ -41,6 +41,7 @@ from generative_flow_adapters.data import (
     SD_VAE_DDCONFIG,
     TranslatedClipDataset,
     VideoAutoencoderKL,
+    build_metaworld_clip_dataset,
     precompute_null_text_embedding,
 )
 from generative_flow_adapters.data.clip import (
@@ -60,12 +61,22 @@ def trainable_parameter_count(model: torch.nn.Module) -> tuple[int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/diffusion_avid_shortcut_metaworld.yaml")
-    parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5")
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
-    parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--hdf5", default="ds/metaworld_corner2_large.hdf5")
+    parser.add_argument("--steps", type=int, default=100_000)
+    parser.add_argument("--batch-size", type=int, default=6)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--sampling", choices=["random", "exhaustive"], default=None,
+                        help="Override data.sampling from the config when set.")
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=None,
+        help=(
+            "Override data.frame_stride from the config when set. The frame stride "
+            "subsamples every k-th frame (longer window + action-SUM); prefer setting "
+            "it in the config's `data:` block."
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=1)
@@ -127,6 +138,49 @@ def main() -> None:
         default=None,
         help="Override training.extra.shortcut_step_level_min.",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Directory for run artifacts (metrics.jsonl + checkpoints/). Defaults "
+            "to training.output_dir from the YAML, else outputs/<config.name>."
+        ),
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help="Run an eval cycle (held-out loss + best.pt) every N steps. Overrides config.",
+    )
+    parser.add_argument(
+        "--eval-batches",
+        type=int,
+        default=None,
+        help="Number of held-out batches averaged per eval cycle. Overrides config.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help="Save a step-tagged checkpoint every N steps. Overrides config.",
+    )
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=None,
+        help="Keep only the most recent K step checkpoints (best/final are kept). Overrides config.",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.05,
+        help="Fraction of the dataset held out for eval (random split). 0 disables eval.",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a checkpoint (.pt) to resume trainable weights + optimizer + global_step from.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -156,6 +210,19 @@ def main() -> None:
             "Set a positive weight in the YAML if you intended to train with shortcut supervision."
         )
 
+    # Run-output overrides (CLI wins over YAML). output_dir defaults to
+    # outputs/<config.name> so a plain run still gets metrics.jsonl + checkpoints.
+    config.training.output_dir = args.output_dir or config.training.output_dir or f"outputs/{config.name}"
+    if args.eval_every is not None:
+        config.training.eval_every_n_steps = args.eval_every
+    if args.eval_batches is not None:
+        config.training.eval_num_batches = args.eval_batches
+    if args.checkpoint_every is not None:
+        config.training.checkpoint_every_n_steps = args.checkpoint_every
+    if args.keep_last_checkpoints is not None:
+        config.training.keep_last_checkpoints = args.keep_last_checkpoints
+    want_eval = bool(config.training.eval_every_n_steps) and args.val_fraction > 0.0
+
     temporal_length = int(config.model.extra.get("temporal_length", 8))
     context_tokens = int(config.conditioning.extra.get("context_tokens", 77))
     context_dim = int(config.conditioning.extra.get("context_dim", 512))
@@ -168,7 +235,13 @@ def main() -> None:
         experiment.loss_fn,
         config.training,
         experiment.wandb_logger,
+        jsonl_logger=experiment.jsonl_logger,
+        checkpoint_manager=experiment.checkpoint_manager,
     )
+    if args.resume is not None:
+        payload = trainer.load_checkpoint(args.resume)
+        print(f"resumed from {args.resume} at global_step={trainer.global_step} "
+              f"(best_eval_metric={trainer.best_eval_metric:.5f})")
 
     vae = VideoAutoencoderKL(ddconfig=dict(SD_VAE_DDCONFIG), embed_dim=4).to(device)
     vae_status = "random-init"
@@ -255,20 +328,47 @@ def main() -> None:
         image_resampler=image_resampler,
     )
 
-    translator = MetaWorldTranslator(args.hdf5, caption_mode="empty")
-    dataset = TranslatedClipDataset(
-        translator,
-        window_width=temporal_length,
+    translator, dataset = build_metaworld_clip_dataset(
+        config.data,
+        default_window_width=temporal_length,
+        hdf5=args.hdf5,
         frame_stride=args.frame_stride,
         sampling=args.sampling,
     )
+
+    # Hold out a fraction for the periodic eval cycle. Random window-level split
+    # with a fixed generator — note that adjacent windows from the same episode
+    # can land on opposite sides, so this is in-distribution validation, not a
+    # leak-free held-out test split. See thesis-vault feature note.
+    eval_dataset = None
+    train_dataset = dataset
+    if want_eval:
+        val_len = max(args.batch_size, int(len(dataset) * args.val_fraction))
+        val_len = min(val_len, len(dataset) - args.batch_size)
+        if val_len >= args.batch_size:
+            generator = torch.Generator().manual_seed(args.seed)
+            train_dataset, eval_dataset = torch.utils.data.random_split(
+                dataset, [len(dataset) - val_len, val_len], generator=generator
+            )
+        else:
+            print("  warning: dataset too small for the requested val split; eval disabled.")
+
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
-        shuffle=(args.sampling == "exhaustive"),
+        shuffle=(dataset.sampling == "exhaustive"),
         num_workers=args.num_workers,
         drop_last=True,
     )
+    eval_loader = None
+    if eval_dataset is not None:
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=True,
+        )
 
     trainable, total = trainable_parameter_count(model)
     vae_params = sum(parameter.numel() for parameter in vae.parameters())
@@ -279,7 +379,8 @@ def main() -> None:
     print(f"adapter={config.adapter.type}/{config.adapter.extra.get('architecture')}")
     print(f"composition={config.adapter.composition}")
     print(f"vae={vae_status} params={vae_params:,}")
-    print(f"dataset_size={len(dataset)} (sampling={args.sampling}, window={temporal_length})")
+    print(f"dataset_size={len(dataset)} (sampling={dataset.sampling}, window={dataset.window_width}, "
+          f"frame_stride={dataset.frame_stride}, fs={translator.fs_value})")
     print(f"params trainable={trainable:,} total={total:,} ({100.0 * trainable / max(total, 1):.2f}% trainable)")
     print(
         f"shortcut: weight={config.training.shortcut_direction_weight} "
@@ -287,12 +388,26 @@ def main() -> None:
         f"step_level~U[{step_min}, {step_max}]"
     )
     print(f"steps={args.steps} batch_size={args.batch_size}")
+    print(f"output_dir={config.training.output_dir}")
+    if eval_loader is not None:
+        print(
+            f"eval: every={config.training.eval_every_n_steps} "
+            f"batches={config.training.eval_num_batches} metric={config.training.eval_metric} "
+            f"val_size={len(eval_dataset)}"
+        )
+    else:
+        print("eval: disabled")
+    print(
+        f"checkpoints: every={config.training.checkpoint_every_n_steps} "
+        f"keep_last={config.training.keep_last_checkpoints}"
+    )
 
     trainer.train(
         loader=loader,
         max_steps=args.steps,
         preprocessor=preprocessor,
         log_every=args.log_every,
+        eval_loader=eval_loader,
     )
 
 

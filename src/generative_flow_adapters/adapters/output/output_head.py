@@ -23,7 +23,6 @@ from torch import Tensor, nn
 from generative_flow_adapters.adapters.common import resolve_condition_embedding
 from generative_flow_adapters.adapters.output.format import (
     build_output_result,
-    normalize_affine_granularity,
     normalize_output_format,
     output_channel_multiplier,
     prepare_gate,
@@ -44,7 +43,6 @@ class OutputHeadAdapter(OutputAdapterInterface):
         hidden_dim: int,
         backbone: str = "mlp",
         output_format: str = "affine",
-        affine_granularity: str = "dense",
         gate_kind: str = "none",
         condition_on_base_outputs: bool = True,
         patch_size: int = 2,
@@ -59,7 +57,6 @@ class OutputHeadAdapter(OutputAdapterInterface):
         self.hidden_dim = int(hidden_dim)
         self.backbone_kind = str(backbone).strip().lower()
         self.output_format = normalize_output_format(output_format)
-        self.affine_granularity = normalize_affine_granularity(affine_granularity)
         self.gate_kind = str(gate_kind).strip().lower()
         if self.gate_kind not in _GATE_KINDS:
             raise ValueError(f"Unsupported gate_kind: {gate_kind!r} (expected one of {sorted(_GATE_KINDS)}).")
@@ -116,7 +113,6 @@ class OutputHeadAdapter(OutputAdapterInterface):
             raw,
             reference,
             output_format=self.output_format,
-            affine_granularity=self.affine_granularity,
             gate=gate,
         )
 

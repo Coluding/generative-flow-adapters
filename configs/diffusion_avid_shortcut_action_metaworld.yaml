@@ -1,18 +1,34 @@
-name: diffusion_avid_shortcut_metaworld
+name: diffusion_avid_shortcut_action_metaworld
 
-# AVID-style output adapter on DynamiCrafter, trained with shortcut
-# supervision on the MetaWorld HDF5 dataset.
+# Combined run: AVID output adapter on DynamiCrafter, trained with BOTH
+#   (a) shortcut self-consistency supervision (shortcut_anchor_prob = 0.5), and
+#   (b) action conditioning on a_t.
 #
-# The frozen DynamiCrafter UNet provides the base velocity prediction. The
-# adapter is a small action-conditioned UNet (AVID 11M) that produces a
-# delta + a per-pixel gate ("avid_mask_mix" composition):
+# This is the natural next step after the two local sanity checks:
+#   - diffusion_avid_shortcut_metaworld.yaml      (anchor_prob = 1.0, baseline)
+#   - the earlier anchor_prob = 0.5 shortcut run  (step-level only, dynamics random)
+# Goal here: keep the few-step robustness from the shortcut loss while making the
+# predicted dynamics actually respond to the action, rather than wandering.
 #
-#     prediction = base * sigmoid(gate) + adapted * (1 - sigmoid(gate))
+# Action path (grounded, not assumed):
+#   - The AVID adapter UNet (act_cond_diffusion_11M.yaml) is natively
+#     action_conditioned: True, action_dropout_prob: 0.0.
+#   - `conditioning.conditions[act]` below builds a_t from the batch and
+#     dynamicrafter.py passes it straight into that UNet's action head.
+#   - The adapter therefore conditions on BOTH step_level and a_t.
 #
-# The trainer samples a random ``step_level`` per batch, injects it into the
-# cond mapping, and supervises the *adapted* output toward
-# ``base(x_t, t, cond) * step_level``. The adapter's own step-level branch
-# consumes the same value so it learns which multi-step horizon is active.
+# This config differs from diffusion_avid_shortcut_metaworld.yaml in exactly:
+#   shortcut_anchor_prob 1.0 -> 0.5, name/output_dir/wandb_project.
+# Everything else is held identical so the two runs are directly comparable.
+#
+# VERIFY BEFORE THE HPC RUN (see thesis-vault ticket
+# exp-conditioning-add-actions-to-shortcut-adapter):
+#   1. The MetaWorld batch actually provides `act` (non-null) at train time, and
+#      eval conditions on the *real* action sequence (not dropped/null), otherwise
+#      "action conditioning" is nominal only.
+#   2. The action a_t is held FIXED across the self-consistency micro-step — both
+#      no-grad half-step calls in compute_self_consistency_target_v must see the
+#      same a_t, or the consistency target is ill-defined.
 
 data:
   frame_stride: 4
@@ -80,21 +96,19 @@ training:
   inference_num_steps: 50
   # Run artifacts: metrics.jsonl + checkpoints/ are written under output_dir
   # (CLI --output-dir overrides; defaults to outputs/<name> in the script).
-  output_dir: outputs/diffusion_avid_shortcut_metaworld
+  output_dir: outputs/diffusion_avid_shortcut_action_metaworld
   log_metrics_jsonl: true
-  # Periodic checkpointing of the trainable adapter/encoder weights + optimizer.
   checkpoint_every_n_steps: 2000
   keep_last_checkpoints: 3
-  # Eval cycle: every N steps, average the loss over `eval_num_batches` held-out
-  # batches and save best.pt when `eval_metric` improves. base_loss (the honest
-  # denoising loss) drives selection rather than the self-distilled total.
   eval_every_n_steps: 2000
   eval_num_batches: 8
   eval_metric: base_loss
   extra:
     amp_dtype: bf16
     shortcut_step_level_key: step_level
-    shortcut_anchor_prob: 1.0
+    # Shortcut ON: 50% anchor (finest step, standard loss) / 50% self-consistency
+    # at coarser step levels. Matches the earlier 0.5 shortcut run.
+    shortcut_anchor_prob: 0.5
     eval_step_schedule:
       - { num_steps: 1,  step_level: 1.0 }
       - { num_steps: 2,  step_level: 0.5 }
@@ -111,4 +125,4 @@ training:
       enable: true
       num_samples: 1
       fps: 2
-      wandb_project: avid-shortcut-metaworld
+      wandb_project: avid-shortcut-action-metaworld

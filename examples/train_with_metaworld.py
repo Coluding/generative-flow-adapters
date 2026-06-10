@@ -25,7 +25,12 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--hdf5", required=True, help="Path to MetaWorld HDF5 file")
     parser.add_argument("--window-width", type=int, default=8)
-    parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=4,
+        help="Subsample every k-th frame for a longer temporal window; delta-actions are SUM-aggregated.",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-batches", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)

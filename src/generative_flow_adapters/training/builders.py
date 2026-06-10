@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -18,6 +19,8 @@ class ExperimentComponents:
     optimizer: torch.optim.Optimizer
     loss_fn: object
     wandb_logger: object | None = None
+    jsonl_logger: object | None = None
+    checkpoint_manager: object | None = None
 
 
 def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
@@ -43,7 +46,46 @@ def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
         weight_decay=config.training.weight_decay,
     )
     wandb_logger = _maybe_build_wandb_logger(config, base_model)
-    return ExperimentComponents(model=model, optimizer=optimizer, loss_fn=loss_fn, wandb_logger=wandb_logger)
+    jsonl_logger, checkpoint_manager = _maybe_build_run_io(config)
+    return ExperimentComponents(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        wandb_logger=wandb_logger,
+        jsonl_logger=jsonl_logger,
+        checkpoint_manager=checkpoint_manager,
+    )
+
+
+def _maybe_build_run_io(config: ExperimentConfig) -> tuple[object | None, object | None]:
+    """Build the JSONL metrics logger and checkpoint manager from config.
+
+    Both are gated on ``training.output_dir``: without it (smoke / wandb-only
+    runs) nothing is written and the trainer's file-output paths stay no-ops.
+    The checkpoint manager is built when any checkpoint or eval cadence is set
+    (eval needs it to persist the best.pt). Artifacts land under
+    ``output_dir/metrics.jsonl`` and ``output_dir/checkpoints/``.
+    """
+    out = config.training.output_dir
+    if not out:
+        return None, None
+    out_path = Path(out)
+
+    jsonl_logger = None
+    if config.training.log_metrics_jsonl:
+        from generative_flow_adapters.training.metrics_logger import JsonlMetricsLogger
+
+        jsonl_logger = JsonlMetricsLogger(out_path / "metrics.jsonl")
+
+    checkpoint_manager = None
+    if config.training.checkpoint_every_n_steps or config.training.eval_every_n_steps:
+        from generative_flow_adapters.training.checkpoint import CheckpointManager
+
+        checkpoint_manager = CheckpointManager(
+            out_path / "checkpoints",
+            keep_last=config.training.keep_last_checkpoints,
+        )
+    return jsonl_logger, checkpoint_manager
 
 
 def _maybe_build_wandb_logger(config: ExperimentConfig, base_model) -> object | None:
