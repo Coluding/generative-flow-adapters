@@ -10,9 +10,93 @@ from __future__ import annotations
 
 import torch
 
+from generative_flow_adapters.multimodal.builders import build_multimodal_experiment
 from generative_flow_adapters.multimodal.codecs import IdentityCodec, ResizeCodec
 from generative_flow_adapters.multimodal.config import MultiModalExperimentConfig
+from generative_flow_adapters.multimodal.fusion import LearnedMaskFusion
+from generative_flow_adapters.multimodal.preprocessor import MultiModalBatchPreprocessor
 from generative_flow_adapters.multimodal.spec import OutputModalitySpec
+from generative_flow_adapters.multimodal.trainer import MultiModalTrainer
+
+
+def _dummy_config_dict(fusion="trivial"):
+    return {
+        "name": "mm-substrate",
+        "model": {"type": "diffusion", "provider": "dummy", "feature_dim": 8, "hidden_dim": 32},
+        "adapter": {"type": "output", "extra": {"fusion": fusion}},
+        "conditioning": {"type": "structured", "output_dim": 16,
+                         "conditions": [{"key": "act", "input_dim": 4}]},
+        "training": {"learning_rate": 2e-3, "diffusion_timesteps": 1000},
+        "output_modalities": [
+            {"name": "video", "kind": "vector", "feature_shape": [8], "has_frozen_prior": True,
+             "loss_weight": 1.0, "hidden_dim": 64},
+            {"name": "proprio", "kind": "vector", "feature_shape": [7], "loss_weight": 1.0, "hidden_dim": 64},
+            {"name": "tactile", "kind": "map", "feature_shape": [2, 4, 4], "codec": "resize",
+             "codec_kwargs": {"size": [4, 4]}, "loss_weight": 1.0, "hidden_dim": 64},
+        ],
+    }
+
+
+def _overfit(fusion, steps=800):
+    torch.manual_seed(0)
+    config = MultiModalExperimentConfig.from_dict(_dummy_config_dict(fusion=fusion))
+    components = build_multimodal_experiment(config)
+    pre = MultiModalBatchPreprocessor(config.output_modalities, components.codecs, video_preprocessor=None)
+    trainer = MultiModalTrainer(components.model, components.optimizer, config.base.training, config.output_modalities)
+
+    raw = _dummy_batch(batch_size=2)
+    history: list[dict[str, float]] = []
+    for _ in range(steps):
+        history.append(trainer.training_step(pre(raw)))
+    return components, history
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — substrate model + trainer (TrivialFusion)
+# --------------------------------------------------------------------------- #
+def test_substrate_overfits_every_stream_trivial_fusion():
+    _, history = _overfit("trivial", steps=500)
+    for key in ("loss_video", "loss_proprio", "loss_tactile", "loss"):
+        first = sum(h[key] for h in history[:25]) / 25
+        last = sum(h[key] for h in history[-25:]) / 25
+        assert last < 0.6 * first, f"{key}: {last:.4f} not < 0.6*{first:.4f}"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — compositional learned-mask fusion
+# --------------------------------------------------------------------------- #
+def test_compositional_fusion_learns_and_overfits():
+    components, history = _overfit("compositional", steps=500)
+    fusion = components.model.fusion
+    assert isinstance(fusion, LearnedMaskFusion)
+    # mask has n+2 slots: base + action + (proprio, tactile) video-adjustments
+    assert fusion.logits.numel() == 4
+    assert fusion.logits.grad is not None  # mask received gradient
+    weights = fusion.mask_weights()
+    assert abs(float(weights.sum()) - 1.0) < 1e-5
+    for key in ("loss_video", "loss_proprio", "loss_tactile"):
+        first = sum(h[key] for h in history[:25]) / 25
+        last = sum(h[key] for h in history[-25:]) / 25
+        assert last < 0.7 * first, f"{key}: {last:.4f} not < 0.7*{first:.4f}"
+
+
+def _dummy_modalities():
+    """Video-as-vector substrate spec for the dummy base (feature_dim=8)."""
+    return [
+        OutputModalitySpec(name="video", kind="vector", feature_shape=[8], has_frozen_prior=True, loss_weight=1.0),
+        OutputModalitySpec(name="proprio", kind="vector", feature_shape=[7], loss_weight=0.5),
+        OutputModalitySpec(name="tactile", kind="map", feature_shape=[2, 8, 8], codec="resize",
+                           codec_kwargs={"size": [8, 8]}, loss_weight=0.2),
+    ]
+
+
+def _dummy_batch(batch_size=4):
+    return {
+        "video": torch.randn(batch_size, 8),
+        "proprio": torch.randn(batch_size, 7),
+        "tactile": torch.randn(batch_size, 2, 8, 8),
+        "act": torch.randn(batch_size, 4),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -71,3 +155,24 @@ def test_multimodal_config_from_dict_partitions_streams():
     assert config.video_modality.name == "video"
     assert [m.name for m in config.adapter_modalities] == ["proprio", "tactile"]
     assert config.base.model.provider == "dummy"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 — preprocessor (dummy path, no DynamiCrafter)
+# --------------------------------------------------------------------------- #
+def test_preprocessor_builds_target_and_cond_dicts():
+    specs = _dummy_modalities()
+    codecs = {
+        "video": IdentityCodec(),
+        "proprio": IdentityCodec(),
+        "tactile": ResizeCodec(size=(8, 8)),
+    }
+    pre = MultiModalBatchPreprocessor(specs, codecs, video_preprocessor=None, condition_keys=("act",))
+    out = pre(_dummy_batch(batch_size=4), train=True)
+
+    assert set(out["targets"]) == {"video", "proprio", "tactile"}
+    assert out["targets"]["video"].shape == (4, 8)
+    assert out["targets"]["proprio"].shape == (4, 7)
+    assert out["targets"]["tactile"].shape == (4, 2, 8, 8)
+    assert "act" in out["cond"]
+    assert out["cond"]["act"].shape == (4, 4)
