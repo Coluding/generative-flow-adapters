@@ -64,7 +64,7 @@ conditioning:
   type: action
   input_dim: 7
   output_dim: 128
-  drop_condition_prob: 0.1
+  drop_condition_prob: 0.0
 
 training:
   loss: flow_matching

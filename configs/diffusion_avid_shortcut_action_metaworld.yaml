@@ -73,7 +73,7 @@ adapter:
 conditioning:
   type: structured
   output_dim: 512
-  drop_condition_prob: 0.05
+  drop_condition_prob: 0.0
   extra:
     context_tokens: 77
     context_dim: 1024

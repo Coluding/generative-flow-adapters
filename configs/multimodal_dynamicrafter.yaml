@@ -1,0 +1,109 @@
+name: multimodal_dynamicrafter
+
+# Real-backbone smoke config for the MULTIMODAL compositional adapter line.
+#
+# This is a normal DynamiCrafter experiment YAML (model / adapter / conditioning
+# / training, parsed by ExperimentConfig.from_dict) PLUS one extra top-level
+# `output_modalities:` section parsed into OutputModalitySpec by
+# MultiModalExperimentConfig.from_dict.
+#
+# Stream layout (sub-decision 1 — every stream predicts its own target; only the
+# video stream carries the frozen DynamiCrafter prior):
+#   - video   : has_frozen_prior, VAE-latent codec, denoised by the frozen base
+#               + the real DynamiCrafter output adapter (compositional fusion).
+#   - proprio : vector stream, predicted from scratch by a ModalityPredictionHead.
+#   - tactile : map stream, resized into a small target by the ResizeCodec.
+#
+# Run it with examples/multimodal_training_test.py (synthetic clip batch, no
+# dataset / checkpoint required — set allow_missing_checkpoint below). Swap in a
+# real MetaWorld loader + DynamiCrafter checkpoint for an actual training run.
+
+data:
+  frame_stride: 4
+  fs_value: 1
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: configs/base/dynamicrafter512.yaml
+    strict_checkpoint: false
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: true
+    allow_missing_checkpoint: true
+    # Needed so the video VAE codec has a first-stage encoder/decoder to call.
+    load_first_stage_model: true
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    # `fusion: trivial` -> only the real video adapter contributes to the video
+    # stream (standard additive composition). NOTE: `fusion: compositional` is
+    # NOT yet supported on a real backbone — the builder wires the per-modality
+    # video-adjustment heads as ModalityPredictionHead(video_spec.feature_shape),
+    # which assumes the dummy "video-as-vector" substrate and has no notion of
+    # the (B,C,T,H,W) DynamiCrafter latent layout. See thesis-vault.
+    fusion: trivial
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  output_dir: outputs/multimodal_dynamicrafter
+  log_metrics_jsonl: true
+  extra:
+    amp_dtype: bf16
+
+# --- multimodal extension: the coupled output streams -----------------------
+output_modalities:
+  - name: video
+    kind: video
+    has_frozen_prior: true
+    codec: vae
+    loss_weight: 1.0
+    hidden_dim: 512
+  - name: proprio
+    kind: vector
+    feature_shape: [7]
+    codec: identity
+    loss_weight: 0.5
+    hidden_dim: 128
+  - name: tactile
+    kind: map
+    feature_shape: [2, 16, 16]
+    codec: resize
+    codec_kwargs:
+      size: [16, 16]
+    loss_weight: 0.2
+    hidden_dim: 128
