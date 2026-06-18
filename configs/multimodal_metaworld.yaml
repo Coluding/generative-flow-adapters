@@ -1,0 +1,107 @@
+name: multimodal_metaworld
+
+# Multimodal multi-stream world model on the MetaWorld HDF5 dataset.
+#
+# Same frozen DynamiCrafter base + AVID output adapter + structured action
+# conditioning as diffusion_avid_shortcut_metaworld.yaml, but extended with the
+# `output_modalities:` section so the model predicts COUPLED future streams:
+#
+#   - video        : frozen DynamiCrafter prior + output adapter (VAE latent).
+#   - force_torque : 6-DoF end-effector wrench, vector stream (identity codec).
+#   - depth        : per-frame depth map, downsampled to 32x32 (resize codec).
+#
+# These are the streams the corner2 MetaWorld HDF5 actually provides (see
+# data/translators/metaworld.py METAWORLD_OPTIONAL_KEYS). Swap force_torque ->
+# ee_xyz/gripper or drop depth to match a different dump.
+#
+# Run with scripts/train_multimodal_metaworld.py. NOTE: `fusion: compositional`
+# is dummy-base-only for now (the per-modality video-adjustment heads assume the
+# flat video-as-vector substrate), so a real run uses `fusion: trivial` — the
+# standard additive composition through the video adapter.
+
+data:
+  frame_stride: 4
+  fs_value: 1
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: configs/base/dynamicrafter512.yaml
+    strict_checkpoint: true
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: false
+    allow_missing_checkpoint: true
+    load_first_stage_model: true
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    fusion: trivial
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    # No shortcut trainer here -> no step_level is injected, so keep the
+    # adapter's step-level branch off.
+    use_step_level_conditioning: false
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  output_dir: outputs/multimodal_metaworld
+  log_metrics_jsonl: true
+  checkpoint_every_n_steps: 2000
+  keep_last_checkpoints: 3
+  extra:
+    amp_dtype: bf16
+
+output_modalities:
+  - name: video
+    kind: video
+    has_frozen_prior: true
+    codec: vae
+    loss_weight: 1.0
+    hidden_dim: 512
+  - name: force_torque
+    kind: vector
+    feature_shape: [6]
+    codec: identity
+    loss_weight: 0.5
+    hidden_dim: 128
+  - name: depth
+    kind: map
+    feature_shape: [32, 32]
+    codec: resize
+    codec_kwargs:
+      size: [32, 32]
+    loss_weight: 0.2
+    hidden_dim: 128

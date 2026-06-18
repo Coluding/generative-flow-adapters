@@ -135,5 +135,52 @@ class HeunSmoothnessTrainerTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(torch.tensor(metrics["heun_smoothness_loss"])))
 
 
+class ShortcutPerRungLoggingTest(unittest.TestCase):
+    """The aggregate `shortcut_direction_loss` marginalises over the sampled
+    step size, so the trainer also re-logs it under a per-rung key
+    `shortcut_direction_loss/N{steps}` (steps = round(1/s)). Each step feeds
+    exactly one rung, so over several steps the supervised rungs should appear,
+    keyed by their schedule level, while the smallest (anchor-only) level never
+    does."""
+
+    def _build(self):
+        config = load_config(CONFIG_PATH)
+        config.training.heun_smoothness_weight = 0.0
+        config.training.shortcut_direction_weight = 1.0
+        config.training.shortcut_target_method = "distillation"
+        # log2 schedule over {1/8, 1/4, 1/2, 1} ⇒ supervised rungs N ∈ {1, 2, 4}
+        # (the smallest level 1/8 → N=8 is the anchor and is never supervised).
+        config.training.extra["shortcut_step_schedule"] = {
+            "units": "normalized", "mode": "log2", "min": "1/8", "max": 1, "base": 2,
+        }
+        # Force non-anchor every step so a shortcut target is always produced.
+        config.training.extra["shortcut_anchor_prob"] = 0.0
+        experiment = build_experiment(config)
+        trainer = Trainer(experiment.model, experiment.optimizer, experiment.loss_fn, config.training)
+        return trainer, config
+
+    def test_per_rung_keys_appear_and_match_schedule(self):
+        trainer, config = self._build()
+        self.assertIsNotNone(trainer.step_schedule)
+        seen: set[str] = set()
+        for b in _batches(config, n=24):
+            metrics = trainer.training_step(b)
+            seen.update(k for k in metrics if k.startswith("shortcut_direction_loss/N"))
+            # Each step logs at most one rung, and it matches the stashed `s`.
+            rung_keys = [k for k in metrics if k.startswith("shortcut_direction_loss/N")]
+            self.assertLessEqual(len(rung_keys), 1)
+            if rung_keys:
+                self.assertIn("shortcut_direction_loss", metrics)
+                n = max(1, round(1.0 / trainer._last_shortcut_step_level))
+                self.assertEqual(rung_keys[0], f"shortcut_direction_loss/N{n:03d}")
+        # Over many steps every supervised rung should show up; the anchor-only
+        # finest level (N=8) must never be logged as a supervised rung.
+        self.assertTrue(seen, "no per-rung shortcut series were logged")
+        self.assertLessEqual(seen, {"shortcut_direction_loss/N001",
+                                    "shortcut_direction_loss/N002",
+                                    "shortcut_direction_loss/N004"})
+        self.assertNotIn("shortcut_direction_loss/N008", seen)
+
+
 if __name__ == "__main__":
     unittest.main()

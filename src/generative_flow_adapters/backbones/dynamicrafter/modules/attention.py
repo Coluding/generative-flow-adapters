@@ -407,6 +407,7 @@ class TemporalTransformer(nn.Module):
         self.causal_block_size = causal_block_size
 
         self.in_channels = in_channels
+        self.n_heads = n_heads
         inner_dim = n_heads * d_head
         self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         self.proj_in = nn.Conv1d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
@@ -470,8 +471,26 @@ class TemporalTransformer(nn.Module):
 
         if self.only_self_att:
             ## note: if no context is given, cross-attention defaults to self-attention
+            # The batch dimension here is (b·h·w). PyTorch's Flash / mem-efficient
+            # SDPA kernels launch a CUDA grid whose y/z dim is batch·n_heads, which
+            # must stay below the hardware limit of 65,535 — otherwise the launch
+            # fails with cudaErrorInvalidConfiguration (NOT an OOM). For large batch
+            # sizes / spatial resolutions we therefore split the batch into chunks
+            # so chunk·n_heads < 65,535, mirroring the per-batch loop used in the
+            # cross-attention path below. Wall-clock and memory are unaffected: the
+            # batch axis is embarrassingly parallel and Flash is preserved.
+            bhw = x.shape[0]
+            chunk = max(1, 65535 // self.n_heads)
             for i, block in enumerate(self.transformer_blocks):
-                x = block(x, mask=mask)
+                if bhw <= chunk:
+                    x = block(x, mask=mask)
+                else:
+                    outs = []
+                    for s in range(0, bhw, chunk):
+                        e = s + chunk
+                        m = mask[s:e] if mask is not None else None
+                        outs.append(block(x[s:e], mask=m))
+                    x = torch.cat(outs, dim=0)
             x = rearrange(x, "(b hw) t c -> b hw t c", b=b).contiguous()
         else:
             x = rearrange(x, "(b hw) t c -> b hw t c", b=b).contiguous()

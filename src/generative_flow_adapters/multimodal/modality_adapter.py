@@ -81,6 +81,19 @@ class ModalityPredictionHead(nn.Module):
         temb = self.time_mlp(timestep_embedding(t, self.time_embed_dim))  # (B, hidden)
         parts = [x_flat, temb.repeat_interleave(repeat, dim=0) if repeat > 1 else temb]
         if cond_emb is not None and self.cond_dim > 0:
-            parts.append(cond_emb.repeat_interleave(repeat, dim=0) if repeat > 1 else cond_emb)
+            parts.append(self._align_cond(cond_emb, lead, n, repeat))
         out = self.net(torch.cat(parts, dim=-1))
         return out.reshape(*lead, *self.feature_shape)
+
+    def _align_cond(self, cond_emb: Tensor, lead: tuple[int, ...], n: int, repeat: int) -> Tensor:
+        """Flatten the conditioning embedding to ``(n, cond_dim)`` to match ``x_flat``.
+
+        Two shapes occur: per-sample ``(B, cond_dim)`` (the dummy substrate, and
+        action conditioning with no time axis) is broadcast across the leading
+        multiplicity via ``repeat_interleave``; per-frame ``(B, T, cond_dim)``
+        (real per-frame action conditioning, already aligned with a ``(B, T)``
+        stream) is flattened directly. Mixed cases fall back to repeat.
+        """
+        if cond_emb.dim() == len(lead) + 1 and tuple(cond_emb.shape[: len(lead)]) == lead:
+            return cond_emb.reshape(n, self.cond_dim)
+        return cond_emb.repeat_interleave(repeat, dim=0) if repeat > 1 else cond_emb

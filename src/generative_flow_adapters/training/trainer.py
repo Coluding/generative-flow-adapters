@@ -84,6 +84,11 @@ class Trainer:
             if isinstance(raw_schedule, Mapping)
             else None
         )
+        # Normalised step size `s` supervised by the most recent shortcut step
+        # (None on anchor steps / when no shortcut target). Lets `training_step`
+        # bucket the shortcut loss into one per-rung series so the otherwise
+        # `s`-marginalised aggregate curve becomes readable.
+        self._last_shortcut_step_level: float | None = None
         self.flow_objective = FlowMatchingTrainingObjective(
             sigma_min=float(config.extra.get("flow_sigma_min", 1e-5)),
             shift_schedule=bool(config.extra.get("flow_shift_schedule", True)),
@@ -148,7 +153,7 @@ class Trainer:
             else:
                 t = self.diffusion_objective.sample_timesteps(batch_size=batch_size, device=target.device)
             noise = self.diffusion_objective.sample_noise(target)
-            #TODO this is everything very dynamicrafter orientated atm --> for the future we need to adjust it
+            #TODO this is very dynamicrafter orientated atm --> for the future we need to adjust it
             target_scaled = self.diffusion_objective.scale_x_start(target, t)
             x_t = self.diffusion_objective.q_sample(x_start=target_scaled, t=t, noise=noise)
             cond, shortcut_target = self._maybe_prepare_shortcut(
@@ -269,6 +274,15 @@ class Trainer:
         # Components were captured during the forward (pre-backward), so they
         # reflect the loss at the params actually used — no redundant re-forward.
         metrics.update(loss_components)
+        # Per-rung shortcut loss: the aggregate `shortcut_direction_loss` mixes
+        # all sampled step sizes, so its magnitude swings with whichever `s` was
+        # drawn that batch. Re-log it under a per-`s` key (N = round(1/s) steps)
+        # so wandb shows one convergence curve per rung. Sparse by design — each
+        # step contributes to exactly one series.
+        shortcut_s = self._last_shortcut_step_level
+        if shortcut_s is not None and "shortcut_direction_loss" in loss_components:
+            n_steps = max(1, int(round(1.0 / shortcut_s)))
+            metrics[f"shortcut_direction_loss/N{n_steps:03d}"] = loss_components["shortcut_direction_loss"]
         generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
         if generated_samples is not None:
             metrics["generated_samples"] = generated_samples.detach().cpu()
@@ -540,6 +554,8 @@ class Trainer:
           standard loss; see thesis-vault risk-shortcut-self-consistency-collapse
           for why the anchor matters.
         """
+        # Reset per-step; only the supervised schedule path below sets a value.
+        self._last_shortcut_step_level = None
         existing = batch.get("shortcut_target")
         if isinstance(existing, Tensor):
             return cond, existing.to(device=x_t.device, dtype=x_t.dtype)
@@ -580,6 +596,7 @@ class Trainer:
                     )
                     return self._inject_step_level(cond, step_level_key, step_level), None
                 s_full = self.step_schedule.sample(exclude_smallest=True)
+                self._last_shortcut_step_level = float(s_full)
                 s_half = s_full / 2.0
                 jump = self.step_schedule.to_timestep_jump(s_half)
                 step_level_full = torch.full((batch_size,), float(s_full), device=device, dtype=dtype)
