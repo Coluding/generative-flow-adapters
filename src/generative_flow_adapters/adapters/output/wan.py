@@ -1,0 +1,103 @@
+"""Conditioning-agnostic Wan output adapter (the Wan analogue of
+``DynamicCrafterOutputAdapter`` / AVID).
+
+Wraps a small :class:`ActionWanModel` (a structural copy of the Wan DiT at
+11M/34M/150M params) as the trainable delta on the frozen 1.3B base:
+``prediction = base(x_t, t) + Wan21OutputAdapter(x_t, t, cond, step_level)``.
+
+Conditioning is injected through the tiny DiT's AdaLN modulation; its head is
+zero-initialised, so the delta is ~0 at init (identity composition). Like the
+transformer head and the DynamiCrafter adapter, it consumes the **fused
+``embedding``** from the external condition encoder (modality-agnostic — action
+today, + proprio/goal/language later by changing only the encoder). The
+shortcut **step size** keeps its own dedicated path.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import yaml
+from torch import Tensor
+
+from generative_flow_adapters.adapters.common import resolve_condition_embedding
+from generative_flow_adapters.adapters.output.interface import OutputAdapterInterface, OutputAdapterResult
+from generative_flow_adapters.backbones.wan.modules.action_model import ActionWanModel
+
+
+class Wan21OutputAdapter(OutputAdapterInterface):
+    def __init__(
+        self,
+        cond_dim: int,
+        dim: int = 256,
+        num_layers: int = 10,
+        num_heads: int = 4,
+        ffn_dim: int | None = None,
+        in_dim: int = 16,
+        out_dim: int = 16,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+        condition_on_base_outputs: bool = True,
+        use_step_level: bool = True,
+        step_level_key: str = "step_level",
+        step_level_transform: str = "log2",
+    ) -> None:
+        super().__init__()
+        self.step_level_key = step_level_key
+        self.module = ActionWanModel(
+            in_dim=in_dim,
+            out_dim=out_dim,
+            dim=dim,
+            ffn_dim=ffn_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            patch_size=patch_size,
+            cond_dim=cond_dim,
+            use_step_level=use_step_level,
+            step_level_transform=step_level_transform,
+            condition_on_base_outputs=condition_on_base_outputs,
+        )
+
+    @classmethod
+    def from_config(cls, wan_adapter_config_path: str, cond_dim: int, **overrides: Any) -> "Wan21OutputAdapter":
+        params = _load_action_wan_params(wan_adapter_config_path)
+        params.update({k: v for k, v in overrides.items() if v is not None})
+        return cls(cond_dim=cond_dim, **params)
+
+    def forward(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        cond: object | None,
+        base_output: Tensor | None = None,
+    ) -> OutputAdapterResult:
+        # Fused conditioning embedding from the encoder (action/proprio/goal/…);
+        # condition dropout / CFG is applied upstream by the encoder's null path.
+        cond_embedding = resolve_condition_embedding(cond)
+        step_level = cond.get(self.step_level_key) if isinstance(cond, Mapping) else None
+        delta = self.module(
+            x_t,
+            t,
+            cond_embedding=cond_embedding,
+            step_level=step_level if isinstance(step_level, Tensor) else None,
+            base_output=base_output,
+        )
+        return OutputAdapterResult(adapter_output=delta.to(x_t.dtype), output_kind="delta")
+
+
+def _load_action_wan_params(config_path: str) -> dict[str, Any]:
+    path = Path(config_path)
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    model_params = raw.get("model", {}).get("params", {})
+    params = model_params.get("dit_config", {}).get("params")
+    if not isinstance(params, dict):
+        raise ValueError(f"Could not find `model.params.dit_config.params` in {path}")
+    params = dict(params)
+    for key in ("patch_size",):
+        if key in params and isinstance(params[key], list):
+            params[key] = tuple(params[key])
+    # action_dim is supplied by the conditioning config, not the tier file.
+    params.pop("action_dim", None)
+    return params

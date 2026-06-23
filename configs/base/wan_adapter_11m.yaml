@@ -1,0 +1,16 @@
+# Action-conditioned Wan output adapter (~11m) — structural copy of the Wan DiT
+# at reduced width/depth, with AVID-style action + step-level AdaLN conditioning.
+# Consumed by adapters/output/wan.py:Wan21OutputAdapter.from_config.
+model:
+  params:
+    dit_config:
+      params:
+        in_dim: 16
+        out_dim: 16
+        dim: 256
+        num_layers: 10
+        num_heads: 4
+        patch_size: [1, 2, 2]
+        use_step_level: true
+        step_level_transform: log2
+        condition_on_base_outputs: true

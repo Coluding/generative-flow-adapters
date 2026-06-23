@@ -1,0 +1,48 @@
+# Wan2.1 (flow matching) + output adapter — fake-data smoke config.
+#
+# Frozen Wan DiT provides the base velocity; a small backbone-agnostic
+# transformer output head produces an action-conditioned delta over the 5D
+# latent (prediction = base + delta). Uses the tiny CPU Wan config and random
+# weights, so it runs without flash-attn or the real checkpoint:
+#
+#   python examples/training_test.py --config configs/wan_output_adapter.yaml --steps 3
+name: wan_output_adapter
+
+model:
+  type: flow
+  provider: wan2.1
+  prediction_type: velocity
+  freeze: true
+  extra:
+    wan_config_path: configs/base/wan2.1_tiny.yaml
+    allow_missing_checkpoint: true
+    # Fake-data latent geometry (also the wrapper's seq_len grid).
+    latent_channels: 16
+    temporal_length: 4
+    latent_height: 16
+    latent_width: 16
+
+adapter:
+  type: output
+  hidden_dim: 128
+  feature_dim: 16          # latent channel count the delta lives in
+  extra:
+    architecture: output_head
+    backbone: transformer  # DiT-style head over the 5D latent
+    output_format: direct
+    condition_on_base_outputs: true
+    patch_size: 2
+    num_layers: 2
+    num_heads: 4
+
+conditioning:
+  type: action
+  input_dim: 4             # MetaWorld action dimension
+  output_dim: 128
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  grad_clip_norm: 1.0

@@ -216,6 +216,24 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
             "or set it to 'channel'."
         )
 
+    if backbone in {"wan", "wan2.1"}:
+        from generative_flow_adapters.adapters.output.wan import Wan21OutputAdapter
+
+        wan_adapter_config_path = adapter.extra.get("wan_adapter_config_path")
+        if not isinstance(wan_adapter_config_path, str) or not wan_adapter_config_path:
+            raise ValueError("output adapter with backbone='wan' requires adapter.extra.wan_adapter_config_path")
+        # cond_dim is the fused embedding width from the condition encoder.
+        if not cond_dim or cond_dim <= 0:
+            raise ValueError("Wan output adapter needs a positive conditioning.output_dim (the fused embedding width).")
+        return Wan21OutputAdapter.from_config(
+            wan_adapter_config_path=wan_adapter_config_path,
+            cond_dim=cond_dim,
+            condition_on_base_outputs=adapter.extra.get("condition_on_base_outputs"),
+            use_step_level=adapter.extra.get("use_step_level_conditioning"),
+            step_level_key=adapter.extra.get("step_level_key"),
+            step_level_transform=adapter.extra.get("step_level_transform"),
+        )
+
     if backbone in {"unet", "dynamicrafter"}:
         unet_config_path = adapter.extra.get("unet_config_path")
         if not isinstance(unet_config_path, str) or not unet_config_path:
@@ -266,4 +284,8 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
         patch_size=int(adapter.extra.get("patch_size", 2)),
         num_layers=int(adapter.extra.get("num_layers", 4)),
         num_heads=int(adapter.extra.get("num_heads", 8)),
+        use_step_level_conditioning=bool(adapter.extra.get("use_step_level_conditioning", False)),
+        step_level_key=str(adapter.extra.get("step_level_key", "step_level")),
+        step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
+        step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
     )

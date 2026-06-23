@@ -9,12 +9,13 @@ import torch
 from torch import Tensor, nn
 
 from generative_flow_adapters.config import TrainingConfig
-from generative_flow_adapters.inference import DiffusionInferenceSampler
+from generative_flow_adapters.inference import DiffusionInferenceSampler, FlowInferenceSampler
 from generative_flow_adapters.losses.diffusion import DiffusionTrainingObjective
 from generative_flow_adapters.losses.flow_matching import FlowMatchingTrainingObjective
 from generative_flow_adapters.losses.registry import LossRegistry
 from generative_flow_adapters.training.shortcut_targets import (
     compute_self_consistency_target_v,
+    compute_self_consistency_target_v_flow,
     ddim_micro_step_v,
 )
 from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
@@ -54,24 +55,18 @@ class Trainer:
             base_scale=float(diffusion_schedule.get("base_scale", 0.7)),
             turning_step=int(diffusion_schedule.get("turning_step", 400)),
         )
-        self.inference_sampler = DiffusionInferenceSampler(
-            model=self.model,
-            objective=self.diffusion_objective,
-            prediction_type=getattr(model, "prediction_type", "noise"),
-            scheduler_name=config.inference_scheduler,
-        )
+        # Flow-matching models (Wan) need the rectified-flow sampler, not DDIM.
+        self._is_flow = getattr(model, "model_type", None) in ("flow", "flow_matching")
+        # The model is fed t = sigma * flow_timestep_scale (Wan native = 1000).
+        self._flow_timestep_scale = float(config.extra.get("flow_timestep_scale", 1000.0))
+        self.inference_sampler = self._build_inference_sampler(self.model)
         # Second sampler that points at the frozen base model only. Used at
         # eval time to produce a "no-adapter" baseline rollout from the same
         # starting noise as the adapted rollout — makes the visual difference
         # exactly attributable to the adapter rather than to noise drift.
         base_model = getattr(model, "base_model", None)
         if self.wandb_logger is not None and base_model is not None:
-            self.base_inference_sampler = DiffusionInferenceSampler(
-                model=base_model,
-                objective=self.diffusion_objective,
-                prediction_type=getattr(base_model, "prediction_type", "noise"),
-                scheduler_name=config.inference_scheduler,
-            )
+            self.base_inference_sampler = self._build_inference_sampler(base_model)
         else:
             self.base_inference_sampler = None
         # Paper-faithful step-size schedule (normalised s ∈ (0,1]). When set it
@@ -99,6 +94,31 @@ class Trainer:
             temporal_sqrt_scaling=bool(config.extra.get("flow_temporal_sqrt_scaling", True)),
         )
 
+    def _build_inference_sampler(self, model: nn.Module):
+        """Pick the rollout sampler matching the model family.
+
+        Flow-matching models (Wan) denoise with the rectified-flow ODE
+        (``FlowInferenceSampler`` over ``FlowUniPCMultistepScheduler``); the Wan
+        DiT runs under autocast so its fp32 time-embedding reconciles with bf16
+        weights. Everything else keeps the DDIM/DDPM ``DiffusionInferenceSampler``.
+        """
+        if self._is_flow:
+            extra = self.config.extra
+            num_train = int(extra.get("flow_num_train_timesteps", 1000))
+            return FlowInferenceSampler(
+                model=model,
+                num_train_timesteps=num_train,
+                shift=float(extra.get("flow_inference_shift", 3.0)),
+                timestep_scale=self._flow_timestep_scale,
+                amp_dtype=self._amp_dtype,
+            )
+        return DiffusionInferenceSampler(
+            model=model,
+            objective=self.diffusion_objective,
+            prediction_type=getattr(model, "prediction_type", "noise"),
+            scheduler_name=self.config.inference_scheduler,
+        )
+
     @staticmethod
     def _resolve_amp_dtype(value: object | None) -> torch.dtype | None:
         if value is None:
@@ -124,7 +144,7 @@ class Trainer:
         if self._amp_dtype is None:
             return contextlib.nullcontext()
         device_type = next(self.model.parameters()).device.type
-        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
+        return torch.amp.autocast(device_type=device_type, dtype=self._amp_dtype)
 
     def _forward_and_loss(
         self, batch: Mapping[str, Tensor | object]
@@ -575,6 +595,42 @@ class Trainer:
                 "Either pre-attach `batch['shortcut_target']` or wrap your "
                 "adapter in AdaptedModel."
             )
+
+        # Flow-native shortcut self-consistency. The diffusion path below uses a
+        # DDIM micro-step with alphas_cumprod, which is only valid for the
+        # diffusion parameterisation; rectified-flow models use a straight-line
+        # Euler micro-step in normalised t∈[0,1] units instead. Step sizes are
+        # dyadic fractions of the trajectory (d = 2^-k), supervising step_level
+        # 2d against the average of two d-steps.
+        model_type = getattr(self.model, "model_type", None)
+        if method == "distillation" and model_type in ("flow", "flow_matching"):
+            anchor_prob = float(self.config.extra.get("shortcut_anchor_prob", 0.75))
+            do_anchor = (anchor_prob >= 1.0) or (
+                anchor_prob > 0.0 and bool(torch.rand((), device="cpu").item() < anchor_prob)
+            )
+            max_log2 = int(self.config.extra.get("shortcut_max_log2_steps", 3))
+            if do_anchor:
+                d_min = 1.0 / (2 ** max_log2)
+                step_level = torch.full((batch_size,), d_min, device=device, dtype=dtype)
+                return self._inject_step_level(cond, step_level_key, step_level), None
+            k = int(torch.randint(1, max_log2 + 1, (), device="cpu").item())
+            d_half = 1.0 / (2 ** k)
+            d_full = 2.0 * d_half
+            self._last_shortcut_step_level = float(d_full)
+            step_level_full = torch.full((batch_size,), d_full, device=device, dtype=dtype)
+            step_level_half = torch.full((batch_size,), d_half, device=device, dtype=dtype)
+            new_cond = self._inject_step_level(cond, step_level_key, step_level_full)
+            cond_half = self._inject_step_level(cond, step_level_key, step_level_half)
+            d_tensor = torch.full((batch_size,), d_half, device=device, dtype=dtype)
+            # Under autocast: the Wan DiT casts its modulation to fp32 and relies
+            # on autocast to reconcile that with bf16 weights. This prep runs
+            # outside the main forward's autocast block, so wrap it explicitly.
+            with self._autocast():
+                target = compute_self_consistency_target_v_flow(
+                    model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=d_tensor,
+                    timestep_scale=self._flow_timestep_scale,
+                )
+            return new_cond, target
 
         if method == "distillation":
             anchor_prob = float(self.config.extra.get("shortcut_anchor_prob", 0.75))

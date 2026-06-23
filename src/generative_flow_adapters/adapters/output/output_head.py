@@ -16,11 +16,16 @@ identity residual at step 0 (delta ≈ 0 → base output unchanged), matching th
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 import torch
 from torch import Tensor, nn
 
 from generative_flow_adapters.adapters.common import resolve_condition_embedding
+from generative_flow_adapters.conditioning.utils.dynamicrafter_conditioning import (
+    combine_adapter_embeddings,
+    encode_step_level_embedding,
+)
 from generative_flow_adapters.adapters.output.format import (
     build_output_result,
     normalize_output_format,
@@ -48,6 +53,10 @@ class OutputHeadAdapter(OutputAdapterInterface):
         patch_size: int = 2,
         num_layers: int = 4,
         num_heads: int = 8,
+        use_step_level_conditioning: bool = False,
+        step_level_key: str = "step_level",
+        step_level_hidden_dim: int | None = None,
+        step_level_transform: str = "linear",
     ) -> None:
         super().__init__()
         if feature_dim is None or feature_dim <= 0:
@@ -93,6 +102,24 @@ class OutputHeadAdapter(OutputAdapterInterface):
                 f"the 'unet' backbone is served by DynamicCrafterOutputAdapter)."
             )
 
+        # Shortcut step-level conditioning: embed the scalar step size to the
+        # condition dim and add it to the action embedding (same scheme as
+        # DynamicCrafterOutputAdapter), so the adapter knows which multi-step
+        # horizon it is being supervised for. Requires a positive cond_dim.
+        self.use_step_level_conditioning = bool(use_step_level_conditioning)
+        self.step_level_key = str(step_level_key)
+        self.step_level_transform = str(step_level_transform)
+        self.step_level_embed: nn.Module | None = None
+        if self.use_step_level_conditioning:
+            if self.cond_dim <= 0:
+                raise ValueError("Step-level conditioning requires a positive cond_dim.")
+            step_hidden = int(step_level_hidden_dim or self.hidden_dim or self.cond_dim)
+            self.step_level_embed = nn.Sequential(
+                nn.Linear(1, step_hidden),
+                nn.SiLU(),
+                nn.Linear(step_hidden, self.cond_dim),
+            )
+
     def forward(
         self,
         x_t: Tensor,
@@ -102,6 +129,15 @@ class OutputHeadAdapter(OutputAdapterInterface):
     ) -> OutputAdapterResult:
         reference = base_output if base_output is not None else x_t
         cond_embedding = resolve_condition_embedding(cond)
+        if self.use_step_level_conditioning and isinstance(cond, Mapping):
+            step_embedding = encode_step_level_embedding(
+                cond.get(self.step_level_key),
+                step_level_embed=self.step_level_embed,
+                device=x_t.device,
+                dtype=x_t.dtype,
+                transform=self.step_level_transform,
+            )
+            cond_embedding = combine_adapter_embeddings(cond_embedding, step_embedding)
         raw = self.backbone(x_t, t, cond_embedding, base_output=base_output)
 
         gate = None

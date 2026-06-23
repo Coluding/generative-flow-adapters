@@ -1,0 +1,20 @@
+# Tiny Wan2.1 DiT for CPU smoke tests (same contract, ~negligible params).
+model:
+  params:
+    dit_config:
+      params:
+        model_type: t2v
+        patch_size: [1, 2, 2]
+        text_len: 512
+        in_dim: 16
+        dim: 64
+        ffn_dim: 128
+        freq_dim: 256
+        text_dim: 4096
+        out_dim: 16
+        num_heads: 4
+        num_layers: 2
+        window_size: [-1, -1]
+        qk_norm: true
+        cross_attn_norm: true
+        eps: 1.0e-6
