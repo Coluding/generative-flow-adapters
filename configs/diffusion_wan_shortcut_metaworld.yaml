@@ -1,0 +1,80 @@
+# Wan2.1-T2V-1.3B (flow matching) + action-conditioned output adapter,
+# trained on the MetaWorld HDF5 dataset.
+#
+# The frozen Wan DiT provides the base velocity prediction. A small
+# backbone-agnostic transformer output head produces an action-conditioned,
+# step-size-conditioned delta over the 16-channel Wan latent
+# (prediction = base + delta), trained with flow-native shortcut
+# self-consistency (rectified-flow Euler micro-step, not DDIM).
+#
+# PREREQUISITES for a real run (see thesis-vault feat-wan21-backbone-integration):
+#   1. Wan2.1-T2V-1.3B checkpoint at model.pretrained_model_name_or_path
+#      (HF: Wan-AI/Wan2.1-T2V-1.3B). Until then allow_missing_checkpoint runs
+#      with random base weights.
+#   2. Wan-VAE encoding of MetaWorld pixels -> 16-channel latents (P4). The
+#      latent geometry below (channels=16, stride-8 spatial) assumes Wan-VAE,
+#      NOT the 4-channel DynamiCrafter SD-VAE used by the avid configs.
+
+name: diffusion_wan_shortcut_metaworld
+
+data:
+  frame_stride: 4
+  fs_value: 1
+  # env: reach-v3       # str or list; omit = all environments
+  # camera: corner2     # str or list; omit = all cameras
+
+model:
+  type: flow
+  provider: wan2.1
+  prediction_type: velocity
+  freeze: true
+  # pretrained_model_name_or_path: ckpts/Wan2.1-T2V-1.3B   # HF snapshot dir
+  extra:
+    wan_config_path: configs/base/wan2.1_t2v_1_3B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    # Wan-VAE latent geometry (vae_stride = (4, 8, 8), z_dim = 16).
+    latent_channels: 16
+    temporal_length: 8
+    latent_height: 32
+    latent_width: 32
+
+adapter:
+  type: output
+  hidden_dim: 512
+  feature_dim: 16          # Wan latent channel count
+  extra:
+    architecture: output_head
+    backbone: transformer   # DiT-style head over the 5D latent
+    output_format: direct
+    condition_on_base_outputs: true
+    patch_size: 2
+    num_layers: 4
+    num_heads: 8
+    # Shortcut step-level conditioning (now wired for the transformer head):
+    # the adapter embeds the step size and adds it to the action embedding.
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+
+conditioning:
+  type: action
+  input_dim: 4             # MetaWorld action dimension
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0       # enable shortcut self-consistency supervision
+  shortcut_target_method: distillation
+  inference_every_n_steps: 2000
+  inference_num_steps: 50
+  extra:
+    amp_dtype: bf16                  # autocast (NOT model dtype) — see bf16 memory note
+    use_batch_timesteps_for_flow: true  # use the (x_t,t,target) triple the WanBatchPreprocessor builds
+    flow_timestep_scale: 1000            # model fed t = sigma*scale (Wan native [0,1000])
+    shortcut_anchor_prob: 0.75          # P(anchor step: standard flow loss only, no shortcut target)
+    shortcut_max_log2_steps: 3          # dyadic step sizes d = 2^-k, k in 1..3

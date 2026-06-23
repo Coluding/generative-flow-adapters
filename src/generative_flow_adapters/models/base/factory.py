@@ -6,6 +6,7 @@ from generative_flow_adapters.config import ModelConfig
 from generative_flow_adapters.models.base.dynamicrafter import DynamicCrafterUNetWrapper
 from generative_flow_adapters.models.base.diffusers import DiffusersUNetWrapper
 from generative_flow_adapters.models.base.dummy import DummyVectorField
+from generative_flow_adapters.models.base.wan import Wan21DiTWrapper
 
 
 _DTYPE_MAP = {
@@ -61,6 +62,19 @@ def build_base_model(config: ModelConfig):
             allow_missing_checkpoint=bool(config.extra.get("allow_missing_checkpoint", False)),
             allow_dummy_concat_condition=bool(config.extra.get("allow_dummy_concat_condition", False)),
             load_first_stage_model=bool(config.extra.get("load_first_stage_model", False)),
+            dtype=_parse_dtype(config.extra.get("dtype")),
+        )
+    elif provider in ("wan2.1", "wan"):
+        wan_config_path = config.extra.get("wan_config_path")
+        if not isinstance(wan_config_path, str) or not wan_config_path:
+            raise ValueError("wan2.1 provider requires model.extra.wan_config_path")
+        model = Wan21DiTWrapper.from_config(
+            wan_config_path=wan_config_path,
+            model_type=config.type,
+            checkpoint_path=config.pretrained_model_name_or_path,
+            prediction_type=config.prediction_type,
+            strict_checkpoint=bool(config.extra.get("strict_checkpoint", False)),
+            allow_missing_checkpoint=bool(config.extra.get("allow_missing_checkpoint", False)),
             dtype=_parse_dtype(config.extra.get("dtype")),
         )
     elif provider == "opensora":

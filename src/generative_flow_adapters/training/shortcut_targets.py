@@ -58,6 +58,53 @@ def compute_self_consistency_target_v(
     return ((v1 + v2) / 2.0).detach()
 
 
+def flow_micro_step_v(*, x: Tensor, v: Tensor, d: Tensor | float) -> Tensor:
+    """Rectified-flow Euler micro-step in the generative direction (toward data).
+
+    With the linear path ``x_t = (1-t)*x0 + t*noise`` and velocity
+    ``v = dx/dt = noise - x0``, one generative step of size ``d`` (decreasing
+    ``t`` toward data at ``t=0``) is ``x_{t-d} = x_t - d * v``. ``d`` is the
+    normalised step in ``t``-units (``t in [0, 1]``). This is the flow analogue
+    of :func:`ddim_micro_step_v` — no ``alphas_cumprod``, just a straight-line
+    Euler step, which is exactly correct for rectified flow.
+    """
+    d_view = d.view(-1, *[1] * (x.dim() - 1)) if isinstance(d, Tensor) else d
+    return x - d_view * v
+
+
+def compute_self_consistency_target_v_flow(
+    *,
+    model: nn.Module,
+    x_t: Tensor,
+    t: Tensor,
+    cond_half: object | None,
+    d: Tensor,
+    timestep_scale: float = 1.0,
+) -> Tensor:
+    """Flow-native self-consistency target (shortcut models, Frans et al. 2024).
+
+    The 2d-step velocity equals the average of two d-step velocities chained
+    across one flow Euler micro-step — the rectified-flow counterpart of
+    :func:`compute_self_consistency_target_v` (which uses a DDIM micro-step and
+    is only valid for the diffusion parameterisation).
+
+    ``d`` is the step in **sigma** units (∈[0,1]); the spatial micro-step is
+    ``x - d·v``. The model is fed ``t = sigma · timestep_scale``, so the second
+    call's timestep moves by ``d · timestep_scale`` (not ``d``).
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            v1 = model(x_t, t, cond_half)
+            x_mid = flow_micro_step_v(x=x_t, v=v1, d=d)
+            t_next = (t - d * timestep_scale).clamp_min(0.0)
+            v2 = model(x_mid, t_next, cond_half)
+    finally:
+        model.train(was_training)
+    return ((v1 + v2) / 2.0).detach()
+
+
 def ddim_micro_step_v(
     *,
     x: Tensor,

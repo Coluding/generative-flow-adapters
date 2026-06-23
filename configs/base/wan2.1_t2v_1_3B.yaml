@@ -1,0 +1,22 @@
+# Wan2.1-T2V-1.3B DiT backbone config (flow matching / velocity prediction).
+# Dims mirror external_repos/Wan2.1/wan/configs/wan_t2v_1_3B.py + shared_config.py.
+# Consumed by models/base/wan.py:_load_wan_params via model.params.dit_config.params.
+model:
+  params:
+    dit_config:
+      params:
+        model_type: t2v
+        patch_size: [1, 2, 2]
+        text_len: 512
+        in_dim: 16
+        dim: 1536
+        ffn_dim: 8960
+        freq_dim: 256
+        text_dim: 4096
+        out_dim: 16
+        num_heads: 12
+        num_layers: 30
+        window_size: [-1, -1]
+        qk_norm: true
+        cross_attn_norm: true
+        eps: 1.0e-6

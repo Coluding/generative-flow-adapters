@@ -111,6 +111,29 @@ def infer_fake_batch_spec(config: ExperimentConfig) -> FakeBatchSpec:
             structured_conditions={spec.key: spec.input_dim for spec in config.conditioning.conditions} or None,
         )
 
+    if config.model.provider in ("wan2.1", "wan"):
+        # Wan2.1 is a flow-matching video DiT operating on 5D latents.
+        # The base reads only an optional text `context` (null by default);
+        # action conditioning is encoded for the adapter from the `action` key.
+        latent_channels = int(config.model.extra.get("latent_channels", 16))
+        temporal_length = int(
+            config.model.extra.get("temporal_length", config.model.extra.get("num_frames", 8))
+        )
+        latent_height = int(config.model.extra.get("latent_height", 16))
+        latent_width = int(config.model.extra.get("latent_width", 16))
+        action_dim = config.conditioning.input_dim
+        return FakeBatchSpec(
+            x_shape=(latent_channels, temporal_length, latent_height, latent_width),
+            target_shape=(latent_channels, temporal_length, latent_height, latent_width),
+            cond_kind="wan",
+            timestep_max=1,  # flow matching: trainer resamples t in [0, 1]
+            include_shortcut_targets=include_shortcut_targets,
+            include_step_size=config.conditioning.include_step_size,
+            step_size_key=config.conditioning.step_size_key,
+            action_dim=action_dim,
+            structured_conditions={spec.key: spec.input_dim for spec in config.conditioning.conditions} or None,
+        )
+
     feature_dim = int(config.adapter.feature_dim or config.model.feature_dim)
     cond_type = config.conditioning.type
     modalities = config.conditioning.modalities if config.conditioning.modalities else None
@@ -168,6 +191,17 @@ def _build_condition(spec: FakeBatchSpec) -> Tensor | Mapping[str, Tensor] | Non
                 cond[key] = torch.randn(spec.target_shape[1], dim)
         elif spec.action_dim is not None:
             cond["act"] = torch.randn(spec.target_shape[1], spec.action_dim)
+        return cond
+
+    if spec.cond_kind == "wan":
+        cond: dict[str, Tensor] = {}
+        if spec.structured_conditions is not None:
+            for key, dim in spec.structured_conditions.items():
+                cond[key] = torch.randn(dim)
+        elif spec.action_dim is not None:
+            cond["action"] = torch.randn(spec.action_dim)
+        if spec.include_step_size:
+            cond[spec.step_size_key] = torch.randint(1, 5, (1,), dtype=torch.float32).squeeze(0)
         return cond
 
     if spec.structured_conditions is not None:
