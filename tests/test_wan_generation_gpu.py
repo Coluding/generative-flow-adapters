@@ -145,6 +145,98 @@ def test_wan_frame_conditioned_base_vs_adapter():
 
 @pytest.mark.skipif(not _HDF5.exists(), reason=f"MetaWorld HDF5 not found at {_HDF5}.")
 @pytest.mark.skipif(not _DIT_SAFETENSORS.exists(), reason="Wan DiT safetensors not found.")
+def test_wan_base_sdedit_reconstructs_metaworld_clip():
+    """Is the WAN generation machinery actually correct? (WAN analogue of
+    DynamiCrafter's ``test_base_model_image_to_video_rollout_is_semantically_
+    consistent``.)
+
+    Encodes a real MetaWorld clip to the ground-truth latent ``z0``, then rolls
+    the frozen Wan base through two paths from the *same* noise: a frame-
+    conditioned **SDEdit** rollout (anchored on ``z0``) and an **unconditional**
+    pure-noise rollout. It asserts the SDEdit decode is close to GT in pixels
+    **and clearly closer than the unconditional rollout** — the conditioning
+    must demonstrably steer the result.
+
+    This isolates the sampler / VAE / timestep convention from adapter training:
+    if SDEdit reconstructs GT, the machinery is sound and washed-out eval-grid
+    panels are an unconditional-null-text-base + undertrained-adapter artifact,
+    not a pipeline bug. If even SDEdit fails, the generation path is broken.
+    Stores ``[GT | sdedit | uncond]`` side by side for inspection. Thresholds
+    are loose (null text, few steps); tune against the printed values.
+    """
+    import imageio.v3 as iio
+    import numpy as np
+    import torch.nn.functional as F
+
+    from generative_flow_adapters.backbones.wan.modules.vae import WanVAE
+    from generative_flow_adapters.backbones.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+    from generative_flow_adapters.config import load_config
+    from generative_flow_adapters.training.builders import build_experiment
+
+    device, dtype = "cuda", torch.bfloat16
+    frames, height, width, steps = 17, 128, 128, 8
+    os.makedirs("outputs", exist_ok=True)
+
+    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config.model.pretrained_model_name_or_path = str(_CKPT_DIR)
+    config.model.extra["allow_missing_checkpoint"] = False
+    config.model.extra["dtype"] = "bf16"
+    base = build_experiment(config).model.base_model.to(device).eval()
+
+    # Tiled real frame -> Wan-VAE latent (same proven setup as the base-vs-adapter
+    # test; frames=17 keeps the (4,8,8) temporal geometry clean). A static scene
+    # still fully exercises the sampler / VAE / timestep convention.
+    vae = WanVAE(vae_pth=str(_VAE_PTH), device=device)
+    frame = _load_first_metaworld_frame()
+    img = frame.permute(2, 0, 1).float().div(127.5).sub(1.0)
+    img = F.interpolate(img.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+    video_in = img.unsqueeze(1).repeat(1, frames, 1, 1).to(device)  # [3, F, H, W] in [-1, 1]
+    z0 = vae.encode([video_in])[0].unsqueeze(0).float()            # ground-truth latent
+    gt_px = vae.decode([z0[0]])[0]                                 # decode(z0): isolates sampler from VAE error
+
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1, use_dynamic_shifting=False)
+    gen = torch.Generator(device=device).manual_seed(0)
+    noise = torch.randn(1, 16, *z0.shape[2:], generator=gen, device=device, dtype=torch.float32)
+
+    def rollout(strength: float):
+        sched = scheduler
+        sched.set_timesteps(steps, device=device, shift=3.0)
+        start_idx = min(int(round((1.0 - strength) * steps)), steps - 1)
+        sigma_start = sched.sigmas[start_idx].to(device)
+        latent = ((1.0 - sigma_start) * z0 + sigma_start * noise).float()
+        for t in sched.timesteps[start_idx:]:
+            with torch.autocast("cuda", dtype=dtype):
+                v = base(latent, t.unsqueeze(0).to(device), {})
+            latent = sched.step(v.float(), t, latent, return_dict=False, generator=gen)[0]
+        return latent
+
+    sdedit_px = vae.decode([rollout(strength=0.5)[0]])[0]   # anchored on z0
+    uncond_px = vae.decode([rollout(strength=1.0)[0]])[0]   # pure noise
+
+    mse_sdedit = (sdedit_px.float() - gt_px.float()).pow(2).mean().item()
+    mse_uncond = (uncond_px.float() - gt_px.float()).pow(2).mean().item()
+    print(f"\n[wan-sdedit] MSE(sdedit, gt)={mse_sdedit:.4f}  MSE(uncond, gt)={mse_uncond:.4f}  ratio={mse_sdedit / max(mse_uncond, 1e-6):.2f}")
+
+    # Store [GT | sdedit | uncond] side by side (per-frame, concatenated on width).
+    def to_u8(v):
+        return v.add(1).mul(127.5).clamp(0, 255).byte().permute(1, 2, 3, 0).cpu().numpy()  # [F, H, W, 3]
+
+    panel = np.concatenate([to_u8(gt_px), to_u8(sdedit_px), to_u8(uncond_px)], axis=2)
+    iio.imwrite("outputs/test_wan_sdedit_vs_gt.mp4", panel, fps=8)
+    iio.imwrite("outputs/test_wan_sdedit_vs_gt_frame0.png", panel[0])
+    assert os.path.exists("outputs/test_wan_sdedit_vs_gt.mp4")
+
+    # The machinery works iff frame-conditioning demonstrably beats pure noise
+    # at recovering GT, and the conditioned reconstruction is reasonably close.
+    assert mse_sdedit < 0.6 * mse_uncond, (
+        f"SDEdit conditioning did not steer toward GT (sdedit={mse_sdedit:.4f} "
+        f"vs uncond={mse_uncond:.4f}); generation/convention likely broken."
+    )
+    assert mse_sdedit < 0.12, f"SDEdit reconstruction too far from GT: {mse_sdedit:.4f}"
+
+
+@pytest.mark.skipif(not _HDF5.exists(), reason=f"MetaWorld HDF5 not found at {_HDF5}.")
+@pytest.mark.skipif(not _DIT_SAFETENSORS.exists(), reason="Wan DiT safetensors not found.")
 def test_wan_metaworld_training_step():
     """One real flow-matching training step: MetaWorld pixels -> Wan-VAE 16-ch
     latents -> (x_t,t,target) triple -> AdaptedModel -> finite loss, and only the

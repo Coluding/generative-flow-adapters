@@ -608,6 +608,37 @@ class Trainer:
             do_anchor = (anchor_prob >= 1.0) or (
                 anchor_prob > 0.0 and bool(torch.rand((), device="cpu").item() < anchor_prob)
             )
+
+            if self.step_schedule is not None:
+                # Paper-faithful path shared with the diffusion branch below:
+                # normalised step sizes s ∈ (0,1] drawn from `shortcut_step_schedule`
+                # (the same config knob DynamiCrafter/AVID use), instead of the
+                # shallow `shortcut_max_log2_steps` ladder. Flow makes this *exact*:
+                # the straight-line Euler micro-step has no curvature, so unlike the
+                # diffusion branch there are no alphas_cumprod tables and no
+                # timestep-jump conversion — `d` is the normalised sigma step (s/2)
+                # fed directly to the flow self-consistency target.
+                if do_anchor:
+                    step_level = torch.full(
+                        (batch_size,), float(self.step_schedule.smallest()), device=device, dtype=dtype
+                    )
+                    return self._inject_step_level(cond, step_level_key, step_level), None
+                s_full = self.step_schedule.sample(exclude_smallest=True)
+                self._last_shortcut_step_level = float(s_full)
+                s_half = s_full / 2.0
+                step_level_full = torch.full((batch_size,), float(s_full), device=device, dtype=dtype)
+                step_level_half = torch.full((batch_size,), float(s_half), device=device, dtype=dtype)
+                new_cond = self._inject_step_level(cond, step_level_key, step_level_full)
+                cond_half = self._inject_step_level(cond, step_level_key, step_level_half)
+                d_tensor = torch.full((batch_size,), float(s_half), device=device, dtype=dtype)
+                with self._autocast():
+                    target = compute_self_consistency_target_v_flow(
+                        model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=d_tensor,
+                        timestep_scale=self._flow_timestep_scale,
+                    )
+                return new_cond, target
+
+            # Legacy dyadic ladder (no schedule configured): d = 2^-k, k in 1..max.
             max_log2 = int(self.config.extra.get("shortcut_max_log2_steps", 3))
             if do_anchor:
                 d_min = 1.0 / (2 ** max_log2)
@@ -663,6 +694,7 @@ class Trainer:
                 target = compute_self_consistency_target_v(
                     model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=jump,
                     alphas_cumprod=alphas, scale_arr=scale_arr,
+                    target_kind=self.config.shortcut_consistency_target,
                 )
                 return new_cond, target
 
@@ -687,6 +719,7 @@ class Trainer:
             target = compute_self_consistency_target_v(
                 model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=d_value,
                 alphas_cumprod=alphas, scale_arr=scale_arr,
+                target_kind=self.config.shortcut_consistency_target,
             )
             return new_cond, target
 
@@ -812,8 +845,10 @@ class Trainer:
         num_inference_steps: int | None = None,
     ) -> Tensor:
         model_type = getattr(self.model, "model_type", None)
-        if model_type != "diffusion":
-            raise ValueError("Inference sampling is only implemented for diffusion models.")
+        if model_type not in ("diffusion", "flow", "flow_matching"):
+            raise ValueError(
+                f"Inference sampling is only implemented for diffusion/flow models, got {model_type!r}."
+            )
         steps = num_inference_steps or self.config.inference_num_steps
         return self.inference_sampler.sample_from_batch(batch=batch, num_inference_steps=steps)
 
@@ -858,7 +893,7 @@ class Trainer:
         return []
 
     def _maybe_generate_samples(self, batch: Mapping[str, Tensor | object], model_type: str | None) -> Tensor | None:
-        if model_type != "diffusion":
+        if model_type not in ("diffusion", "flow", "flow_matching"):
             return None
         if self.config.inference_every_n_steps is None or self.config.inference_every_n_steps <= 0:
             return None
@@ -871,6 +906,11 @@ class Trainer:
 
         target = batch.get("target")
         steps = self.config.inference_num_steps
+        # Decode the clean latent z0 for the GT panel on flow batches (where
+        # `target` is the velocity); fall back to `target` for diffusion.
+        ground_truth = batch.get("x0")
+        if not isinstance(ground_truth, Tensor):
+            ground_truth = target
         if self.wandb_logger is not None and self.base_inference_sampler is not None and isinstance(target, Tensor):
             shared_noise = torch.randn_like(target)
             adapted_samples = self.inference_sampler.sample_from_batch(
@@ -884,7 +924,7 @@ class Trainer:
             self.wandb_logger.log_videos(
                 prediction_latents=adapted_samples,
                 base_prediction_latents=base_samples,
-                target_latents=target,
+                target_latents=ground_truth,
                 cond=batch.get("cond"),
                 step=self.global_step,
             )
@@ -894,7 +934,7 @@ class Trainer:
         if self.wandb_logger is not None and isinstance(target, Tensor):
             self.wandb_logger.log_videos(
                 prediction_latents=samples,
-                target_latents=target,
+                target_latents=ground_truth,
                 cond=batch.get("cond"),
                 step=self.global_step,
             )
@@ -921,6 +961,12 @@ class Trainer:
         if self.wandb_logger is None or not isinstance(target, Tensor):
             return None
 
+        # Flow batches carry target = (noise - z0) (the velocity), so decode the
+        # clean latent z0 for the ground-truth panel when the preprocessor
+        # provides it; diffusion batches put the clean latent in `target`.
+        ground_truth = batch.get("x0")
+        if not isinstance(ground_truth, Tensor):
+            ground_truth = target
         shared_noise = torch.randn_like(target)
         step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
         cond = batch.get("cond")
@@ -951,7 +997,7 @@ class Trainer:
                 base_by_steps.append((num_steps, base))
 
         self.wandb_logger.log_step_size_grid(
-            target_latents=target,
+            target_latents=ground_truth,
             adapted_by_steps=adapted_by_steps,
             base_by_steps=base_by_steps or None,
             cond=cond,

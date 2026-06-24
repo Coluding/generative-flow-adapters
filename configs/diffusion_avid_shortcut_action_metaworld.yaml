@@ -92,6 +92,7 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0
   shortcut_target_method: distillation
+  shortcut_consistency_target: endpoint_inversion
   inference_every_n_steps: 2000
   inference_num_steps: 50
   # Run artifacts: metrics.jsonl + checkpoints/ are written under output_dir
@@ -111,10 +112,10 @@ training:
     shortcut_anchor_prob: 0.5
     eval_step_schedule:
       - { num_steps: 1,  step_level: 1.0 }
-      - { num_steps: 2,  step_level: 0.5 }
-      - { num_steps: 4,  step_level: 0.25 }
-      - { num_steps: 8,  step_level: 0.125 }
-      - { num_steps: 25, step_level: 0.04 }
+     # - { num_steps: 2,  step_level: 0.5 }
+     # - { num_steps: 4,  step_level: 0.25 }
+     # - { num_steps: 8,  step_level: 0.125 }
+     # - { num_steps: 25, step_level: 0.04 }
     shortcut_step_schedule:
       units: normalized
       mode: log2
