@@ -82,7 +82,10 @@ class WanBatchPreprocessor:
         t = sigma * self.config.timestep_scale
 
         cond = self._build_condition(batch, batch_size)
-        return {"x_t": x_t, "t": t, "target": target, "cond": cond}
+        # `x0` (clean latent) is kept alongside the velocity `target` so the
+        # eval video logger can decode a correct ground-truth panel — decoding
+        # `target` (= noise - z0) would render noise, not the source clip.
+        return {"x_t": x_t, "t": t, "target": target, "x0": z0, "cond": cond}
 
     def _build_condition(self, batch: Mapping[str, Any], batch_size: int) -> dict[str, Tensor]:
         cond: dict[str, Tensor] = {}

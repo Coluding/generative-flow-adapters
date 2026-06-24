@@ -235,6 +235,76 @@ class EvalStepScheduleParseTest(unittest.TestCase):
         self.assertEqual(result, [(4, None), (25, None)])
 
 
+class FlowGridGroundTruthTest(unittest.TestCase):
+    """The flow eval grid must decode the *clean latent* `x0` for the GT panel.
+
+    Flow batches carry `target = noise - z0` (the velocity), so decoding
+    `target` would render noise. `_generate_step_size_grid` must pass `batch
+    ["x0"]` (the clean latent the WanBatchPreprocessor now keeps) as
+    `target_latents`, and reuse one noise draw across every step count with the
+    per-row `step_level` injected only into the adapted cond."""
+
+    @staticmethod
+    def _run(batch, schedule):
+        import types
+
+        from generative_flow_adapters.training.trainer import Trainer
+
+        captured = {}
+
+        class _Logger:
+            def log_step_size_grid(self, **kwargs):
+                captured.update(kwargs)
+
+        class _Sampler:
+            def __init__(self, tag):
+                self.tag = tag
+                self.calls = []
+
+            def sample_from_batch(self, *, batch, num_inference_steps, initial_sample):
+                self.calls.append(
+                    {"cond": batch.get("cond"), "steps": num_inference_steps, "noise": initial_sample}
+                )
+                return torch.full_like(batch["target"], float(num_inference_steps))
+
+        stub = types.SimpleNamespace(
+            wandb_logger=_Logger(),
+            inference_sampler=_Sampler("adapted"),
+            base_inference_sampler=_Sampler("base"),
+            config=types.SimpleNamespace(extra={"shortcut_step_level_key": "step_level"}),
+            global_step=5,
+        )
+        stub._inject_step_level = Trainer._inject_step_level.__get__(stub)
+        Trainer._generate_step_size_grid(stub, batch=batch, schedule=schedule)
+        return stub, captured
+
+    def test_grid_uses_x0_not_velocity_for_ground_truth(self):
+        x0 = torch.randn(1, 4, 2, 4, 8)
+        velocity = torch.randn(1, 4, 2, 4, 8)
+        batch = {"target": velocity, "x0": x0, "cond": {"action": torch.randn(1, 4)}}
+        stub, captured = self._run(batch, [(1, 1.0), (2, 0.5)])
+
+        # GT panel decodes the clean latent, never the velocity target.
+        self.assertTrue(torch.equal(captured["target_latents"], x0))
+        self.assertFalse(torch.equal(captured["target_latents"], velocity))
+        # One adapted + one base rollout per schedule row.
+        self.assertEqual([n for n, _ in captured["adapted_by_steps"]], [1, 2])
+        self.assertEqual([n for n, _ in captured["base_by_steps"]], [1, 2])
+        # Shared noise draw across every rollout (differences are model-driven).
+        noises = [c["noise"] for c in stub.inference_sampler.calls + stub.base_inference_sampler.calls]
+        self.assertTrue(all(torch.equal(n, noises[0]) for n in noises))
+        # step_level injected into the adapted cond, stripped from the base cond.
+        self.assertIn("step_level", stub.inference_sampler.calls[0]["cond"])
+        self.assertNotIn("step_level", stub.base_inference_sampler.calls[0]["cond"])
+
+    def test_grid_falls_back_to_target_when_no_x0(self):
+        # Diffusion batches have no `x0`; the clean latent lives in `target`.
+        velocity = torch.randn(1, 4, 2, 4, 8)
+        batch = {"target": velocity, "cond": None}
+        _stub, captured = self._run(batch, [(4, None)])
+        self.assertTrue(torch.equal(captured["target_latents"], velocity))
+
+
 class WandbLoggerMetricsTest(unittest.TestCase):
     def test_log_metrics_filters_non_scalar_and_prefixes_keys(self):
         fake_log: list = []

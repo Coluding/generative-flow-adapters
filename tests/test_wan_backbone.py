@@ -255,3 +255,56 @@ def test_flow_shortcut_training_step_fires():
     # The frozen base stays frozen; the adapter (incl. step_level_embed) trains.
     assert sum(p.numel() for p in experiment.model.base_model.parameters() if p.requires_grad) == 0
     assert experiment.model.adapter.step_level_embed is not None
+
+
+def test_flow_shortcut_uses_step_schedule_like_dynamicrafter():
+    """The flow shortcut path honours `shortcut_step_schedule` (the same knob
+    DynamiCrafter/AVID use) rather than the shallow dyadic `max_log2` ladder.
+
+    With the schedule configured, a forced shortcut step must record a
+    `step_level` drawn from the schedule's rungs (down to 1/128), proving the
+    flow branch took the schedule sub-path and not the dyadic fallback."""
+    from generative_flow_adapters.config import load_config
+    from generative_flow_adapters.training.builders import build_experiment
+    from generative_flow_adapters.training.trainer import Trainer
+
+    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config.model.extra["wan_config_path"] = _TINY_CONFIG
+    config.model.extra["allow_missing_checkpoint"] = True
+    config.model.extra["dtype"] = "float32"
+    config.model.pretrained_model_name_or_path = None
+    config.training.extra["shortcut_anchor_prob"] = 0.0  # force a shortcut step
+    config.training.extra["amp_dtype"] = "float32"
+    experiment = build_experiment(config)
+    trainer = Trainer(experiment.model, experiment.optimizer, experiment.loss_fn, config.training)
+
+    # The schedule object is built from `shortcut_step_schedule`; its presence is
+    # exactly what routes the flow branch to the continuous (DynamiCrafter-style)
+    # sub-path. The shallow dyadic knob is gone from the config.
+    assert trainer.step_schedule is not None
+    assert "shortcut_max_log2_steps" not in config.training.extra
+    rungs = set(trainer.step_schedule.discrete_levels())
+    assert min(rungs) == 1 / 128
+
+    z0 = torch.randn(2, 16, 2, 8, 8)
+    noise = torch.randn_like(z0)
+    t = torch.rand(2)
+    t_b = t.view(2, 1, 1, 1, 1)
+    batch = {"x_t": (1 - t_b) * z0 + t_b * noise, "t": t, "target": noise - z0,
+             "cond": {"action": torch.randn(2, 4)}}
+    trainer.training_step(batch)
+
+    # The supervised step_level recorded for per-rung logging is a schedule rung
+    # (excluding the smallest, which the anchor owns) — not a {1,1/2,1/4}-only
+    # dyadic draw. Over a few forced steps we should be able to land below 1/8,
+    # which the old `max_log2: 3` ladder could never reach.
+    seen = set()
+    for _ in range(40):
+        trainer._maybe_prepare_shortcut(
+            batch=batch, x_t=batch["x_t"], t=batch["t"], cond={"action": torch.randn(2, 4)}
+        )
+        if trainer._last_shortcut_step_level is not None:
+            seen.add(round(trainer._last_shortcut_step_level, 6))
+    assert seen, "no shortcut step_level was recorded"
+    assert seen <= rungs, f"step_levels {seen} not all schedule rungs {sorted(rungs)}"
+    assert min(seen) < 0.125, f"never sampled finer than 1/8: {sorted(seen)}"

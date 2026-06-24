@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,24 @@ import yaml
 from torch import Tensor
 
 from generative_flow_adapters.models.base.interfaces import BaseGenerativeModel, infer_prediction_type
+
+
+def make_wan_decode_fn(vae: Any) -> Callable[[Tensor], Tensor]:
+    """Adapt a ``WanVAE`` into the ``WandbLogger`` decode contract.
+
+    The logger calls ``decode_fn(latents)`` with a 5D batch ``[B, 16, T, H, W]``
+    and expects ``[B, 3, T, H, W]`` pixels in ``[-1, 1]``. ``WanVAE.decode``
+    instead takes a *list* of ``[16, T, H, W]`` latents and returns a list of
+    ``[3, T, H, W]`` clips already clamped to ``[-1, 1]`` — so we split the
+    batch, decode, and restack. This lets the Wan training script reuse the same
+    VAE it already loaded for the pixel->latent encode."""
+
+    @torch.no_grad()
+    def decode_fn(latents: Tensor) -> Tensor:
+        clips = vae.decode([latents[i].float() for i in range(latents.shape[0])])
+        return torch.stack(clips, dim=0)
+
+    return decode_fn
 
 
 class Wan21DiTWrapper(BaseGenerativeModel):

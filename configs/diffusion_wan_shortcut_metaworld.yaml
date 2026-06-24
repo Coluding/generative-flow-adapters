@@ -77,4 +77,34 @@ training:
     use_batch_timesteps_for_flow: true  # use the (x_t,t,target) triple the WanBatchPreprocessor builds
     flow_timestep_scale: 1000            # model fed t = sigma*scale (Wan native [0,1000])
     shortcut_anchor_prob: 0.75          # P(anchor step: standard flow loss only, no shortcut target)
-    shortcut_max_log2_steps: 3          # dyadic step sizes d = 2^-k, k in 1..3
+    # Paper-faithful shortcut step schedule, identical to the DynamiCrafter/AVID
+    # configs. Normalised s ∈ (0,1] over a log2 ladder down to 1/128, so the
+    # adapter is supervised across the full multi-step range (not just the
+    # shallow <=8-step dyadic ladder). Flow makes the self-consistency target
+    # exact (straight-line Euler, no curvature), so there is no reason to limit
+    # the depth. The anchor grounds the finest rung (1/128) with the standard
+    # flow loss. Replaces the old `shortcut_max_log2_steps: 3` knob.
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128   # finest — grounded by the standard flow loss at the anchor
+      max: 1       # one-step
+      base: 2
+    # Multi-step shortcut eval grid logged every `inference_every_n_steps`:
+    # rows are sampling-step counts, columns are [GT | base | adapted]. Each row
+    # injects step_level = 1/num_steps so the adapter approximates that horizon.
+    # Mirrors the AVID shortcut grid (incl. the 25-step many-step reference); all
+    # rows now sit inside the trained [1/128, 1] range, so the adapter
+    # interpolates rather than extrapolates.
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+    wandb:
+      enable: true
+      require_vae: false                # Wan-VAE has no decode_first_stage; injected at runtime
+      project: wan-shortcut-metaworld
+      num_samples: 2
+      fps: 4

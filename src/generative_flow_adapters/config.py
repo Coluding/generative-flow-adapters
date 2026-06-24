@@ -70,6 +70,18 @@ class TrainingConfig:
     # unchanged. See thesis-vault theory/heun-smoothness-regularizer.md.
     heun_smoothness_weight: float = 0.0
     shortcut_target_method: str = "distillation"  # only "distillation" (two_step removed)
+    # How the self-consistency target is formed from the two half-step velocities
+    # (sibling to `shortcut_target_method`, which selects the teacher path).
+    #   "v_average"          — (v1+v2)/2, exact for flow matching but BIASED for
+    #                          diffusion v-prediction (kept as the ablation baseline).
+    #   "endpoint_inversion" — follow both sub-steps to the real landing x_end and
+    #                          invert the DDIM 2d-step for the velocity that
+    #                          reproduces it. Exact under v-prediction.
+    #   "displacement"       — reserved (Option B); needs the additive few-step
+    #                          sampler + head grounding, not yet wired (raises).
+    # Diffusion (v-pred) only; flow matching is unbiased so the selector is a no-op
+    # there. See thesis-vault decided/shortcut-target-endpoint-vs-v-averaging.
+    shortcut_consistency_target: str = "v_average"
     grad_clip_norm: float | None = None
     diffusion_timesteps: int = 1000
     diffusion_beta_schedule: str = "linear"

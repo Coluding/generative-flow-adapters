@@ -42,6 +42,14 @@ class WandbLogger:
         if wandb.run is None:
             wandb.init(project=project, name=run_name, config=dict(config) if config else None)
 
+    def set_decode_fn(self, decode_fn) -> None:
+        """Attach the latent->pixel decoder after construction.
+
+        Used when the VAE lives outside ``build_experiment`` (e.g. the Wan
+        training script loads ``WanVAE`` itself): the logger is built with no
+        decoder and the script injects it here before the first eval."""
+        self._decode_fn = decode_fn
+
     # ------------------------------------------------------------------ metrics
 
     def log_metrics(self, metrics: Mapping[str, object], step: int) -> None:

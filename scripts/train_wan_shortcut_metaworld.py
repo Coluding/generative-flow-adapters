@@ -48,7 +48,7 @@ def main() -> None:
         default="ckpts/Wan2.1-T2V-1.3B",
         help="Wan checkpoint dir (Wan2.1_VAE.pth + DiT safetensors). Loads real weights when present.",
     )
-    parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--frame-stride", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -80,16 +80,24 @@ def main() -> None:
         experiment.optimizer,
         experiment.loss_fn,
         config.training,
+        wandb_logger=getattr(experiment, "wandb_logger", None),
         checkpoint_manager=getattr(experiment, "checkpoint_manager", None),
     )
 
     # Wan-VAE for the pixel->latent encode.
     from generative_flow_adapters.backbones.wan.modules.vae import WanVAE
+    from generative_flow_adapters.models.base.wan import make_wan_decode_fn
 
     vae_pth = ckpt_dir / "Wan2.1_VAE.pth"
     if not vae_pth.exists():
         raise FileNotFoundError(f"Wan-VAE not found at {vae_pth}; pass --ckpt-dir with the downloaded checkpoint.")
     vae = WanVAE(vae_pth=str(vae_pth), device=device)
+
+    # Reuse the same VAE for the eval video grid (latent->pixel decode). The
+    # logger is built decoder-less by build_experiment (the frozen Wan DiT has
+    # no decode_first_stage), so inject the decoder now that the VAE exists.
+    if trainer.wandb_logger is not None:
+        trainer.wandb_logger.set_decode_fn(make_wan_decode_fn(vae))
 
     condition_keys = tuple(spec.key for spec in config.conditioning.conditions if spec.key != "step_level")
     # Single source for the timestep convention: t = sigma * flow_timestep_scale
