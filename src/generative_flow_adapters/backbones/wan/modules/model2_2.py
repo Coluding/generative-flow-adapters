@@ -6,7 +6,10 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+# Vendored change (mirrors model.py): import the SDPA-capable dispatcher under
+# the `flash_attention` name so the model runs on CPU / without flash-attn. The
+# dispatcher uses flash-attn when available and falls back to torch SDPA.
+from .attention import attention as flash_attention
 
 __all__ = ['WanModel']
 

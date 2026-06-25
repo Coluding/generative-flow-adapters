@@ -127,6 +127,13 @@ class OutputHeadAdapter(OutputAdapterInterface):
         cond: object | None,
         base_output: Tensor | None = None,
     ) -> OutputAdapterResult:
+        # Diffusion-forcing bases (Wan2.2 TI2V) feed a per-latent-frame timestep
+        # ``[B, T']`` (observation frames at 0, predicted frames at sigma). This
+        # adapter's time conditioning is global (broadcast over space/frames), so
+        # collapse to a per-sample denoising level — the max over frames recovers
+        # the predicted-frame sigma. The usual per-batch ``[B]`` t is untouched.
+        if t.dim() > 1:
+            t = t.flatten(1).amax(dim=1)
         reference = base_output if base_output is not None else x_t
         cond_embedding = resolve_condition_embedding(cond)
         if self.use_step_level_conditioning and isinstance(cond, Mapping):

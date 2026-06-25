@@ -17,6 +17,9 @@ from generative_flow_adapters.data.null_caption import (
 )
 from generative_flow_adapters.data.translators.base import EpisodeRef, Translator
 from generative_flow_adapters.data.translators.metaworld import MetaWorldTranslator
+from generative_flow_adapters.data.wan22_batch_preprocessor import (
+    Wan22DiffusionForcingPreprocessor,
+)
 from generative_flow_adapters.data.wan_batch_preprocessor import (
     WanBatchPreprocessConfig,
     WanBatchPreprocessor,
@@ -28,6 +31,7 @@ __all__ = [
     "CaptionEncoder",
     "DynamiCrafterBatchPreprocessor",
     "EpisodeRef",
+    "Wan22DiffusionForcingPreprocessor",
     "WanBatchPreprocessConfig",
     "WanBatchPreprocessor",
     "MetaWorldTranslator",
