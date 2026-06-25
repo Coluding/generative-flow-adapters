@@ -1,0 +1,27 @@
+# Wan2.2-TI2V-5B DiT backbone config (flow matching / velocity prediction).
+# Dims mirror external_repos/wan22/wan/configs/wan_ti2v_5B.py + shared_config.py.
+# Consumed by models/base/wan2_2.py:Wan22DiTWrapper via model.params.dit_config.params.
+#
+# TI2V-5B is the unified text+image-to-video model. in_dim == VAE z_dim == 48
+# (no CLIP / no concat channel); image conditioning is done by clamping the
+# observation frame's clean latent and giving those tokens timestep 0
+# ("diffusion forcing"). VAE stride is (4, 16, 16).
+model:
+  params:
+    dit_config:
+      params:
+        model_type: ti2v
+        patch_size: [1, 2, 2]
+        text_len: 512
+        in_dim: 48
+        dim: 3072
+        ffn_dim: 14336
+        freq_dim: 256
+        text_dim: 4096
+        out_dim: 48
+        num_heads: 24
+        num_layers: 30
+        window_size: [-1, -1]
+        qk_norm: true
+        cross_attn_norm: true
+        eps: 1.0e-6

@@ -7,6 +7,7 @@ from generative_flow_adapters.models.base.dynamicrafter import DynamicCrafterUNe
 from generative_flow_adapters.models.base.diffusers import DiffusersUNetWrapper
 from generative_flow_adapters.models.base.dummy import DummyVectorField
 from generative_flow_adapters.models.base.wan import Wan21DiTWrapper
+from generative_flow_adapters.models.base.wan2_2 import Wan22DiTWrapper
 
 
 _DTYPE_MAP = {
@@ -64,11 +65,14 @@ def build_base_model(config: ModelConfig):
             load_first_stage_model=bool(config.extra.get("load_first_stage_model", False)),
             dtype=_parse_dtype(config.extra.get("dtype")),
         )
-    elif provider in ("wan2.1", "wan"):
+    elif provider in ("wan2.1", "wan", "wan2.2"):
         wan_config_path = config.extra.get("wan_config_path")
         if not isinstance(wan_config_path, str) or not wan_config_path:
-            raise ValueError("wan2.1 provider requires model.extra.wan_config_path")
-        model = Wan21DiTWrapper.from_config(
+            raise ValueError(f"{provider} provider requires model.extra.wan_config_path")
+        # Wan2.2 TI2V uses the per-token-timestep / diffusion-forcing DiT
+        # (model2_2); Wan2.1 uses the per-batch-timestep DiT (model).
+        wrapper_cls = Wan22DiTWrapper if provider == "wan2.2" else Wan21DiTWrapper
+        model = wrapper_cls.from_config(
             wan_config_path=wan_config_path,
             model_type=config.type,
             checkpoint_path=config.pretrained_model_name_or_path,

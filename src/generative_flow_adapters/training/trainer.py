@@ -146,6 +146,23 @@ class Trainer:
         device_type = next(self.model.parameters()).device.type
         return torch.amp.autocast(device_type=device_type, dtype=self._amp_dtype)
 
+    def _flow_loss(self, prediction: Tensor, target: Tensor, batch: Mapping[str, Tensor | object]) -> Tensor:
+        """Flow-matching velocity loss, masked to predicted frames when present.
+
+        Diffusion-forcing batches (Wan2.2 TI2V) carry a ``frame_mask`` that is 0
+        on the observation frame(s) — clamped clean, no velocity target — and 1
+        on the predicted future. There the loss is the mean squared velocity
+        error over the future frames only; without a mask it is the standard
+        ``loss_fn`` over the whole clip."""
+        frame_mask = batch.get("frame_mask")
+        if not isinstance(frame_mask, Tensor):
+            return self.loss_fn(prediction, target)
+        m = frame_mask.to(device=prediction.device, dtype=prediction.dtype)
+        # [B, T'] -> broadcast over channels/space to [B, C, T', H, W].
+        m = m.view(m.shape[0], 1, m.shape[1], 1, 1).expand_as(prediction)
+        sq = (prediction.float() - target.float()) ** 2
+        return (sq * m).sum() / m.sum().clamp_min(1.0)
+
     def _forward_and_loss(
         self, batch: Mapping[str, Tensor | object]
     ) -> tuple[Tensor, dict[str, float], Tensor, Tensor, object, Tensor, dict]:
@@ -229,7 +246,7 @@ class Trainer:
             # See diffusion branch: upcast to fp32 for a precision-consistent
             # loss/backward. No-op when amp is off.
             prediction = prediction.float()
-            loss = self.loss_fn(prediction, target)
+            loss = self._flow_loss(prediction, target, batch)
 
         # Record each loss term separately so wandb shows the base loss and
         # every shortcut-consistency term next to the combined total. For
@@ -918,6 +935,12 @@ class Trainer:
             )
             base_cond = _strip_adapter_only_keys(batch.get("cond"))
             base_batch = {"target": target, "cond": base_cond}
+            # Carry the diffusion-forcing conditioning (observation frames +
+            # mask) into the base rollout too, so the no-adapter baseline is
+            # conditioned on the same observation as the adapted one.
+            for key in ("frame_mask", "x0"):
+                if isinstance(batch.get(key), Tensor):
+                    base_batch[key] = batch[key]
             base_samples = self.base_inference_sampler.sample_from_batch(
                 batch=base_batch, num_inference_steps=steps, initial_sample=shared_noise
             )

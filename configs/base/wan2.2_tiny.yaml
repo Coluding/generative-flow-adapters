@@ -1,0 +1,22 @@
+# Tiny Wan2.2 TI2V DiT for CPU smoke tests (same contract, ~negligible params).
+# in_dim == z_dim == 48 and model_type == ti2v so the per-token-timestep /
+# diffusion-forcing path is exercised without the 5B checkpoint.
+model:
+  params:
+    dit_config:
+      params:
+        model_type: ti2v
+        patch_size: [1, 2, 2]
+        text_len: 512
+        in_dim: 48
+        dim: 64
+        ffn_dim: 128
+        freq_dim: 256
+        text_dim: 4096
+        out_dim: 48
+        num_heads: 4
+        num_layers: 2
+        window_size: [-1, -1]
+        qk_norm: true
+        cross_attn_norm: true
+        eps: 1.0e-6
