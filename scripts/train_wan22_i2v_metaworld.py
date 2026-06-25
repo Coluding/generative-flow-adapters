@@ -42,7 +42,7 @@ _WAN22_VAE_SPATIAL_STRIDE = 16
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_i2v_metaworld.yaml")
+    parser.add_argument("--config", default="configs/diffusion_wan22_avid_i2v_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="Path to MetaWorld HDF5 file")
     parser.add_argument(
         "--ckpt-dir",

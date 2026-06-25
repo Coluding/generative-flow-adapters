@@ -72,6 +72,13 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         cond: object | None,
         base_output: Tensor | None = None,
     ) -> OutputAdapterResult:
+        # Diffusion-forcing bases (Wan2.2 TI2V) feed a per-latent-frame timestep
+        # [B, T'] (observation frames at 0, predicted frames at sigma). The
+        # ActionWanModel's time/action conditioning is global (AdaLN broadcast),
+        # so collapse to a per-sample denoising level — the max over frames
+        # recovers the predicted-frame sigma. Per-batch [B] t is untouched.
+        if t.dim() > 1:
+            t = t.flatten(1).amax(dim=1)
         # Fused conditioning embedding from the encoder (action/proprio/goal/…);
         # condition dropout / CFG is applied upstream by the encoder's null path.
         cond_embedding = resolve_condition_embedding(cond)

@@ -1,0 +1,17 @@
+# Action-conditioned Wan output adapter (AVID-style) for the Wan2.2 base.
+# Identical to wan_adapter_11m.yaml but in_dim/out_dim = 48 to match the
+# Wan2.2-VAE latent (z_dim = 48) instead of the Wan2.1 16-channel latent.
+# Consumed by adapters/output/wan.py:Wan21OutputAdapter.from_config.
+model:
+  params:
+    dit_config:
+      params:
+        in_dim: 48
+        out_dim: 48
+        dim: 256
+        num_layers: 10
+        num_heads: 4
+        patch_size: [1, 2, 2]
+        use_step_level: true
+        step_level_transform: log2
+        condition_on_base_outputs: true

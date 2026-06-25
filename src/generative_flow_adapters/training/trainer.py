@@ -146,22 +146,30 @@ class Trainer:
         device_type = next(self.model.parameters()).device.type
         return torch.amp.autocast(device_type=device_type, dtype=self._amp_dtype)
 
-    def _flow_loss(self, prediction: Tensor, target: Tensor, batch: Mapping[str, Tensor | object]) -> Tensor:
-        """Flow-matching velocity loss, masked to predicted frames when present.
+    def _frame_masked_mse(
+        self, prediction: Tensor, target: Tensor, batch: Mapping[str, Tensor | object]
+    ) -> Tensor | None:
+        """Mean squared error over the *predicted* frames, or ``None`` when the
+        batch carries no ``frame_mask``.
 
-        Diffusion-forcing batches (Wan2.2 TI2V) carry a ``frame_mask`` that is 0
-        on the observation frame(s) — clamped clean, no velocity target — and 1
-        on the predicted future. There the loss is the mean squared velocity
-        error over the future frames only; without a mask it is the standard
-        ``loss_fn`` over the whole clip."""
+        Diffusion-forcing batches (Wan2.2 TI2V) mark observation frames with
+        ``frame_mask == 0`` — they are clamped clean and have no velocity target,
+        so every flow-path MSE term (the base velocity loss and the shortcut /
+        consistency losses, which are all plain MSE) must exclude them."""
         frame_mask = batch.get("frame_mask")
         if not isinstance(frame_mask, Tensor):
-            return self.loss_fn(prediction, target)
+            return None
         m = frame_mask.to(device=prediction.device, dtype=prediction.dtype)
         # [B, T'] -> broadcast over channels/space to [B, C, T', H, W].
         m = m.view(m.shape[0], 1, m.shape[1], 1, 1).expand_as(prediction)
         sq = (prediction.float() - target.float()) ** 2
         return (sq * m).sum() / m.sum().clamp_min(1.0)
+
+    def _flow_loss(self, prediction: Tensor, target: Tensor, batch: Mapping[str, Tensor | object]) -> Tensor:
+        """Flow-matching velocity loss, masked to predicted frames when present;
+        otherwise the standard ``loss_fn`` over the whole clip."""
+        masked = self._frame_masked_mse(prediction, target, batch)
+        return masked if masked is not None else self.loss_fn(prediction, target)
 
     def _forward_and_loss(
         self, batch: Mapping[str, Tensor | object]
@@ -259,11 +267,19 @@ class Trainer:
             batch.setdefault("shortcut_target", shortcut_target)
             batch.setdefault("self_consistency_target", shortcut_target)
 
+        # The shortcut / consistency terms are plain MSE, so on diffusion-forcing
+        # batches they get the same predicted-frame masking as the base loss
+        # (observation frames carry no target); without a frame_mask this is the
+        # registry loss unchanged.
+        def _consistency(name: str, pred: Tensor, tgt: Tensor) -> Tensor:
+            masked = self._frame_masked_mse(pred, tgt, batch)
+            return masked if masked is not None else LossRegistry.get_consistency_loss(name)(pred, tgt)
+
         if self.config.local_consistency_weight > 0.0 and "shortcut_target" in batch:
             shortcut_target = batch["shortcut_target"]
             if not isinstance(shortcut_target, Tensor):
                 raise TypeError("batch['shortcut_target'] must be a tensor.")
-            consistency = LossRegistry.get_consistency_loss("local_consistency")(prediction, shortcut_target)
+            consistency = _consistency("local_consistency", prediction, shortcut_target)
             loss_components["local_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.local_consistency_weight * consistency
 
@@ -271,7 +287,7 @@ class Trainer:
             shortcut_target = batch["shortcut_target"]
             if not isinstance(shortcut_target, Tensor):
                 raise TypeError("batch['shortcut_target'] must be a tensor.")
-            shortcut_loss = LossRegistry.get_consistency_loss("shortcut_direction")(prediction, shortcut_target)
+            shortcut_loss = _consistency("shortcut_direction", prediction, shortcut_target)
             loss_components["shortcut_direction_loss"] = float(shortcut_loss.detach().cpu())
             loss = loss + self.config.shortcut_direction_weight * shortcut_loss
 
@@ -279,7 +295,7 @@ class Trainer:
             self_consistency_target = batch["self_consistency_target"]
             if not isinstance(self_consistency_target, Tensor):
                 raise TypeError("batch['self_consistency_target'] must be a tensor.")
-            consistency = LossRegistry.get_consistency_loss("multistep_self_consistency")(prediction, self_consistency_target)
+            consistency = _consistency("multistep_self_consistency", prediction, self_consistency_target)
             loss_components["multistep_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.multistep_consistency_weight * consistency
 
@@ -994,6 +1010,10 @@ class Trainer:
         step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
         cond = batch.get("cond")
         base_cond = _strip_adapter_only_keys(cond)
+        # Carry the diffusion-forcing conditioning (observation frames + mask)
+        # into every rollout so the grid predicts the future *from the observed
+        # frame* rather than from pure noise; absent for non-DF (Wan2.1) configs.
+        df = {k: batch[k] for k in ("frame_mask", "x0") if isinstance(batch.get(k), Tensor)}
 
         adapted_by_steps: list[tuple[int, Tensor]] = []
         base_by_steps: list[tuple[int, Tensor]] = []
@@ -1005,7 +1025,7 @@ class Trainer:
                 )
                 adapted_cond = self._inject_step_level(cond, step_level_key, level)
             adapted = self.inference_sampler.sample_from_batch(
-                batch={"target": target, "cond": adapted_cond},
+                batch={"target": target, "cond": adapted_cond, **df},
                 num_inference_steps=num_steps,
                 initial_sample=shared_noise,
             )
@@ -1013,7 +1033,7 @@ class Trainer:
 
             if self.base_inference_sampler is not None:
                 base = self.base_inference_sampler.sample_from_batch(
-                    batch={"target": target, "cond": base_cond},
+                    batch={"target": target, "cond": base_cond, **df},
                     num_inference_steps=num_steps,
                     initial_sample=shared_noise,
                 )
