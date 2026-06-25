@@ -145,14 +145,24 @@ def test_wan22_diffusion_forcing_sampler_clamps_observation():
 
 _CKPT_DIR = Path(os.environ.get("WAN22_CKPT_DIR", "ckpts/Wan2.2-TI2V-5B"))
 _VAE_PTH = _CKPT_DIR / "Wan2.2_VAE.pth"
-_DIT = _CKPT_DIR / "diffusion_pytorch_model.safetensors"
 _HDF5 = Path("ds/metaworld_corner2.hdf5")
 
 
+def _dit_complete(d: Path) -> bool:
+    """True only when the full DiT is on disk: a single-file checkpoint, or every
+    shard referenced by the safetensors index (the HF/ModelScope sharded form)."""
+    if (d / "diffusion_pytorch_model.safetensors").exists():
+        return True
+    index = d / "diffusion_pytorch_model.safetensors.index.json"
+    if not index.exists():
+        return False
+    import json
+
+    shards = set(json.loads(index.read_text())["weight_map"].values())
+    return bool(shards) and all((d / s).exists() for s in shards)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Wan2.2 I2V generation.")
-@pytest.mark.skipif(not _VAE_PTH.exists(), reason=f"Wan2.2-VAE not found at {_VAE_PTH}. Set WAN22_CKPT_DIR.")
-@pytest.mark.skipif(not _DIT.exists(), reason="Wan2.2 TI2V-5B DiT not found.")
-@pytest.mark.skipif(not _HDF5.exists(), reason=f"MetaWorld HDF5 not found at {_HDF5}.")
 def test_wan22_i2v_reconstructs_future_from_observation():
     """Frozen TI2V-5B, conditioned on a real first frame via diffusion forcing,
     predicts future frames that resemble ground truth far better than an
@@ -177,12 +187,22 @@ def test_wan22_i2v_reconstructs_future_from_observation():
     config.training.extra["wandb"] = {"enable": False}
     base = build_experiment(config).model.base_model.to(device).eval()
 
+    # Pixel resolution = latent geometry × the Wan2.2-VAE spatial stride (16).
+    # Driven by the config's latent_height/width so the test matches training;
+    # override either with WAN22_PX=<latent_size> for a quick sweep (e.g.
+    # WAN22_PX=32 -> 512 px). Wan2.2-TI2V is a 720p model, so 16 (=256 px) is far
+    # below its training resolution — bump this to see clean frozen-base I2V.
+    _VAE_STRIDE = 16
+    lat_h = int(os.environ.get("WAN22_PX", config.model.extra.get("latent_height", 16)))
+    lat_w = int(os.environ.get("WAN22_PX", config.model.extra.get("latent_width", 16)))
+    px_h, px_w = lat_h * _VAE_STRIDE, lat_w * _VAE_STRIDE
+
     vae = Wan2_2_VAE(vae_pth=str(_VAE_PTH), device=device)
     translator = MetaWorldTranslator(str(_HDF5), caption_mode="empty")
     dataset = TranslatedClipDataset(translator, window_width=17, frame_stride=4, sampling="exhaustive")
     clip = torch.as_tensor(dataset[0]["video"]).permute(3, 0, 1, 2).float().div(127.5).sub(1.0)
-    clip = F.interpolate(clip, size=(256, 256), mode="bilinear", align_corners=False).to(device)
-    z0 = vae.encode([clip])[0].unsqueeze(0).float()  # [1, 48, T', 16, 16]
+    clip = F.interpolate(clip, size=(px_h, px_w), mode="bilinear", align_corners=False).to(device)
+    z0 = vae.encode([clip])[0].unsqueeze(0).float()  # [1, 48, T', lat_h, lat_w]
     gt_px = vae.decode([z0[0]])[0]
 
     t_lat = z0.shape[2]

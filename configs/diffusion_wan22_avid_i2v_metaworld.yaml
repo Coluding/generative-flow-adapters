@@ -1,0 +1,90 @@
+# Wan2.2-TI2V-5B (flow matching, diffusion forcing) + AVID-style action adapter
+# (a small action-conditioned Wan DiT delta), trained on MetaWorld as an
+# action-conditioned world model with shortcut self-consistency.
+#
+# Same diffusion-forcing base as diffusion_wan22_i2v_metaworld.yaml (frozen
+# TI2V-5B conditions on the observation frame natively), but the adapter is the
+# AVID-style `backbone: wan` delta instead of the output_head transformer, and
+# shortcut self-consistency is ON. Run with scripts/train_wan22_i2v_metaworld.py
+# (it builds the Wan2.2-VAE + the diffusion-forcing preprocessor).
+#
+# PREREQUISITES: Wan2.2-TI2V-5B DiT + Wan2.2_VAE.pth in the ckpt dir.
+
+name: diffusion_wan22_avid_i2v_metaworld
+
+data:
+  frame_stride: 4
+  fs_value: 1
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  # pretrained_model_name_or_path: ckpts/Wan2.2-TI2V-5B
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    # Wan2.2-VAE latent geometry (vae_stride = (4, 16, 16), z_dim = 48).
+    latent_channels: 48
+    temporal_length: 17      # pixel-frame window -> 5 latent frames at stride 4
+    latent_height: 16        # 256 px. Bump to 32 (512 px) for a sharper eval grid
+    latent_width: 16         # (more GPU memory; the eval looks washed at 256 px).
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 48            # Wan2.2 latent channel count
+  extra:
+    backbone: wan            # AVID-style: a small action-conditioned Wan DiT delta
+    wan_adapter_config_path: configs/base/wan_adapter_11m_48ch.yaml
+    condition_on_base_outputs: true
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_transform: log2
+    action_dropout_prob: 0.0
+
+conditioning:
+  type: action
+  input_dim: 4             # MetaWorld action dimension
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
+  shortcut_target_method: distillation
+  # Eval video grid logged every 300 steps: rows are sampling-step counts,
+  # columns [GT | base | adapted], conditioned on the observation frame. Three
+  # clips per grid (num_samples).
+  inference_every_n_steps: 300
+  inference_num_steps: 50
+  extra:
+    amp_dtype: bf16                  # autocast (NOT model dtype) — see bf16 memory note
+    use_batch_timesteps_for_flow: true  # use the (x_t,t,target) the diffusion-forcing preprocessor builds
+    flow_timestep_scale: 1000            # model fed t = sigma*scale (Wan native [0,1000])
+    cond_frames: 1                       # leading observation frames held clean
+    shortcut_anchor_prob: 0.6            # P(anchor step: standard flow loss only, no shortcut target)
+    # Paper-faithful shortcut step schedule (normalised s ∈ (0,1], log2 ladder).
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    # Multi-step shortcut eval grid (incl. the 25-step many-step reference).
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+    wandb:
+      enable: true
+      require_vae: false                # Wan2.2-VAE injected at runtime
+      project: wan22-avid-i2v-metaworld
+      num_samples: 3                    # three clips logged per eval grid
+      fps: 8

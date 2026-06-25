@@ -153,7 +153,12 @@ def compute_self_consistency_target_v_flow(
         with torch.no_grad():
             v1 = model(x_t, t, cond_half)
             x_mid = flow_micro_step_v(x=x_t, v=v1, d=d)
-            t_next = (t - d * timestep_scale).clamp_min(0.0)
+            # `d` is per-sample [B]; reshape it to broadcast against `t`, which is
+            # per-sample [B] (uniform-timestep flow) or per-latent-frame [B, T']
+            # (Wan2.2 diffusion forcing). The observation frames sit at t=0 and
+            # clamp_min keeps them there.
+            d_t = d.view(-1, *([1] * (t.dim() - 1))) if isinstance(d, Tensor) else d
+            t_next = (t - d_t * timestep_scale).clamp_min(0.0)
             v2 = model(x_mid, t_next, cond_half)
     finally:
         model.train(was_training)
