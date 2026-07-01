@@ -68,9 +68,15 @@ def main() -> None:
     target_height = latent_height * 8  # Wan-VAE spatial stride
     target_width = latent_width * 8
 
-    # Point the frozen base at the real DiT weights when available.
+    # Point the frozen base at the real DiT weights when available. Accept both
+    # the single-file layout (Wan2.1-1.3B: diffusion_pytorch_model.safetensors)
+    # and the HF-sharded layout (Wan2.2-TI2V-5B: diffusion_pytorch_model-0000N-of-*
+    # .safetensors); the Wan wrapper's loader globs *.safetensors over the dir.
     ckpt_dir = Path(args.ckpt_dir)
-    if (ckpt_dir / "diffusion_pytorch_model.safetensors").exists():
+    has_dit_weights = (ckpt_dir / "diffusion_pytorch_model.safetensors").exists() or bool(
+        list(ckpt_dir.glob("diffusion_pytorch_model-*.safetensors"))
+    )
+    if has_dit_weights:
         config.model.pretrained_model_name_or_path = str(ckpt_dir)
         config.model.extra["allow_missing_checkpoint"] = False
     experiment = build_experiment(config)

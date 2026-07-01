@@ -59,10 +59,11 @@ def main() -> None:
         default="ckpts/Wan2.2-TI2V-5B",
         help="Wan2.2 checkpoint dir (Wan2.2_VAE.pth + DiT safetensors). Loads real weights when present.",
     )
-    parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=8)
+
+    parser.add_argument("--steps", type=int, default=100_000)
+    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--frame-stride", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)

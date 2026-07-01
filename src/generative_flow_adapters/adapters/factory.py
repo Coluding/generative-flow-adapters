@@ -225,9 +225,16 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
         # cond_dim is the fused embedding width from the condition encoder.
         if not cond_dim or cond_dim <= 0:
             raise ValueError("Wan output adapter needs a positive conditioning.output_dim (the fused embedding width).")
+        # The latent channel count is a property of the base VAE (Wan2.1: 16,
+        # Wan2.2-TI2V: 48), not the adapter tier file (which only sets width/depth).
+        # Thread feature_dim through as in_dim/out_dim so the patch-embed matches
+        # the real latents; falls back to the tier file's value when unset.
+        latent_channels = int(feature_dim) if feature_dim else None
         return Wan21OutputAdapter.from_config(
             wan_adapter_config_path=wan_adapter_config_path,
             cond_dim=cond_dim,
+            in_dim=latent_channels,
+            out_dim=latent_channels,
             condition_on_base_outputs=adapter.extra.get("condition_on_base_outputs"),
             use_step_level=adapter.extra.get("use_step_level_conditioning"),
             step_level_key=adapter.extra.get("step_level_key"),

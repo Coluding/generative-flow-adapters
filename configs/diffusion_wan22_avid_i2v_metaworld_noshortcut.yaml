@@ -1,22 +1,25 @@
-# Wan2.2-TI2V-5B (flow matching, diffusion forcing) + AVID-style action adapter
-# (a small action-conditioned Wan DiT delta), trained on MetaWorld as an
-# action-conditioned world model with shortcut self-consistency.
+# Wan2.2-TI2V-5B (flow matching, diffusion forcing) + AVID-style action adapter,
+# trained as a PLAIN action-conditioned world model — NO shortcut self-consistency.
 #
-# Same diffusion-forcing base as diffusion_wan22_i2v_metaworld.yaml (frozen
-# TI2V-5B conditions on the observation frame natively), but the adapter is the
-# AVID-style `backbone: wan` delta instead of the output_head transformer, and
-# shortcut self-consistency is ON. Run with scripts/train_wan22_i2v_metaworld.py
-# (it builds the Wan2.2-VAE + the diffusion-forcing preprocessor).
+# Ablation companion to diffusion_wan22_avid_i2v_metaworld.yaml: identical frozen
+# TI2V-5B base, identical AVID-style `backbone: wan` delta and action
+# conditioning, but the shortcut consistency loss is OFF. The mechanism is
+# `shortcut_anchor_prob: 1.0` — every training step is an "anchor" step, so the
+# trainer never synthesises a shortcut target and the only supervision is the
+# standard flow-matching loss (see Trainer._maybe_prepare_shortcut). step_level
+# conditioning stays wired (clamped to the smallest rung) so the adapter keeps
+# its expected input; it simply receives a constant.
+#
+# Run with scripts/train_wan22_i2v_metaworld.py (Wan2.2-VAE + diffusion-forcing
+# preprocessor).
 #
 # PREREQUISITES: Wan2.2-TI2V-5B DiT + Wan2.2_VAE.pth in the ckpt dir.
 
-name: diffusion_wan22_avid_i2v_metaworld
+name: diffusion_wan22_avid_i2v_metaworld_noshortcut
 
 data:
   frame_stride: 1
   fs_value: 1
-  val_fraction: 0.01
-  # eval_hdf5: ds/metaworld_corner2_val.hdf5
 
 model:
   type: flow
@@ -30,7 +33,7 @@ model:
     dtype: bf16
     # Wan2.2-VAE latent geometry (vae_stride = (4, 16, 16), z_dim = 48).
     latent_channels: 48
-    temporal_length: 121      # pixel-frame window -> 5 latent frames at stride 4
+    temporal_length: 121     # pixel-frame window -> 5 latent frames at stride 4
     latent_height: 16        # 256 px. Bump to 32 (512 px) for a sharper eval grid
     latent_width: 16         # (more GPU memory; the eval looks washed at 256 px).
 
@@ -57,45 +60,32 @@ training:
   loss: flow_matching
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
-  shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
+  # --- Shortcut self-consistency DISABLED ------------------------------------
+  # anchor_prob=1.0 -> every step is a standard flow-matching step, no shortcut
+  # target is ever built, so shortcut_direction_weight has nothing to act on.
+  shortcut_direction_weight: 1.0
   shortcut_target_method: distillation
+  # Eval video grid logged every 300 steps: rows are sampling-step counts,
+  # columns [GT | base | adapted], conditioned on the observation frame. Three
+  # clips per grid (num_samples).
   inference_every_n_steps: 300
-  eval_every_n_steps: 5
   inference_num_steps: 50
-  # Paired generative-quality metrics scored on decoded pixels vs the aligned
-  # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
-  # and the frozen-base rollout are scored, so wandb shows the base→adapted
-  # delta. Cheap (torchmetrics); needs the runtime VAE decoder + an eval_loader
-  # (--eval-hdf5 or data.val_fraction). Rollout uses quality_eval_num_steps.
-  quality_metrics: [psnr, ssim, lpips, mse]
-  quality_eval_num_batches: 4
-  quality_eval_num_steps: 10          # cheaper sampler than the 50-step video panel
-  # Distribution metrics (per-frame FID + clip FVD) on their own rarer cadence —
-  # they load Inception / I3D and only mean anything over many samples, so they
-  # stay off the per-cycle path. Needs cd-fvd installed.
-  quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 3
-  quality_dist_num_batches: 16
-
   extra:
     amp_dtype: bf16                  # autocast (NOT model dtype) — see bf16 memory note
     use_batch_timesteps_for_flow: true  # use the (x_t,t,target) the diffusion-forcing preprocessor builds
     flow_timestep_scale: 1000            # model fed t = sigma*scale (Wan native [0,1000])
-    cond_frames: 1                       # eval/no-dist: leading observation frames held clean
-    cond_frames_dist:
-      1: 0.4
-      2: 0.3
-      4: 0.2
-      8: 0.1
-    shortcut_anchor_prob: 0.6            # P(anchor step: standard flow loss only, no shortcut target)
-    # Paper-faithful shortcut step schedule (normalised s ∈ (0,1], log2 ladder).
+    cond_frames: 1                       # leading observation frames held clean
+    shortcut_anchor_prob: 1.0            # 1.0 => no shortcut target ever (consistency loss off)
+    # Step ladder is kept so step_level conditioning has a defined (smallest)
+    # rung to clamp to on every anchor step; it no longer drives any loss.
     shortcut_step_schedule:
       units: normalized
       mode: log2
       min: 1/128
       max: 1
       base: 2
-    # Multi-step shortcut eval grid (incl. the 25-step many-step reference).
+    # Multi-step eval grid (incl. the 25-step many-step reference). Pure eval
+    # diagnostic — unaffected by the shortcut loss being off.
     eval_step_schedule:
       - {num_steps: 1,  step_level: 1.0}
       - {num_steps: 2,  step_level: 0.5}
@@ -104,10 +94,10 @@ training:
       - {num_steps: 25, step_level: 0.04}
       - {num_steps: 50, step_level: 0.02}
       - {num_steps: 100, step_level: 0.01}
-
+      
     wandb:
       enable: true
       require_vae: false                # Wan2.2-VAE injected at runtime
-      project: wan22-avid-i2v-metaworld34
+      project: wan22-avid-i2v-metaworld-noshortcut34
       num_samples: 3                    # three clips logged per eval grid
       fps: 3
