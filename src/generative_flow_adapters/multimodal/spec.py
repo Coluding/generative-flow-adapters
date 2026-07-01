@@ -45,6 +45,10 @@ class OutputModalitySpec:
             (e.g. ``(7,)`` for proprio, ``(2, 64, 64)`` for tactile). For
             ``video`` it is inferred by the output adapter and may be empty.
         hidden_dim: width of this modality's prediction head.
+        visualize: when ``True``, the eval loop rolls out this modality (full
+            reverse diffusion) and logs predicted-vs-ground-truth at the eval
+            cadence. Best for low-dim streams (e.g. ``proprio``); video is not
+            supported here (use the video eval grid instead).
         adapter: extra knobs for the ``video`` head (forwarded into the output
             adapter factory's ``AdapterConfig.extra``); unused for other kinds.
         codec_kwargs: extra knobs for the codec (e.g. ``mean``/``std`` for
@@ -59,6 +63,7 @@ class OutputModalitySpec:
     codec: str = "identity"
     feature_shape: tuple[int, ...] = ()
     hidden_dim: int = 128
+    visualize: bool = False
     adapter: dict[str, Any] = field(default_factory=dict)
     codec_kwargs: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)

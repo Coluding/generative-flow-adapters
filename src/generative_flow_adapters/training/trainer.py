@@ -18,6 +18,7 @@ from generative_flow_adapters.training.shortcut_targets import (
     compute_self_consistency_target_v_flow,
     ddim_micro_step_v,
 )
+from generative_flow_adapters.training.quality_metrics import QualityMetricSuite
 from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
 
 
@@ -465,6 +466,19 @@ class Trainer:
                     )
                 if eval_loader is not None and self._cadence_due(self.config.eval_every_n_steps):
                     self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
+                if (
+                    eval_loader is not None
+                    and self.config.quality_dist_metrics
+                    and self._cadence_due(self.config.quality_dist_every_n_steps)
+                ):
+                    self._run_quality_eval(
+                        eval_loader,
+                        preprocessor=preprocessor,
+                        metric_names=self.config.quality_dist_metrics,
+                        num_batches=self.config.quality_dist_num_batches,
+                        num_steps=self.config.quality_eval_num_steps or self.config.inference_num_steps,
+                        log=log_every > 0,
+                    )
                 if self._cadence_due(self.config.checkpoint_every_n_steps):
                     self._save_checkpoint(log=log_every > 0)
 
@@ -530,7 +544,141 @@ class Trainer:
             )
             if log:
                 print(f"  new best {metric_key}={value:.5f} -> {path}")
+        # Paired quality metrics (psnr/ssim/...) on every eval cycle — cheap,
+        # reliable, scored vs aligned ground truth. Distribution metrics
+        # (fid/fvd) run on their own rarer cadence from the train loop.
+        if self.config.quality_metrics:
+            self._run_quality_eval(
+                eval_loader,
+                preprocessor=preprocessor,
+                metric_names=self.config.quality_metrics,
+                num_batches=self.config.quality_eval_num_batches,
+                num_steps=self.config.quality_eval_num_steps or self.config.inference_num_steps,
+                log=log,
+            )
         return eval_metrics
+
+    @torch.no_grad()
+    def _generate_eval_rollout(
+        self, batch: Mapping[str, Tensor | object], *, num_steps: int
+    ) -> tuple[Tensor, Tensor | None, Tensor] | None:
+        """Sample the adapted (and, when available, frozen-base) rollout from a
+        shared starting noise, returning ``(adapted, base_or_none, ground_truth)``
+        as clean latents. Mirrors the sampling in ``_maybe_generate_samples`` but
+        decoupled from wandb logging, for scoring quality metrics.
+
+        Returns ``None`` when the batch carries no ``target`` (nothing to sample).
+        """
+        target = batch.get("target")
+        if not isinstance(target, Tensor):
+            return None
+        # Clean latent z0 for the GT panel on flow batches (where `target` is the
+        # velocity); fall back to `target` for diffusion.
+        ground_truth = batch.get("x0")
+        if not isinstance(ground_truth, Tensor):
+            ground_truth = target
+
+        shared_noise = torch.randn_like(target)
+        adapted = self.inference_sampler.sample_from_batch(
+            batch=batch, num_inference_steps=num_steps, initial_sample=shared_noise
+        )
+        base = None
+        if self.base_inference_sampler is not None:
+            base_cond = _strip_adapter_only_keys(batch.get("cond"))
+            base_batch: dict[str, Tensor | object] = {"target": target, "cond": base_cond}
+            # Carry diffusion-forcing conditioning into the base rollout so the
+            # no-adapter baseline sees the same observation as the adapted one.
+            for key in ("frame_mask", "x0"):
+                if isinstance(batch.get(key), Tensor):
+                    base_batch[key] = batch[key]
+            base = self.base_inference_sampler.sample_from_batch(
+                batch=base_batch, num_inference_steps=num_steps, initial_sample=shared_noise
+            )
+        return adapted, base, ground_truth
+
+    @torch.no_grad()
+    def _run_quality_eval(
+        self,
+        eval_loader: Iterable,
+        *,
+        preprocessor: Callable[..., Mapping[str, object]] | None,
+        metric_names: list[str],
+        num_batches: int,
+        num_steps: int,
+        log: bool,
+    ) -> dict[str, float]:
+        """Score generative-visual quality metrics on decoded eval rollouts.
+
+        Generates samples for up to ``num_batches`` held-out batches, decodes
+        latents to pixels via the wandb logger's VAE decoder, and accumulates the
+        requested ``metric_names`` (see :mod:`.quality_metrics`) for both the
+        adapted and frozen-base rollouts. No-op (returns ``{}``) unless a decoder
+        and an inference sampler are both available. Logged separately from the
+        loss eval — these do not drive ``best.pt`` selection.
+        """
+        if not metric_names:
+            return {}
+        decoder = self.wandb_logger if getattr(self.wandb_logger, "can_decode", False) else None
+        if decoder is None:
+            return {}
+        if getattr(self.model, "model_type", None) not in ("diffusion", "flow", "flow_matching"):
+            return {}
+
+        device = next(self.model.parameters()).device
+        suites: dict[str, QualityMetricSuite] = {}
+
+        def _suite_for(variant: str, num_frames: int) -> QualityMetricSuite:
+            if variant not in suites:
+                suites[variant] = QualityMetricSuite(
+                    metric_names, device=device, num_video_frames=num_frames
+                )
+            return suites[variant]
+
+        was_training = self.model.training
+        self.model.eval()
+        count = 0
+        try:
+            for raw_batch in eval_loader:
+                if count >= num_batches:
+                    break
+                batch = (
+                    _call_preprocessor(preprocessor, raw_batch, train=False)
+                    if preprocessor is not None
+                    else raw_batch
+                )
+                rollout = self._generate_eval_rollout(batch, num_steps=num_steps)
+                if rollout is None:
+                    continue
+                adapted, base, ground_truth = rollout
+                gt_px = decoder.decode_to_uint8(ground_truth)
+                adapted_px = decoder.decode_to_uint8(adapted)
+                if gt_px is None or adapted_px is None:
+                    return {}
+                num_frames = adapted_px.shape[1]
+                _suite_for("adapted", num_frames).update(adapted_px, gt_px)
+                if base is not None:
+                    base_px = decoder.decode_to_uint8(base)
+                    if base_px is not None:
+                        _suite_for("base", num_frames).update(base_px, gt_px)
+                count += 1
+        finally:
+            self.model.train(was_training)
+
+        if not suites:
+            return {}
+        results: dict[str, float] = {}
+        for variant, suite in suites.items():
+            results.update(suite.compute(prefix=f"eval/{variant}"))
+        if not results:
+            return {}
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_metrics(results, step=self.global_step)
+        if self.jsonl_logger is not None:
+            self.jsonl_logger.log(results, step=self.global_step, split="eval")
+        if log:
+            summary = " ".join(f"{k}={v:.4f}" for k, v in sorted(results.items()))
+            print(f"  quality step={self.global_step} ({count} batches) {summary}")
+        return results
 
     def _save_checkpoint(
         self,
@@ -933,6 +1081,10 @@ class Trainer:
         if self.global_step % self.config.inference_every_n_steps - 1 != 0:
             return None
 
+        cond_ks = self._eval_cond_frames()
+        if cond_ks and isinstance(batch.get("x0"), Tensor) and isinstance(batch.get("frame_mask"), Tensor):
+            return self._generate_cond_frames_grid(batch=batch, ks=cond_ks)
+
         schedule = self._eval_step_schedule()
         if schedule:
             return self._generate_step_size_grid(batch=batch, schedule=schedule)
@@ -1047,6 +1199,121 @@ class Trainer:
             step=self.global_step,
         )
         return adapted_by_steps[-1][1] if adapted_by_steps else None
+
+    def _eval_cond_frames(self) -> list[int]:
+        """Number of clean observation frames ``k`` to sweep in the eval video
+        grid (diffusion forcing). Read from ``training.extra.eval_cond_frames``
+        or, for convenience, ``training.extra.wandb.eval_cond_frames``. Empty
+        (the default) means no sweep — the single-panel path is used."""
+        raw = self.config.extra.get("eval_cond_frames")
+        if raw is None:
+            wandb_cfg = self.config.extra.get("wandb")
+            if isinstance(wandb_cfg, Mapping):
+                raw = wandb_cfg.get("eval_cond_frames")
+        if not raw:
+            return []
+        return [int(k) for k in raw]
+
+    @staticmethod
+    def _df_frame_mask(reference: Tensor, k: int) -> Tensor:
+        """Build a diffusion-forcing ``[B, T']`` frame mask holding the first
+        ``k`` latent frames clean (0 = observation, 1 = predicted). ``k`` is
+        clamped to ``[0, T'-1]`` so at least one predicted frame remains."""
+        batch_size, t_lat = reference.shape[0], reference.shape[2]
+        kk = max(0, min(int(k), t_lat - 1)) if t_lat > 1 else 0
+        idx = torch.arange(t_lat, device=reference.device)
+        mask = (idx >= kk).to(dtype=reference.dtype)  # [T']
+        return mask.unsqueeze(0).expand(batch_size, t_lat).contiguous()
+
+    def _generate_cond_frames_grid(
+        self,
+        *,
+        batch: Mapping[str, Tensor | object],
+        ks: list[int],
+    ) -> Tensor | None:
+        """Sample the adapted model over a 2-D grid — **columns** sweep the
+        history length ``k`` (numbers of clean observation frames), **rows** sweep
+        the sampling step count ``N`` from ``eval_step_schedule`` — and log
+        ``[gt | base | adapted@k1 | adapted@k2 | …]`` per row.
+
+        For each row the row's ``step_level`` (if any) is injected into the
+        adapted cond so the shortcut adapter knows which horizon it is
+        approximating; the base never sees ``step_level``. The base column is a
+        single reference at the eval ``cond_frames`` (the batch's own
+        ``frame_mask``); each adapted column re-clamps the first ``k`` frames
+        clean. All rollouts share one noise draw so differences are purely
+        conditioning-/step-driven. When no ``eval_step_schedule`` is set there is
+        a single row at ``inference_num_steps`` (no vertical sweep). Returns the
+        last adapted sample or ``None`` when prerequisites are missing."""
+        target = batch.get("target")
+        x0 = batch.get("x0")
+        if self.wandb_logger is None or not isinstance(target, Tensor) or not isinstance(x0, Tensor):
+            return None
+
+        shared_noise = torch.randn_like(target)
+        cond = batch.get("cond")
+        base_cond = _strip_adapter_only_keys(cond)
+        step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
+        base_frame_mask = batch.get("frame_mask") if isinstance(batch.get("frame_mask"), Tensor) else None
+
+        # Columns: dedup clamped k once so every row shows the same history
+        # lengths (k=4 and k=8 collapse on a short clip).
+        t_lat = x0.shape[2]
+        kk_list: list[int] = []
+        seen: set[int] = set()
+        for k in ks:
+            kk = max(0, min(int(k), t_lat - 1)) if t_lat > 1 else 0
+            if kk not in seen:
+                seen.add(kk)
+                kk_list.append(kk)
+
+        # Rows: the sampling-step schedule (few-step vs many-step). Absent → a
+        # single row at inference_num_steps with no step_level injection.
+        schedule = self._eval_step_schedule()
+        have_schedule = bool(schedule)
+        if not have_schedule:
+            schedule = [(self.config.inference_num_steps, None)]
+
+        rows: list[tuple[int | None, Tensor | None, list[tuple[int, Tensor]]]] = []
+        last_adapted: Tensor | None = None
+        for num_steps, step_level in schedule:
+            # Base reference for this row (at the eval conditioning).
+            base_samples = None
+            if self.base_inference_sampler is not None:
+                base_batch: dict[str, Tensor | object | None] = {"target": target, "cond": base_cond, "x0": x0}
+                if base_frame_mask is not None:
+                    base_batch["frame_mask"] = base_frame_mask
+                base_samples = self.base_inference_sampler.sample_from_batch(
+                    batch=base_batch, num_inference_steps=num_steps, initial_sample=shared_noise
+                )
+
+            adapted_cond = cond
+            if step_level is not None:
+                level = torch.full(
+                    (target.shape[0],), float(step_level), device=target.device, dtype=target.dtype
+                )
+                adapted_cond = self._inject_step_level(cond, step_level_key, level)
+
+            adapted_by_k: list[tuple[int, Tensor]] = []
+            for kk in kk_list:
+                frame_mask = self._df_frame_mask(x0, kk)
+                adapted = self.inference_sampler.sample_from_batch(
+                    batch={"target": target, "cond": adapted_cond, "frame_mask": frame_mask, "x0": x0},
+                    num_inference_steps=num_steps,
+                    initial_sample=shared_noise,
+                )
+                adapted_by_k.append((kk, adapted))
+                last_adapted = adapted
+
+            rows.append((num_steps if have_schedule else None, base_samples, adapted_by_k))
+
+        self.wandb_logger.log_cond_frames_grid(
+            target_latents=x0,
+            rows=rows,
+            cond=cond,
+            step=self.global_step,
+        )
+        return last_adapted
 
 
 def _call_preprocessor(

@@ -21,6 +21,11 @@ dependencies = [
   "open-clip-torch>=3.3.0",
   "h5py>=3.16.0",
   "moviepy>=2.2.1",
+  # Generative-visual quality metrics (training-time eval), implemented natively
+  # in training/quality_metrics.py — no external_deps. torchmetrics[image] pulls
+  # torch-fidelity (FID) + lpips; cd-fvd provides FVD (i3d / VideoMAE).
+  "torchmetrics[image]>=1.4",
+  "cd-fvd>=0.1",
 ]
 
 [project.optional-dependencies]

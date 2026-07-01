@@ -13,8 +13,10 @@
 name: diffusion_wan22_avid_i2v_metaworld
 
 data:
-  frame_stride: 4
+  frame_stride: 1          # contiguous frames -> motion stays in the base model's 24fps distribution
   fs_value: 1
+  val_fraction: 0.01
+  # eval_hdf5: ds/metaworld_corner2_val.hdf5
 
 model:
   type: flow
@@ -28,7 +30,7 @@ model:
     dtype: bf16
     # Wan2.2-VAE latent geometry (vae_stride = (4, 16, 16), z_dim = 48).
     latent_channels: 48
-    temporal_length: 17      # pixel-frame window -> 5 latent frames at stride 4
+    temporal_length: 121     # pixel-frame window -> 31 latent frames (t_lat = 1 + (121-1)/4); matches base Wan2.2 native 121f
     latent_height: 16        # 256 px. Bump to 32 (512 px) for a sharper eval grid
     latent_width: 16         # (more GPU memory; the eval looks washed at 256 px).
 
@@ -57,16 +59,34 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
-  # Eval video grid logged every 300 steps: rows are sampling-step counts,
-  # columns [GT | base | adapted], conditioned on the observation frame. Three
-  # clips per grid (num_samples).
   inference_every_n_steps: 300
+  eval_every_n_steps: 5
   inference_num_steps: 50
+  # Paired generative-quality metrics scored on decoded pixels vs the aligned
+  # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
+  # and the frozen-base rollout are scored, so wandb shows the base→adapted
+  # delta. Cheap (torchmetrics); needs the runtime VAE decoder + an eval_loader
+  # (--eval-hdf5 or data.val_fraction). Rollout uses quality_eval_num_steps.
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 10          # cheaper sampler than the 50-step video panel
+  # Distribution metrics (per-frame FID + clip FVD) on their own rarer cadence —
+  # they load Inception / I3D and only mean anything over many samples, so they
+  # stay off the per-cycle path. Needs cd-fvd installed.
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 3
+  quality_dist_num_batches: 16
+
   extra:
     amp_dtype: bf16                  # autocast (NOT model dtype) — see bf16 memory note
     use_batch_timesteps_for_flow: true  # use the (x_t,t,target) the diffusion-forcing preprocessor builds
     flow_timestep_scale: 1000            # model fed t = sigma*scale (Wan native [0,1000])
-    cond_frames: 1                       # leading observation frames held clean
+    cond_frames: 1                       # eval/no-dist: leading observation frames held clean
+    cond_frames_dist:
+      1: 0.4
+      2: 0.3
+      4: 0.2
+      8: 0.1
     shortcut_anchor_prob: 0.6            # P(anchor step: standard flow loss only, no shortcut target)
     # Paper-faithful shortcut step schedule (normalised s ∈ (0,1], log2 ladder).
     shortcut_step_schedule:
@@ -82,9 +102,11 @@ training:
       - {num_steps: 4,  step_level: 0.25}
       - {num_steps: 8,  step_level: 0.125}
       - {num_steps: 25, step_level: 0.04}
+      - { num_steps: 50, step_level: 0.02 }
     wandb:
       enable: true
-      require_vae: false                # Wan2.2-VAE injected at runtime
+      require_vae: false
       project: wan22-avid-i2v-metaworld
-      num_samples: 3                    # three clips logged per eval grid
+      num_samples: 3
       fps: 8
+      eval_cond_frames: [1, 2, 4]

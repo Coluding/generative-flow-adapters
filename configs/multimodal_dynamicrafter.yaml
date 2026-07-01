@@ -46,13 +46,14 @@ adapter:
   composition: avid_mask_mix
   gate_bias: 0.0
   extra:
-    # `fusion: trivial` -> only the real video adapter contributes to the video
-    # stream (standard additive composition). NOTE: `fusion: compositional` is
-    # NOT yet supported on a real backbone — the builder wires the per-modality
-    # video-adjustment heads as ModalityPredictionHead(video_spec.feature_shape),
-    # which assumes the dummy "video-as-vector" substrate and has no notion of
-    # the (B,C,T,H,W) DynamiCrafter latent layout. See thesis-vault.
-    fusion: trivial
+    # `fusion: compositional` on a real backbone realises the converged design
+    # (thesis-vault, 2026-06-19): each modality is encoded into context tokens
+    # (ModalityEncoder) appended to this adapter's `context`, so its existing
+    # cross-attention emits a modality-aware video Δ (video←m); pooled base video
+    # features (VideoReadout) are folded into the modality heads' conditioning
+    # (m←video). The frozen base + 11M adapter UNet are untouched.
+    # `fusion: trivial` -> only the real video adapter contributes (additive).
+    fusion: compositional
     architecture: dynamicrafter
     unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
     condition_on_base_outputs: true
@@ -84,6 +85,13 @@ training:
   log_metrics_jsonl: true
   extra:
     amp_dtype: bf16
+    # Eval-time modality rollout (full reverse diffusion) + pred-vs-GT viz.
+    # Fires every N steps on a fixed eval batch; only modalities with
+    # `visualize: true` below are rolled out. 0 disables.
+    eval_every_n_steps: 500
+    eval_num_inference_steps: 50
+    eval_video_cond_t: 50      # teacher-force GT video at this reference timestep for m←video
+    eval_num_samples: 2
 
 # --- multimodal extension: the coupled output streams -----------------------
 output_modalities:
@@ -99,6 +107,7 @@ output_modalities:
     codec: identity
     loss_weight: 0.5
     hidden_dim: 128
+    visualize: true     # roll out + plot predicted-vs-GT proprio at eval cadence
   - name: tactile
     kind: map
     feature_shape: [2, 16, 16]

@@ -14,9 +14,12 @@ remaining streams from the clip batch.
 Differences vs. the AVID shortcut trainer (the multimodal trainer is leaner):
     - no shortcut / step-level supervision (the multimodal line shelves it);
     - no periodic eval loop or checkpoint-resume (not implemented on
-      ``MultiModalTrainer`` yet) — JSONL metrics + step checkpoints only;
-    - ``fusion: compositional`` is dummy-base-only for now, so a real run uses
-      ``fusion: trivial`` (see configs/multimodal_dynamicrafter.yaml).
+      ``MultiModalTrainer`` yet) — scalar metrics (stdout + JSONL, and W&B with
+      ``--wandb``) + step checkpoints only;
+    - ``fusion: compositional`` now works on the real backbone via context
+      injection (modality tokens appended to the adapter's cross-attention +
+      a pooled-video readout into the modality heads); ``fusion: trivial`` stays
+      available as the additive baseline (see configs/multimodal_dynamicrafter.yaml).
 
 The clip dataset must actually emit the non-video modalities named in the
 config's ``output_modalities`` (``proprio`` / ``tactile`` are OPTIONAL MetaWorld
@@ -94,7 +97,7 @@ def _build_run_io(config) -> tuple[object | None, object | None]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/multimodal_metaworld.yaml")
+    parser.add_argument("--config", default="configs/multimodal_dynamicrafter.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2_large.hdf5")
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -179,6 +182,17 @@ def main() -> None:
         type=int,
         default=None,
         help="Keep only the most recent K step checkpoints (final is kept). Overrides config.",
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Log scalar metrics (total + per-modality denoising losses) to Weights & Biases.",
+    )
+    parser.add_argument("--wandb-project", default="multimodal-world-model", help="W&B project name.")
+    parser.add_argument(
+        "--wandb-run-name",
+        default=None,
+        help="W&B run name (defaults to the config name).",
     )
     args = parser.parse_args()
 
@@ -329,11 +343,30 @@ def main() -> None:
         drop_last=True,
     )
 
+    wandb_logger = None
+    if args.wandb:
+        from generative_flow_adapters.training.wandb_logger import WandbLogger
+
+        # Scalar-only logging: the per-modality denoising losses + total go to
+        # wandb under the `train/` prefix (loss, loss_video, loss_proprio, ...).
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name or config.base.name,
+            config={
+                "config": args.config,
+                "steps": args.steps,
+                "batch_size": args.batch_size,
+                "fusion": str(config.base.adapter.extra.get("fusion", "compositional")),
+                "streams": {s.name: s.loss_weight for s in config.output_modalities},
+            },
+        )
+
     trainer = MultiModalTrainer(
         model,
         components.optimizer,
         training,
         config.output_modalities,
+        wandb_logger=wandb_logger,
         jsonl_logger=jsonl_logger,
         checkpoint_manager=checkpoint_manager,
     )
@@ -354,11 +387,42 @@ def main() -> None:
     print(f"output_dir={training.output_dir}")
     print(f"checkpoints: every={training.checkpoint_every_n_steps} keep_last={training.keep_last_checkpoints}")
 
+    # Eval-time modality rollout + predicted-vs-GT visualization (config-driven).
+    # Plugs into the trainer's on_step hook; fires on a fixed eval batch at the
+    # configured cadence for modalities flagged `visualize: true`.
+    extra = training.extra or {}
+    eval_every = int(extra.get("eval_every_n_steps", 0))
+    on_step = None
+    visualize_streams = [s.name for s in config.output_modalities if getattr(s, "visualize", False)]
+    if eval_every > 0 and visualize_streams:
+        from generative_flow_adapters.multimodal.eval import MultiModalEvaluator
+
+        evaluator = MultiModalEvaluator(
+            model=model,
+            objective=trainer.objective,
+            video_objective=trainer.video_objective,
+            prediction_type=getattr(model, "prediction_type", "noise"),
+            specs=config.output_modalities,
+            codecs=components.codecs,
+            eval_batch=preprocessor(next(iter(loader))),
+            every_n_steps=eval_every,
+            num_inference_steps=int(extra.get("eval_num_inference_steps", 50)),
+            video_cond_t=int(extra.get("eval_video_cond_t", 50)),
+            num_samples=int(extra.get("eval_num_samples", 1)),
+            wandb_logger=wandb_logger,
+            out_dir=training.output_dir,
+            video_name=config.video_modality.name,
+        )
+        on_step = evaluator.maybe_eval
+        print(f"eval: every={eval_every} steps, modalities={visualize_streams}, "
+              f"infer_steps={evaluator.num_inference_steps}")
+
     trainer.train(
         loader=loader,
         max_steps=args.steps,
         preprocessor=preprocessor,
         log_every=args.log_every,
+        on_step=on_step,
     )
 
 
