@@ -17,6 +17,12 @@ Smoke run (real Wan2.2-TI2V-5B + VAE downloaded):
         --hdf5 ds/metaworld_corner2.hdf5 \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
         --steps 5 --batch-size 1
+
+Held-out eval (periodic loss + best.pt) is config-driven: it fires when
+``training.eval_every_n_steps`` is set and a source is configured —
+``data.val_fraction`` (random split of ``data.hdf5``) or ``data.eval_hdf5`` (a
+separate leak-free file). The CLI flags ``--eval-every``/``--eval-batches``/
+``--val-fraction``/``--eval-hdf5`` override the config only when passed.
 """
 
 from __future__ import annotations
@@ -43,24 +49,71 @@ _WAN22_VAE_SPATIAL_STRIDE = 16
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/diffusion_wan22_avid_i2v_metaworld.yaml")
-    parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="Path to MetaWorld HDF5 file")
+    parser.add_argument(
+        "--hdf5",
+        default="ds/metaworld_corner2.hdf5",
+        help="Path to MetaWorld HDF5 file",
+    )
     parser.add_argument(
         "--ckpt-dir",
         default="ckpts/Wan2.2-TI2V-5B",
         help="Wan2.2 checkpoint dir (Wan2.2_VAE.pth + DiT safetensors). Loads real weights when present.",
     )
-    parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--frame-stride", type=int, default=4)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--eval-hdf5",
+        default=None,
+        help=(
+            "Path to a separate held-out MetaWorld HDF5 for eval. Overrides data.eval_hdf5 "
+            "and takes precedence over the val-fraction split (no split of the train file)."
+        ),
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of --hdf5 held out for eval via a random window-level split "
+            "(ignored when an eval HDF5 is set). 0 disables eval. Overrides data.val_fraction."
+        ),
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help="Run an eval cycle (held-out loss + best.pt) every N steps. Overrides config.",
+    )
+    parser.add_argument(
+        "--eval-batches",
+        type=int,
+        default=None,
+        help="Number of held-out batches averaged per eval cycle. Overrides config.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = load_config(args.config)
+
+    # Eval-cadence overrides (CLI wins over YAML). Eval only runs when a cadence
+    # is set *and* a held-out loader exists (a separate --eval-hdf5 or a positive
+    # --val-fraction split of the train file).
+    if args.eval_every is not None:
+        config.training.eval_every_n_steps = args.eval_every
+    if args.eval_batches is not None:
+        config.training.eval_num_batches = args.eval_batches
+    # Eval data source: config is the default, CLI overrides only when passed.
+    eval_hdf5 = args.eval_hdf5 or config.data.eval_hdf5
+    val_fraction = args.val_fraction if args.val_fraction is not None else config.data.val_fraction
+    want_eval = bool(config.training.eval_every_n_steps) and (
+        eval_hdf5 is not None or val_fraction > 0.0
+    )
 
     # Latent geometry from the config drives both the VAE resize and the model.
     temporal_length = int(config.model.extra.get("temporal_length", 17))
@@ -104,6 +157,7 @@ def main() -> None:
     condition_keys = tuple(spec.key for spec in config.conditioning.conditions if spec.key != "step_level")
     timestep_scale = float(config.training.extra.get("flow_timestep_scale", 1000.0))
     cond_frames = int(config.training.extra.get("cond_frames", 1))
+    cond_frames_dist = config.training.extra.get("cond_frames_dist")
     preprocessor = Wan22DiffusionForcingPreprocessor(
         vae=vae,
         config=WanBatchPreprocessConfig(
@@ -111,6 +165,7 @@ def main() -> None:
         ),
         condition_keys=condition_keys or ("act",),
         cond_frames=cond_frames,
+        cond_frames_dist=cond_frames_dist,
     )
 
     translator, dataset = build_metaworld_clip_dataset(
@@ -120,13 +175,48 @@ def main() -> None:
         frame_stride=args.frame_stride,
         sampling=args.sampling,
     )
+
+    # Held-out eval source. A separate --eval-hdf5 is a clean leak-free split;
+    # the --val-fraction fallback is a random window-level split of the train
+    # file, so adjacent windows from the same episode can land on opposite sides
+    # (in-distribution validation, not a leak-free test set).
+    eval_dataset = None
+    train_dataset = dataset
+    if want_eval and eval_hdf5 is not None:
+        _, eval_dataset = build_metaworld_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            hdf5=eval_hdf5,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+        )
+    elif want_eval:
+        val_len = max(args.batch_size, int(len(dataset) * val_fraction))
+        val_len = min(val_len, len(dataset) - args.batch_size)
+        if val_len >= args.batch_size:
+            generator = torch.Generator().manual_seed(args.seed)
+            train_dataset, eval_dataset = torch.utils.data.random_split(
+                dataset, [len(dataset) - val_len, val_len], generator=generator
+            )
+        else:
+            print("  warning: dataset too small for the requested val split; eval disabled.")
+
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=(dataset.sampling == "exhaustive"),
         num_workers=args.num_workers,
         drop_last=True,
     )
+    eval_loader = None
+    if eval_dataset is not None:
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=True,
+        )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -136,8 +226,23 @@ def main() -> None:
     print(f"latent geometry: {temporal_length}f -> ({target_height}x{target_width} px) -> 48-ch Wan2.2 latent")
     print(f"params trainable={trainable:,} total={total:,} ({100.0 * trainable / max(total, 1):.2f}%)")
     print(f"dataset_size={len(dataset)} | steps={args.steps} batch_size={args.batch_size}")
+    if eval_loader is not None:
+        source = f"eval_hdf5={eval_hdf5}" if eval_hdf5 is not None else f"val_split={val_fraction}"
+        print(
+            f"eval: every={config.training.eval_every_n_steps} "
+            f"batches={config.training.eval_num_batches} metric={config.training.eval_metric} "
+            f"val_size={len(eval_dataset)} ({source})"
+        )
+    else:
+        print("eval: disabled")
 
-    trainer.train(loader=loader, max_steps=args.steps, preprocessor=preprocessor, log_every=args.log_every)
+    trainer.train(
+        loader=loader,
+        max_steps=args.steps,
+        preprocessor=preprocessor,
+        log_every=args.log_every,
+        eval_loader=eval_loader,
+    )
 
 
 if __name__ == "__main__":

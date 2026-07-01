@@ -36,9 +36,13 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
     """Encode MetaWorld clips to Wan2.2 latents and build a diffusion-forcing
     (first-frame-conditioned) flow-matching batch.
 
-    ``cond_frames`` observation frames at the front of the clip are held clean
-    (timestep 0); the rest are the predicted future. Reuses the parent's VAE
-    encode, video normalisation, and action-conditioning helpers.
+    The number of leading observation frames held clean (timestep 0) is ``k``;
+    the rest are the predicted future. ``k`` is fixed to ``cond_frames`` by
+    default, but when ``cond_frames_dist`` is given, *training* draws ``k``
+    per-sample from that categorical distribution over history lengths (so the
+    model learns to roll out from a variable amount of context). *Eval* always
+    uses the fixed scalar ``cond_frames`` so the logged panel stays stable.
+    Reuses the parent's VAE encode, video normalisation, and action helpers.
     """
 
     def __init__(
@@ -47,12 +51,64 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         config: WanBatchPreprocessConfig,
         condition_keys: tuple[str, ...] = (),
         cond_frames: int = 1,
+        cond_frames_dist: Mapping[int, float] | None = None,
     ) -> None:
         super().__init__(vae=vae, config=config, condition_keys=condition_keys)
         self.cond_frames = int(cond_frames)
+        if cond_frames_dist:
+            self._cond_values, self._cond_weights = self._parse_cond_frames_dist(
+                cond_frames_dist
+            )
+        else:
+            self._cond_values = None
+            self._cond_weights = None
+
+    @staticmethod
+    def _parse_cond_frames_dist(
+        dist: Mapping[int, float] | Any,
+    ) -> tuple[list[int], list[float]]:
+        """Validate a categorical distribution over the number of clean
+        observation frames. Accepts a ``{k: weight}`` mapping (or an iterable of
+        ``(k, weight)`` pairs). Keys are non-negative ints, weights are
+        non-negative and must sum to 1."""
+        items = list(dist.items()) if isinstance(dist, Mapping) else [tuple(p) for p in dist]
+        if not items:
+            raise ValueError("cond_frames_dist must have at least one entry")
+        values: list[int] = []
+        weights: list[float] = []
+        for key, weight in items:
+            ki, wf = int(key), float(weight)
+            if ki < 0:
+                raise ValueError(f"cond_frames_dist keys (frame counts) must be >= 0, got {ki}")
+            if wf < 0:
+                raise ValueError(f"cond_frames_dist weights must be >= 0, got {wf}")
+            values.append(ki)
+            weights.append(wf)
+        total = sum(weights)
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"cond_frames_dist weights must sum to 1, got {total:.6f}")
+        return values, weights
+
+    def _sample_cond_frames(
+        self, batch_size: int, t_lat: int, train: bool, device: torch.device
+    ) -> torch.Tensor:
+        """Per-sample number of clean observation frames ``k`` as a ``[B]`` long
+        tensor, clamped so at least one predicted frame remains. Training draws
+        from ``cond_frames_dist`` when set; eval (and the no-dist case) use the
+        fixed scalar ``cond_frames``."""
+        if t_lat <= 1:
+            # No temporal future to condition on: pure generation (k = 0).
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        if train and self._cond_values is not None:
+            weights = torch.tensor(self._cond_weights, dtype=torch.float32, device=device)
+            idx = torch.multinomial(weights, batch_size, replacement=True)
+            values = torch.tensor(self._cond_values, dtype=torch.long, device=device)
+            ks = values[idx]
+        else:
+            ks = torch.full((batch_size,), self.cond_frames, dtype=torch.long, device=device)
+        return ks.clamp_(min=0, max=t_lat - 1)
 
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
-        del train
         video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
         batch_size = video.shape[0]
 
@@ -60,18 +116,19 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         z0 = torch.stack(self.vae.encode([video[i] for i in range(batch_size)]), dim=0).float()
         t_lat = z0.shape[2]
 
-        # Keep at least one predicted frame; for a single-latent-frame clip there
-        # is no temporal future to condition on (k=0 -> pure generation).
-        k = min(self.cond_frames, t_lat - 1) if t_lat > 1 else 0
+        # Per-sample number of clean observation frames (>= 1 predicted frame
+        # always remains). Training may draw it from cond_frames_dist; eval is
+        # fixed to the scalar cond_frames for a stable panel.
+        ks = self._sample_cond_frames(batch_size, t_lat, train, z0.device)  # [B] long
 
         noise = torch.randn_like(z0)
         sigma = torch.rand(batch_size, device=z0.device, dtype=z0.dtype).clamp_min(self.config.sigma_min)
         sigma_b = sigma.view(batch_size, *([1] * (z0.dim() - 1)))
 
-        # frame_mask: 1 = predicted (noised) future frame, 0 = clean observation.
-        frame_mask = torch.ones(batch_size, t_lat, device=z0.device, dtype=z0.dtype)
-        if k > 0:
-            frame_mask[:, :k] = 0.0
+        # frame_mask: 1 = predicted (noised) future frame, 0 = clean observation
+        # (the first ks[i] frames of sample i).
+        frame_idx = torch.arange(t_lat, device=z0.device).unsqueeze(0)  # [1, T']
+        frame_mask = (frame_idx >= ks.unsqueeze(1)).to(z0.dtype)        # [B, T']
         fm = frame_mask.view(batch_size, 1, t_lat, 1, 1)
 
         x_noised = (1.0 - sigma_b) * z0 + sigma_b * noise

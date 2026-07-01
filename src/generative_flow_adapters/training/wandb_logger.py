@@ -50,6 +50,22 @@ class WandbLogger:
         decoder and the script injects it here before the first eval."""
         self._decode_fn = decode_fn
 
+    @property
+    def can_decode(self) -> bool:
+        """Whether a latent->pixel decoder is attached (gates quality metrics)."""
+        return self._decode_fn is not None
+
+    @torch.no_grad()
+    def decode_to_uint8(self, latents: Tensor) -> Tensor | None:
+        """Public latent->pixel decode → uint8 ``(B, T, 3, H, W)`` on CPU.
+
+        Thin wrapper over the internal decoder so the trainer can score quality
+        metrics on decoded pixels without reaching into a private method.
+        Returns ``None`` when no decoder is attached."""
+        if self._decode_fn is None:
+            return None
+        return self._decode_to_uint8(latents)
+
     # ------------------------------------------------------------------ metrics
 
     def log_metrics(self, metrics: Mapping[str, object], step: int) -> None:
@@ -63,6 +79,59 @@ class WandbLogger:
             payload[f"{self.metrics_prefix}/{key}" if self.metrics_prefix else key] = scalar
         if payload:
             self._wandb.log(payload, step=int(step))
+
+    # ------------------------------------------------ modality prediction vs gt
+
+    def log_prediction_vs_gt(
+        self,
+        *,
+        name: str,
+        pred: Tensor,
+        gt: Tensor,
+        kind: str,
+        step: int,
+        sample_index: int = 0,
+    ) -> None:
+        """Log a rolled-out modality prediction against ground truth.
+
+        ``vector`` streams (e.g. proprio, shape ``(T, D)``) become one
+        ``line_series`` chart per dimension with ``gt`` and ``pred`` lines over
+        time. ``map`` streams (shape ``(T, C, H, W)`` / ``(T, H, W)``) log a
+        mid-clip frame as a side-by-side ``gt | pred`` image. No matplotlib.
+        """
+        pred = pred.detach().float().cpu()
+        gt = gt.detach().float().cpu()
+        tag = f"eval/{name}/sample_{sample_index}"
+
+        if kind == "vector":
+            t_len = pred.shape[0]
+            xs = list(range(t_len))
+            pred2 = pred.reshape(t_len, -1)
+            gt2 = gt.reshape(t_len, -1)
+            panels = {
+                f"{tag}/dim_{d}": self._wandb.plot.line_series(
+                    xs=xs,
+                    ys=[gt2[:, d].tolist(), pred2[:, d].tolist()],
+                    keys=["gt", "pred"],
+                    title=f"{name}[{d}] (sample {sample_index})",
+                    xname="frame",
+                )
+                for d in range(pred2.shape[1])
+            }
+            self._wandb.log(panels, step=int(step))
+            return
+
+        if kind == "map":
+            frame = pred.shape[0] // 2
+            pr = pred[frame]
+            gtf = gt[frame]
+            if pr.dim() == 3:  # (C, H, W) -> first channel
+                pr, gtf = pr[0], gtf[0]
+            panel = torch.cat([_minmax(gtf), _minmax(pr)], dim=-1).numpy()
+            self._wandb.log(
+                {f"{tag}/frame{frame}": self._wandb.Image(panel, caption=f"{name}: gt | pred")},
+                step=int(step),
+            )
 
     # ------------------------------------------------------------------- videos
 
@@ -174,6 +243,75 @@ class WandbLogger:
             )
         self._wandb.log(videos, step=int(step))
 
+    def log_cond_frames_grid(
+        self,
+        *,
+        target_latents: Tensor,
+        rows: list[tuple[int | None, Tensor | None, list[tuple[int, Tensor]]]],
+        cond: object | None,
+        step: int,
+    ) -> None:
+        """Log one video per sample as a 2-D grid: **columns** sweep the number
+        of clean observation (history) frames ``k``; **rows** sweep the sampling
+        step count ``N``.
+
+        ``rows`` is top→bottom; each entry is
+        ``(num_steps, base_latents, adapted_by_k)`` — the row's step count (or
+        ``None`` when there is no vertical sweep), a single base reference for
+        that row (at the eval ``cond_frames``; ``None`` omits the base column),
+        and one adapted latent per ``k`` (left→right). Within a row the columns
+        are ``ground_truth | base | adapted@k1 | adapted@k2 | …`` concatenated
+        along width; rows are stacked along height. The swept ``k`` (columns) and
+        ``N`` (rows) are named in the caption. This is the diffusion-forcing
+        analogue of :meth:`log_step_size_grid`: it shows how the prediction
+        sharpens as more observed history is held clean, across step counts.
+        """
+        if self._decode_fn is None:
+            raise RuntimeError("WandbLogger.log_cond_frames_grid requires a decode_fn (set at construction).")
+        if not rows or not rows[0][2]:
+            return
+        sample_count = min(self.num_samples, target_latents.shape[0])
+        target_pixels = self._decode_to_uint8(target_latents[:sample_count])
+        decoded_rows = [
+            (
+                num_steps,
+                self._decode_to_uint8(base[:sample_count]) if base is not None else None,
+                [(k, self._decode_to_uint8(lat[:sample_count])) for k, lat in adapted_by_k],
+            )
+            for num_steps, base, adapted_by_k in rows
+        ]
+        actions = _maybe_extract_actions(cond)
+
+        # Columns identical across rows; take names from the first row.
+        ks_str = ", ".join(f"k={k}" for k, _ in decoded_rows[0][2])
+        any_base = any(base is not None for _, base, _ in decoded_rows)
+        prefix = "gt | base | " if any_base else "gt | "
+        row_labels = [n for n, _, _ in decoded_rows if n is not None]
+
+        videos: dict[str, Any] = {}
+        for i in range(sample_count):
+            strips = []
+            for _, base_pixels, adapted_pixels in decoded_rows:
+                panels = [target_pixels[i]]
+                if base_pixels is not None:
+                    panels.append(base_pixels[i])
+                for _, pixels in adapted_pixels:
+                    panels.append(pixels[i])
+                strips.append(torch.cat(panels, dim=-1))
+            grid = torch.cat(strips, dim=-2) if len(strips) > 1 else strips[0]
+            caption = f"sample={i} | cols: {prefix}adapted@({ks_str})"
+            if row_labels:
+                caption += " | rows top→bottom: " + ", ".join(f"N={n}" for n in row_labels)
+            if isinstance(actions, Tensor) and actions.shape[0] > i:
+                caption += self._format_action_block(actions[i])
+            videos[f"eval_cond_grid/sample_{i}"] = self._wandb.Video(
+                grid.numpy(),
+                fps=self.fps,
+                format="mp4",
+                caption=caption,
+            )
+        self._wandb.log(videos, step=int(step))
+
     # --------------------------------------------------------------- internals
 
     @torch.no_grad()
@@ -205,6 +343,12 @@ class WandbLogger:
             row = sample_actions[frame_index].tolist()
             rows.append(f"{frame_index} " + " ".join(f"{x:+.2f}" for x in row))
         return "\nactions:\n" + "\n".join(rows)
+
+
+def _minmax(x: Tensor) -> Tensor:
+    """Min-max normalise a 2-D tensor to [0, 1] for image display."""
+    lo, hi = float(x.min()), float(x.max())
+    return (x - lo) / (hi - lo) if hi > lo else torch.zeros_like(x)
 
 
 def _coerce_scalar(value: object) -> float | None:

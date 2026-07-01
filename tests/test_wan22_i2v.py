@@ -43,7 +43,7 @@ def _tiny_batch(preprocessor, batch_size=2, pixel_frames=17):
     return preprocessor(raw, train=True)
 
 
-def _build_preprocessor(cond_frames=1):
+def _build_preprocessor(cond_frames=1, cond_frames_dist=None):
     from generative_flow_adapters.data import (
         Wan22DiffusionForcingPreprocessor,
         WanBatchPreprocessConfig,
@@ -54,6 +54,7 @@ def _build_preprocessor(cond_frames=1):
         config=WanBatchPreprocessConfig(target_height=256, target_width=256, timestep_scale=1000.0),
         condition_keys=("act",),
         cond_frames=cond_frames,
+        cond_frames_dist=cond_frames_dist,
     )
 
 
@@ -73,6 +74,54 @@ def test_diffusion_forcing_preprocessor_builds_masked_batch():
     # per-frame timestep: obs frame at 0, future frames at the same sigma*scale.
     assert torch.all(t[:, 0] == 0.0)
     assert torch.all(t[:, 1:] > 0.0)
+
+
+def test_cond_frames_dist_samples_variable_history_in_training():
+    """Training draws k per-sample from cond_frames_dist (mixed history lengths
+    within a batch); eval is fixed to the scalar cond_frames."""
+    dist = {1: 0.5, 2: 0.25, 4: 0.25}
+    pre = _build_preprocessor(cond_frames=1, cond_frames_dist=dist)
+    # 33 px -> 9 latent frames, so k in {1,2,4} all fit with a predicted future.
+    raw = {
+        "video": (torch.rand(256, 33, 256, 256, 3) * 255).byte(),
+        "act": torch.randn(256, 33, 4),
+    }
+
+    train_fm = pre(raw, train=True)["frame_mask"]
+    # k = number of leading clean (mask==0) frames per sample.
+    ks = (train_fm == 0).sum(dim=1)
+    assert set(ks.tolist()).issubset(set(dist)), "every sampled k must be in the support"
+    assert len(set(ks.tolist())) > 1, "a 256-sample batch should show mixed history lengths"
+    # mask stays a contiguous 0-prefix then 1s (no interior holes).
+    for row in train_fm:
+        k = int((row == 0).sum())
+        assert row.tolist() == [0.0] * k + [1.0] * (row.shape[0] - k)
+
+    # Eval ignores the distribution and uses the fixed scalar cond_frames=1.
+    eval_fm = pre(raw, train=False)["frame_mask"]
+    assert torch.all((eval_fm == 0).sum(dim=1) == 1)
+
+
+def test_cond_frames_dist_clamps_to_available_future():
+    """k is capped at t_lat-1 so at least one predicted frame always remains,
+    even when the distribution puts mass on more frames than the clip has."""
+    pre = _build_preprocessor(cond_frames=1, cond_frames_dist={8: 1.0})
+    # 17 px -> 5 latent frames; k=8 must clamp to 4 (one predicted frame left).
+    raw = {
+        "video": (torch.rand(16, 17, 256, 256, 3) * 255).byte(),
+        "act": torch.randn(16, 17, 4),
+    }
+    fm = pre(raw, train=True)["frame_mask"]
+    ks = (fm == 0).sum(dim=1)
+    assert torch.all(ks == 4)
+    assert torch.all(fm[:, -1] == 1.0), "the last frame must always be predicted"
+
+
+def test_cond_frames_dist_rejects_weights_not_summing_to_one():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="sum to 1"):
+        _build_preprocessor(cond_frames_dist={1: 0.5, 2: 0.3})
 
 
 def _tiny_experiment(disable_wandb=True):

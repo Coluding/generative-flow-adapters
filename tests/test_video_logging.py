@@ -182,6 +182,180 @@ class WandbLoggerStepSizeGridTest(unittest.TestCase):
         self.assertIn("gt | adapted", video.caption)
 
 
+class WandbLoggerCondFramesGridTest(unittest.TestCase):
+    def test_grid_one_adapted_column_per_k_with_base(self):
+        fake_log: list = []
+        logger = _make_logger(fake_log)
+        target = torch.zeros(1, 4, 2, 4, 8)  # [B, C, T, H, W]; decode → H=4, W=8
+        base = torch.zeros(1, 4, 2, 4, 8)
+        adapted_by_k = [(1, torch.zeros(1, 4, 2, 4, 8)), (2, torch.zeros(1, 4, 2, 4, 8)), (4, torch.zeros(1, 4, 2, 4, 8))]
+
+        logger.log_cond_frames_grid(
+            target_latents=target,
+            rows=[(None, base, adapted_by_k)],
+            cond={"act": torch.randn(1, 2, 4)},
+            step=9,
+        )
+
+        payload, step = fake_log[0]
+        self.assertEqual(step, 9)
+        video = payload["eval_cond_grid/sample_0"]
+        # gt | base | adapted@{1,2,4} → 2 + 3 = 5 columns → W = 8 * 5 = 40, H = 4.
+        self.assertEqual(video.data.shape[-2], 4)
+        self.assertEqual(video.data.shape[-1], 40)
+        # k values named in the caption (the "subtitle").
+        self.assertIn("k=1, k=2, k=4", video.caption)
+        self.assertIn("gt | base | adapted", video.caption)
+        # No step schedule → single row → no vertical N labels.
+        self.assertNotIn("rows top", video.caption)
+
+    def test_grid_omits_base_column_when_base_absent(self):
+        fake_log: list = []
+        logger = _make_logger(fake_log)
+        target = torch.zeros(1, 4, 2, 4, 8)
+        adapted_by_k = [(1, torch.zeros(1, 4, 2, 4, 8)), (8, torch.zeros(1, 4, 2, 4, 8))]
+
+        logger.log_cond_frames_grid(
+            target_latents=target, rows=[(None, None, adapted_by_k)], cond=None, step=2
+        )
+
+        video = fake_log[0][0]["eval_cond_grid/sample_0"]
+        # gt | adapted@{1,8} → 1 + 2 = 3 columns → W = 8 * 3 = 24.
+        self.assertEqual(video.data.shape[-1], 24)
+        self.assertIn("k=1, k=8", video.caption)
+        self.assertIn("gt | adapted", video.caption)
+
+    def test_grid_stacks_step_rows_vertically_and_names_them(self):
+        fake_log: list = []
+        logger = _make_logger(fake_log)
+        target = torch.zeros(1, 4, 2, 4, 8)
+        # Two step-count rows (N=1, N=4), each with base + adapted@{1,2}.
+        rows = [
+            (1, torch.zeros(1, 4, 2, 4, 8), [(1, torch.zeros(1, 4, 2, 4, 8)), (2, torch.zeros(1, 4, 2, 4, 8))]),
+            (4, torch.zeros(1, 4, 2, 4, 8), [(1, torch.zeros(1, 4, 2, 4, 8)), (2, torch.zeros(1, 4, 2, 4, 8))]),
+        ]
+
+        logger.log_cond_frames_grid(target_latents=target, rows=rows, cond=None, step=3)
+
+        video = fake_log[0][0]["eval_cond_grid/sample_0"]
+        # cols: gt | base | adapted@{1,2} = 4 → W = 8*4 = 32; rows: N=1,N=4 → H = 4*2 = 8.
+        self.assertEqual(video.data.shape[-1], 32)
+        self.assertEqual(video.data.shape[-2], 8)
+        self.assertIn("k=1, k=2", video.caption)
+        self.assertIn("rows top→bottom: N=1, N=4", video.caption)
+
+
+class CondFramesGridTrainerTest(unittest.TestCase):
+    def test_df_frame_mask_is_clean_prefix_and_clamps(self):
+        from generative_flow_adapters.training.trainer import Trainer
+
+        ref = torch.zeros(2, 4, 5, 4, 8)  # t_lat = 5
+        self.assertEqual(Trainer._df_frame_mask(ref, 2)[0].tolist(), [0.0, 0.0, 1.0, 1.0, 1.0])
+        # k beyond the clip clamps to t_lat-1 so one predicted frame remains.
+        self.assertEqual(Trainer._df_frame_mask(ref, 99)[0].tolist(), [0.0, 0.0, 0.0, 0.0, 1.0])
+
+    def test_eval_cond_frames_reads_top_level_and_wandb_block(self):
+        import types
+
+        from generative_flow_adapters.training.trainer import Trainer
+
+        def parse(extra):
+            stub = types.SimpleNamespace(config=types.SimpleNamespace(extra=extra))
+            return Trainer._eval_cond_frames(stub)
+
+        self.assertEqual(parse({}), [])
+        self.assertEqual(parse({"eval_cond_frames": [1, 2, 4]}), [1, 2, 4])
+        self.assertEqual(parse({"wandb": {"eval_cond_frames": [2, 8]}}), [2, 8])
+
+    def test_grid_sweeps_k_dedups_clamped_and_passes_columns(self):
+        import types
+
+        from generative_flow_adapters.training import trainer as trainer_mod
+        from generative_flow_adapters.training.trainer import Trainer
+
+        class _FakeSampler:
+            def __init__(self):
+                self.masks = []
+
+            def sample_from_batch(self, *, batch, num_inference_steps, initial_sample):
+                self.masks.append(batch.get("frame_mask"))
+                return torch.zeros_like(initial_sample)
+
+        class _RecordingLogger:
+            def __init__(self):
+                self.kwargs = None
+
+            def log_cond_frames_grid(self, **kwargs):
+                self.kwargs = kwargs
+
+        logger = _RecordingLogger()
+        stub = types.SimpleNamespace(
+            wandb_logger=logger,
+            inference_sampler=_FakeSampler(),
+            base_inference_sampler=_FakeSampler(),
+            config=types.SimpleNamespace(inference_num_steps=3, extra={}),
+            global_step=5,
+            _df_frame_mask=Trainer._df_frame_mask,
+            _eval_step_schedule=lambda: [],  # no vertical sweep → single row
+        )
+        batch = {
+            "target": torch.zeros(1, 4, 5, 4, 8),  # t_lat = 5
+            "x0": torch.zeros(1, 4, 5, 4, 8),
+            "frame_mask": torch.ones(1, 5),
+            "cond": {"act": torch.randn(1, 5, 4)},
+        }
+        # k=4 and k=8 both clamp to 4 → dedup to a single adapted column.
+        Trainer._generate_cond_frames_grid(stub, batch=batch, ks=[1, 4, 8])
+
+        rows = logger.kwargs["rows"]
+        self.assertEqual(len(rows), 1)  # no step schedule → one row
+        num_steps, base, adapted_by_k = rows[0]
+        self.assertIsNone(num_steps)  # unlabelled single row
+        self.assertEqual([k for k, _ in adapted_by_k], [1, 4])  # 8 clamped to 4, deduped
+        self.assertIsNotNone(base)
+
+    def test_grid_sweeps_step_schedule_as_rows(self):
+        import types
+
+        from generative_flow_adapters.training.trainer import Trainer
+
+        class _FakeSampler:
+            def sample_from_batch(self, *, batch, num_inference_steps, initial_sample):
+                return torch.zeros_like(initial_sample)
+
+        class _RecordingLogger:
+            def __init__(self):
+                self.kwargs = None
+
+            def log_cond_frames_grid(self, **kwargs):
+                self.kwargs = kwargs
+
+        logger = _RecordingLogger()
+        stub = types.SimpleNamespace(
+            wandb_logger=logger,
+            inference_sampler=_FakeSampler(),
+            base_inference_sampler=_FakeSampler(),
+            config=types.SimpleNamespace(inference_num_steps=3, extra={}),
+            global_step=7,
+            _df_frame_mask=Trainer._df_frame_mask,
+            _eval_step_schedule=lambda: [(1, 1.0), (4, 0.25)],
+            _inject_step_level=lambda cond, key, level: {**(cond or {}), key: level},
+        )
+        batch = {
+            "target": torch.zeros(1, 4, 5, 4, 8),
+            "x0": torch.zeros(1, 4, 5, 4, 8),
+            "frame_mask": torch.ones(1, 5),
+            "cond": {"act": torch.randn(1, 5, 4)},
+        }
+        Trainer._generate_cond_frames_grid(stub, batch=batch, ks=[1, 2])
+
+        rows = logger.kwargs["rows"]
+        self.assertEqual([n for n, _, _ in rows], [1, 4])  # one row per step count
+        for _, base, adapted_by_k in rows:
+            self.assertIsNotNone(base)
+            self.assertEqual([k for k, _ in adapted_by_k], [1, 2])
+
+
 class EvalStepScheduleParseTest(unittest.TestCase):
     @staticmethod
     def _parse(extra: dict):

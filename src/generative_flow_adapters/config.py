@@ -114,6 +114,24 @@ class TrainingConfig:
     # shortcut/consistency terms can collapse to ~0 without the model improving,
     # so the honest denoising loss is the safer selection signal.
     eval_metric: str = "base_loss"
+    # --- quality metrics (paper-standard generative-visual eval) -------------
+    # Paired, per-frame-vs-ground-truth metrics (subset of psnr/ssim/lpips/mse)
+    # scored on decoded pixels every eval cycle. Cheap and reliable because the
+    # world-model eval has aligned ground-truth future frames. Empty -> off.
+    # Both the adapted rollout and (when a frozen-base sampler exists) the base
+    # rollout are scored, so wandb shows the base-vs-adapted delta. Requires a
+    # VAE decoder on the wandb logger + an inference sampler; silently skipped
+    # otherwise.
+    quality_metrics: list[str] = field(default_factory=list)
+    quality_eval_num_batches: int = 4
+    # Sampler steps for the quality rollout; None -> inference_num_steps.
+    quality_eval_num_steps: int | None = None
+    # Distribution metrics (fid/fvd) on their own, rarer cadence — they load
+    # Inception/I3D and only mean anything over many samples, so they are kept
+    # off the per-cycle path. None/0 (or empty list) disables.
+    quality_dist_metrics: list[str] = field(default_factory=list)
+    quality_dist_every_n_steps: int | None = None
+    quality_dist_num_batches: int = 16
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -146,6 +164,13 @@ class DataConfig:
     fs_value: int = 1
     sampling: str = "random"
     caption_mode: str = "empty"
+    # Held-out eval source (paired with training.eval_every_n_steps). A separate
+    # `eval_hdf5` is a clean leak-free split and wins when set; otherwise
+    # `val_fraction` of `hdf5` is held out via a random window-level split
+    # (in-distribution — adjacent windows from one episode can straddle it).
+    # `val_fraction == 0` and no `eval_hdf5` disables eval. CLI overrides win.
+    eval_hdf5: str | None = None
+    val_fraction: float = 0.05
     extra: dict[str, Any] = field(default_factory=dict)
 
 
