@@ -8,7 +8,9 @@
       <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/latent_diffusion/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/external_repos/avid/libs/avid_utils" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src/generative_flow_adapters/backbones" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/external_repos/wan22/.venv" />
     </content>
     <orderEntry type="jdk" jdkName="uv (generative-flow-adapters)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

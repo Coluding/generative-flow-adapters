@@ -45,6 +45,31 @@ from generative_flow_adapters.training.trainer import Trainer
 # Wan2.2-VAE spatial stride (vae_stride = (4, 16, 16)).
 _WAN22_VAE_SPATIAL_STRIDE = 16
 
+# Non-DiT weight files that live in the same checkpoint dir (VAE, text encoder,
+# …) and must not be mistaken for the DiT when probing for a single-file weight.
+_NON_DIT_WEIGHT_MARKERS = ("wan2.2_vae", "vae", "t5", "text_encoder", "clip", "tokenizer")
+
+
+def _resolve_dit_checkpoint(ckpt_dir: Path) -> Path | None:
+    """Locate the Wan2.2 DiT checkpoint in ``ckpt_dir``, or ``None`` if absent.
+
+    Two accepted forms (see ``WanDiTWrapper.load_checkpoint``):
+    - the HF sharded layout ``diffusion_pytorch_model*.safetensors`` -> return
+      the directory (the loader merges the shards);
+    - a single-file ``*.safetensors`` / ``*.pth`` -> return that file, ignoring
+      the co-located VAE / text-encoder weights.
+    """
+    if not ckpt_dir.is_dir():
+        return None
+    if list(ckpt_dir.glob("diffusion_pytorch_model*.safetensors")):
+        return ckpt_dir
+    candidates = [
+        path
+        for path in (*ckpt_dir.glob("*.safetensors"), *ckpt_dir.glob("*.pth"))
+        if not any(marker in path.name.lower() for marker in _NON_DIT_WEIGHT_MARKERS)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -57,7 +82,16 @@ def main() -> None:
     parser.add_argument(
         "--ckpt-dir",
         default="ckpts/Wan2.2-TI2V-5B",
-        help="Wan2.2 checkpoint dir (Wan2.2_VAE.pth + DiT safetensors). Loads real weights when present.",
+        help="Wan2.2 checkpoint dir (Wan2.2_VAE.pth + DiT safetensors). Real weights are required unless --allow-random-base.",
+    )
+    parser.add_argument(
+        "--allow-random-base",
+        action="store_true",
+        help=(
+            "Escape hatch for CPU/CI smoke tests ONLY: proceed with a RANDOM-INIT frozen "
+            "base DiT when no checkpoint is found. Never use for real training — the adapter "
+            "would train against random base weights."
+        ),
     )
 
     parser.add_argument("--steps", type=int, default=100_000)
@@ -123,14 +157,33 @@ def main() -> None:
     target_height = latent_height * _WAN22_VAE_SPATIAL_STRIDE
     target_width = latent_width * _WAN22_VAE_SPATIAL_STRIDE
 
-    # Point the frozen base at the real DiT weights when available. The HF repo
-    # ships the DiT sharded (diffusion_pytorch_model-0000N-of-*.safetensors),
-    # which the Wan loader merges from the directory; a single-file checkpoint
-    # works too. Either form means real weights are present.
+    # Point the frozen base at the real DiT weights. The HF repo ships the DiT
+    # sharded (diffusion_pytorch_model-0000N-of-*.safetensors), which the Wan
+    # loader merges from the directory; a single-file .safetensors/.pth works too.
+    # Training against a random-init frozen base is almost never intended, so the
+    # checkpoint is MANDATORY: fail hard when it is missing unless the caller
+    # explicitly opts into a random base with --allow-random-base (smoke tests).
     ckpt_dir = Path(args.ckpt_dir)
-    if list(ckpt_dir.glob("diffusion_pytorch_model*.safetensors")):
-        config.model.pretrained_model_name_or_path = str(ckpt_dir)
+    dit_checkpoint = _resolve_dit_checkpoint(ckpt_dir)
+    if dit_checkpoint is not None:
+        config.model.pretrained_model_name_or_path = str(dit_checkpoint)
+        # Force a strict, no-fallback base load: a present-but-broken checkpoint
+        # must raise, not silently degrade to random weights.
         config.model.extra["allow_missing_checkpoint"] = False
+    elif args.allow_random_base:
+        print(
+            "WARNING: no Wan2.2 DiT checkpoint found under "
+            f"{ckpt_dir} — proceeding with a RANDOM-INIT frozen base "
+            "(--allow-random-base). Do NOT use these results."
+        )
+        config.model.extra["allow_missing_checkpoint"] = True
+    else:
+        raise FileNotFoundError(
+            f"Wan2.2 DiT checkpoint not found under {ckpt_dir} (looked for "
+            "diffusion_pytorch_model*.safetensors, *.safetensors, or *.pth). The frozen "
+            "base must be loaded for training — pass --ckpt-dir with the downloaded "
+            "Wan2.2-TI2V-5B weights, or --allow-random-base for a CPU/CI smoke test only."
+        )
     experiment = build_experiment(config)
     model = experiment.model.to(device)
     trainer = Trainer(

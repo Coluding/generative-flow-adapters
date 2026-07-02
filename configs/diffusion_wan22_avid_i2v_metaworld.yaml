@@ -30,9 +30,23 @@ model:
     dtype: bf16
     # Wan2.2-VAE latent geometry (vae_stride = (4, 16, 16), z_dim = 48).
     latent_channels: 48
+<<<<<<< HEAD
     temporal_length: 121      # pixel-frame window -> 5 latent frames at stride 4
     latent_height: 16        # 256 px. Bump to 32 (512 px) for a sharper eval grid
     latent_width: 16         # (more GPU memory; the eval looks washed at 256 px).
+=======
+    temporal_length: 41     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
+    # Aspect-preserving, patch/VAE-aligned resolution à la Wan `best_output_size`
+    # (external-base training script). Frames are sized to the largest (w,h) under
+    # `max_area` px, divisible by 32, matching the source aspect — the base's
+    # native regime. 704*1280 is Wan's native budget; lower it (e.g. 262144=512²,
+    # 147456=384²) to trade fidelity for GPU memory.
+    max_area: 901120         # 704 * 1280
+    # Fallback fixed size (used only when max_area is unset, e.g. the legacy
+    # vendored-base script): 256 px runs the base off-distribution ("looks washed").
+    latent_height: 16
+    latent_width: 16
+>>>>>>> ed6e42c3a750b3a64d9c1664919bcb300bb5784a
 
 adapter:
   type: output

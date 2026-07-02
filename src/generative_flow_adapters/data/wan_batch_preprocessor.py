@@ -25,10 +25,68 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
 from torch import Tensor
 
-from generative_flow_adapters.data.batch_preprocessor import resize_stretch, resize_with_pad
+from generative_flow_adapters.data.batch_preprocessor import (
+    _center_crop_to,
+    resize_stretch,
+    resize_with_pad,
+)
+
+
+def _lanczos_cover_crop_uint8(video: Tensor, out_h: int, out_w: int) -> Tensor:
+    """PIL **LANCZOS** cover-resize + center-crop on raw uint8 frames, byte-for-byte
+    matching the upstream Wan i2v conditioning-frame preprocessing
+    (``img.resize(..., Image.LANCZOS)`` then center ``crop``).
+
+    ``video``: ``[B, T, H, W, 3]`` uint8 (RGB) -> ``[B, T, out_h, out_w, 3]`` uint8.
+    Done in uint8/PIL space *before* normalization (upstream resizes then
+    ``to_tensor``), so the whole pipeline — filter, quantization, and
+    normalization — matches what the frozen base sees at inference."""
+    b, t, ih, iw, c = video.shape
+    scale = max(out_w / iw, out_h / ih)
+    rw, rh = round(iw * scale), round(ih * scale)  # upstream: round(iw*scale), round(ih*scale)
+    x1 = (rw - out_w) // 2                          # upstream: (img.width  - ow)//2
+    y1 = (rh - out_h) // 2                          # upstream: (img.height - oh)//2
+    arr = video.detach().cpu().numpy()
+    out = np.empty((b, t, out_h, out_w, c), dtype=np.uint8)
+    for bi in range(b):
+        for ti in range(t):
+            img = Image.fromarray(arr[bi, ti])                 # HWC uint8 RGB
+            img = img.resize((rw, rh), Image.LANCZOS)          # PIL takes (width, height)
+            img = img.crop((x1, y1, x1 + out_w, y1 + out_h))   # center crop to (out_w, out_h)
+            out[bi, ti] = np.asarray(img)
+    return torch.from_numpy(out)
+
+
+def best_output_size(w: int, h: int, dw: int, dh: int, expected_area: int) -> tuple[int, int]:
+    """Largest ``(width, height)`` that fits within ``expected_area`` pixels, is
+    divisible by ``(dw, dh)``, and best preserves the ``w/h`` aspect ratio.
+
+    First-party port of Wan2.2's ``wan/utils/utils.best_output_size`` (Apache-2.0)
+    — the resolution policy the upstream i2v pipeline uses. Rounding both sides to
+    the ``(dw, dh)`` grid independently would drift the aspect ratio, so it tries
+    snapping width-first and height-first and keeps whichever stays closest to the
+    source ratio. ``dw``/``dh`` are ``patch_size · vae_stride`` (32 for Wan2.2
+    TI2V), so the result tiles into whole latent/patch tokens with no padding.
+    """
+    ratio = w / h
+    ow = (expected_area * ratio) ** 0.5
+    oh = expected_area / ow
+    # width-first
+    ow1 = int(ow // dw * dw)
+    oh1 = int(expected_area / max(ow1, 1) // dh * dh)
+    ratio1 = ow1 / oh1
+    # height-first
+    oh2 = int(oh // dh * dh)
+    ow2 = int(expected_area / max(oh2, 1) // dw * dw)
+    ratio2 = ow2 / oh2
+    if max(ratio / ratio1, ratio1 / ratio) < max(ratio / ratio2, ratio2 / ratio):
+        return ow1, oh1
+    return ow2, oh2
 
 
 @dataclass(slots=True)
@@ -36,6 +94,15 @@ class WanBatchPreprocessConfig:
     target_height: int | None = 256
     target_width: int | None = 256
     resize_mode: str = "stretch"  # "stretch" | "pad"
+    # Aspect-preserving alternative to a fixed target_h/w: when `max_area` is set,
+    # frames are resized to the largest (w, h) that fits `max_area` pixels, is
+    # divisible by (align_w, align_h), and best matches the source aspect ratio
+    # (Wan `best_output_size`), then center-cropped. This matches how the upstream
+    # Wan i2v pipeline sizes frames — the base's native, patch/VAE-aligned regime —
+    # instead of a fixed 256² that runs the frozen base off-distribution.
+    max_area: int | None = None
+    align_h: int = 32  # patch_size[1] * vae_stride[1] (Wan2.2 TI2V: 2 * 16)
+    align_w: int = 32  # patch_size[2] * vae_stride[2]
     action_key: str = "action"
     action_aggregation: str = "sum"  # "sum" | "mean" | "last" over the clip's frames
     sigma_min: float = 1e-5
@@ -119,6 +186,22 @@ class WanBatchPreprocessor:
     def _normalize_video(self, video: Any) -> Tensor:
         if not isinstance(video, Tensor):
             raise TypeError(f"Expected tensor 'video', got {type(video).__name__}.")
+        cfg = self.config
+
+        # Wan-native path (max_area set): resize the RAW uint8 frames with PIL
+        # LANCZOS + center-crop *before* normalizing — exactly the upstream i2v
+        # preprocessing — so the base's conditioning-latent distribution is
+        # identical at train and inference. (Falls through to the tensor/bicubic
+        # branch below for non-uint8 input, which the dataset never emits.)
+        if cfg.max_area is not None and video.dtype == torch.uint8:
+            if video.dim() != 5 or video.shape[-1] != 3:
+                raise ValueError(f"Expected uint8 video [B,T,H,W,3], got {tuple(video.shape)}")
+            src_h, src_w = int(video.shape[2]), int(video.shape[3])
+            out_w, out_h = best_output_size(src_w, src_h, cfg.align_w, cfg.align_h, cfg.max_area)
+            video = _lanczos_cover_crop_uint8(video, out_h, out_w)  # [B,T,out_h,out_w,3] uint8
+            normalized = video.to(dtype=torch.float32) / 127.5 - 1.0  # == to_tensor().sub(.5).div(.5)
+            return normalized.permute(0, 4, 1, 2, 3).contiguous()  # [B,T,H,W,C]->[B,C,T,H,W]
+
         if video.dtype == torch.uint8:
             normalized = video.to(dtype=torch.float32) / 127.5 - 1.0
             normalized = normalized.permute(0, 4, 1, 2, 3).contiguous()  # [B,T,H,W,C]->[B,C,T,H,W]
@@ -127,15 +210,21 @@ class WanBatchPreprocessor:
         else:
             raise ValueError(f"Unsupported video tensor: shape={tuple(video.shape)} dtype={video.dtype}")
 
-        cfg = self.config
-        if cfg.target_height is None or cfg.target_width is None:
+        if cfg.max_area is None and (cfg.target_height is None or cfg.target_width is None):
             return normalized
 
         batch, channels, frames = normalized.shape[:3]
         # Reshape to [B*T, C, H, W] for the 2D resize helpers.
         flat = normalized.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, *normalized.shape[3:])
-        if cfg.resize_mode == "pad":
-            resized = resize_with_pad(flat, cfg.target_height, cfg.target_width)
+        if cfg.max_area is not None:
+            # Float fallback (non-uint8 input): tensor bicubic cover-crop.
+            _, _, src_h, src_w = flat.shape
+            out_w, out_h = best_output_size(src_w, src_h, cfg.align_w, cfg.align_h, cfg.max_area)
+            resized = _center_crop_to(flat, out_h, out_w)
+        elif cfg.resize_mode == "pad":
+            out_h, out_w = cfg.target_height, cfg.target_width
+            resized = resize_with_pad(flat, out_h, out_w)
         else:
-            resized = resize_stretch(flat, cfg.target_height, cfg.target_width)
-        return resized.reshape(batch, frames, channels, cfg.target_height, cfg.target_width).permute(0, 2, 1, 3, 4)
+            out_h, out_w = cfg.target_height, cfg.target_width
+            resized = resize_stretch(flat, out_h, out_w)
+        return resized.reshape(batch, frames, channels, out_h, out_w).permute(0, 2, 1, 3, 4)

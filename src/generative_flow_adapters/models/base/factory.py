@@ -81,6 +81,20 @@ def build_base_model(config: ModelConfig):
             allow_missing_checkpoint=bool(config.extra.get("allow_missing_checkpoint", False)),
             dtype=_parse_dtype(config.extra.get("dtype")),
         )
+    elif provider in ("wan2.2_external", "wan_ti2v_external"):
+        # Plug-and-play Wan2.2 TI2V-5B via the upstream repo (BaseVideoModel),
+        # instead of the vendored Wan22DiTWrapper. Owns its own native
+        # generation; the adapter composes at the denoise seam.
+        from generative_flow_adapters.models.base.wan_ti2v import WanTI2VVideoModel
+
+        ckpt = config.pretrained_model_name_or_path
+        if not ckpt:
+            raise ValueError(f"{provider} provider requires model.pretrained_model_name_or_path (the ckpt dir)")
+        model = WanTI2VVideoModel(
+            checkpoint_dir=ckpt,
+            convert_model_dtype=_parse_dtype(config.extra.get("dtype")) is not None,
+            offload_model=bool(config.extra.get("offload_model", False)),
+        )
     elif provider == "opensora":
         model = _build_opensora_model(config)
     else:
