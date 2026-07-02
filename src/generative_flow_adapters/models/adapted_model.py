@@ -53,8 +53,8 @@ class AdaptedModel(nn.Module):
         return self.base_model.diffusion_schedule_config
 
     def forward(self, x_t: Tensor, t: Tensor, cond: object | None = None) -> Tensor:
-        drop_mask = self._sample_condition_drop_mask(x_t)
-        encoded_cond = self.condition_encoder(cond, drop_mask=drop_mask) if self.condition_encoder is not None else cond
+        """Single-step composition: compute the frozen base prediction, then
+        compose the adapter residual onto it. This is the training seam."""
         if hasattr(self.adapter, "clear_captured_base_features"):
             self.adapter.clear_captured_base_features()
         # Some adapters (e.g. HyperAlign) inject dynamic LoRA weights into the
@@ -66,10 +66,45 @@ class AdaptedModel(nn.Module):
             self.adapter.clear_dynamic_parameters()
         with torch.no_grad():
             base_output = self.base_model(x_t, t, cond=cond)
+        return self._compose_with_adapter(x_t, t, cond, base_output)
+
+    def _compose_with_adapter(
+        self, x_t: Tensor, t: object, cond: object | None, base_output: Tensor
+    ) -> Tensor:
+        """Given the base prediction ``base_output`` for ``(x_t, t, cond)``, run
+        the adapter and compose. Shared by :meth:`forward` (which computes the
+        base itself) and :meth:`generate` (where the base's native loop already
+        computed it and passes it in via ``compose_fn``)."""
+        drop_mask = self._sample_condition_drop_mask(x_t)
+        encoded_cond = self.condition_encoder(cond, drop_mask=drop_mask) if self.condition_encoder is not None else cond
         base_direction = self._build_base_direction(base_output)
         adapter_cond = self._build_adapter_condition(raw_cond=cond, encoded_cond=encoded_cond, base_direction=base_direction)
         adapter_result = self.adapter(x_t, t, adapter_cond, base_output=base_output)
         return self._compose(base_output, adapter_result)
+
+    @torch.no_grad()
+    def generate(self, conditioning: object, *, cond: object | None = None, **kwargs: object) -> Tensor:
+        """Generate through the base backbone's **own** native pipeline, with the
+        adapter injected at each denoiser step.
+
+        Requires ``base_model`` to implement
+        :class:`~...models.base.video_model.BaseVideoModel` (i.e. expose
+        ``generate(conditioning, *, compose_fn, ...)``). ``conditioning`` is the
+        backbone's native conditioning (e.g. an observation frame); ``cond`` is
+        the adapter's conditioning (e.g. an action), held constant across the
+        rollout. Extra ``kwargs`` pass through to the backbone's generator
+        (steps, resolution, seed, ...)."""
+        generate = getattr(self.base_model, "generate", None)
+        if not callable(generate):
+            raise TypeError(
+                "AdaptedModel.generate requires a BaseVideoModel base_model exposing .generate(); "
+                f"got {type(self.base_model).__name__}."
+            )
+
+        def _compose_step(x_t: Tensor, t: object, base_pred: Tensor) -> Tensor:
+            return self._compose_with_adapter(x_t, t, cond, base_pred)
+
+        return generate(conditioning, compose_fn=_compose_step, **kwargs)
 
     def _compose(self, base_output: Tensor, adapter_result: Tensor | OutputAdapterResult) -> Tensor:
         if isinstance(adapter_result, Tensor):
