@@ -1,9 +1,8 @@
-# Task-specific text prompts for conditioning the frozen Wan2.2 base.
+# Text prompts for conditioning the frozen Wan2.2 base — TASK-INDEPENDENT POOL.
 #
-# Keys under `tasks:` are MetaWorld `task_name`s (as stored in the HDF5 env
-# attrs). Each maps to a positive prompt describing the scene/motion; injecting
-# it and generating with guide_scale > 1 sharpens the base video (CFG toward the
-# task, away from the negative).
+# `default` + everything under `prompts:` form one pool. During training a single
+# prompt is sampled at random per clip each step (augmentation); eval always uses
+# `default` (element 0, deterministic). No task_name / per-task setup needed.
 #
 # Pipeline:
 #   1. Precompute embeddings once (needs T5):
@@ -11,21 +10,20 @@
 #          --ckpt_dir ckpts/Wan2.2-TI2V-5B \
 #          --prompts_file configs/prompts/metaworld_tasks.yaml
 #      -> writes configs/prompts/metaworld_tasks.contexts.pt
-#   2. Point the config at THIS file: model.extra.text_prompts_file.
-#      (Set it to null to disable text conditioning -> frame-only training.)
+#   2. Point the config at THIS file: model.extra.text_prompts_file
+#      (null -> disable text conditioning -> frame-only training).
+#   Re-run step 1 after any prompt edit — training reads the .contexts.pt snapshot.
 #
-# `default` is used for any task_name not listed here; `negative: null` uses the
-# model's built-in sample_neg_prompt (the Wan quality-negative) for the CFG
-# unconditional branch.
+# `negative: null` uses the model's built-in sample_neg_prompt (Wan quality-negative)
+# for the CFG unconditional branch.
 
-default: "A robot arm performs a manipulation task in a simulated tabletop scene, smooth realistic motion, sharp video, stable camera."
+default: "A robotic arm performs a manipulation task on a table, smooth realistic motion, sharp video, stable camera."
 
 negative: null
 
-tasks:
-  # Fill in the task_name -> prompt entries for your dataset. Examples:
-  pick-place-v2: "A robot gripper picks up the small object and places it on the target, smooth realistic motion, sharp video."
-  door-open-v2: "A robot arm reaches the door handle and pulls the door open, smooth realistic motion, sharp video."
-  drawer-close-v2: "A robot arm pushes the drawer closed, smooth realistic motion, sharp video."
-  button-press-v2: "A robot arm presses the button down, smooth realistic motion, sharp video."
-  reach-v2: "A robot arm reaches toward the target position, smooth realistic motion, sharp video."
+# The sampling pool (sampled at random per clip during training):
+prompts:
+  - "A red robotic arm moves smoothly to manipulate objects on a table, sharp video, stable camera."
+  - "A robot manipulator performs a precise tabletop task, steady camera, crisp realistic video, correct."
+  - "A robot arm reaches and interacts with objects on a table, fluid realistic motion, sharp video."
+  - "A robotic arm carries out a manipulation task in a simulated tabletop scene, smooth motion, clear video."

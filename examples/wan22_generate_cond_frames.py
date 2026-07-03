@@ -114,6 +114,11 @@ def main() -> None:
                         "from the config's model.extra.text_prompts_file. Enables the conditional rollout.")
     parser.add_argument("--task", default="__default__",
                         help="task_name key into the prompt table for the positive prompt (falls back to __default__).")
+    parser.add_argument("--prompt-index", type=int, default=None,
+                        help="Pool mode: pick prompt N from the precomputed 'pool' (0 = default). "
+                        "Overrides --task. Use --list-prompts to see the pool.")
+    parser.add_argument("--list-prompts", action="store_true",
+                        help="Print the pool prompts in the .contexts.pt table and exit.")
     parser.add_argument(
         "--offload-model",
         action=argparse.BooleanOptionalAction,
@@ -189,13 +194,35 @@ def main() -> None:
             contexts_path = str(Path(pf).with_suffix(".contexts.pt"))
     if contexts_path and Path(contexts_path).exists():
         table = torch.load(contexts_path, map_location="cpu", weights_only=False)
-        positive = table["positive"]
-        context = positive.get(args.task, positive.get("__default__")).to(device)
+        pool = table.get("pool")
+        pool_texts = table.get("prompts", {}).get("__pool__", [])
+        if args.list_prompts:
+            if pool:
+                print(f"pool ({len(pool)} prompts) in {contexts_path}:")
+                for i, s in enumerate(pool_texts):
+                    print(f"  [{i}]{' (default/eval)' if i == 0 else ''} {s}")
+            else:
+                print(f"no 'pool' in {contexts_path}; positive keys: {list(table.get('positive', {}))}")
+            return
         context_null = table["negative"].to(device)
-        prompt_str = table.get("prompts", {}).get(args.task, table.get("prompts", {}).get("__default__", ""))
-        print(f"text conditioning: ON — task={args.task!r} -> {prompt_str[:70]!r}  (guide_scale={args.guide_scale})")
+        if pool and args.prompt_index is not None:  # pool mode: pick prompt N
+            idx = args.prompt_index % len(pool)
+            context = pool[idx].to(device)
+            prompt_str = pool_texts[idx] if idx < len(pool_texts) else ""
+            print(f"text conditioning: ON — pool[{idx}] -> {prompt_str[:70]!r}  (guide_scale={args.guide_scale})")
+        elif pool:  # pool present, no index -> default (element 0)
+            context = pool[0].to(device)
+            prompt_str = pool_texts[0] if pool_texts else ""
+            print(f"text conditioning: ON — pool[0]/default -> {prompt_str[:70]!r}  (guide_scale={args.guide_scale})")
+        else:  # task mode
+            positive = table["positive"]
+            context = positive.get(args.task, positive.get("__default__")).to(device)
+            prompt_str = table.get("prompts", {}).get(args.task, table.get("prompts", {}).get("__default__", ""))
+            print(f"text conditioning: ON — task={args.task!r} -> {str(prompt_str)[:70]!r}  (guide_scale={args.guide_scale})")
     else:
         print(f"text conditioning: OFF — no prompt table ({contexts_path}); unconditional rollout only.")
+        if args.list_prompts:
+            return
 
     frame = _load_frame(args.image, args.hdf5, args.clip_idx)
     iio.imwrite(os.path.join(args.out_dir, "cond_frame.png"), frame)
