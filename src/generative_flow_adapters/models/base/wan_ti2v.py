@@ -32,7 +32,7 @@ from torch import Tensor
 
 from generative_flow_adapters.models.base.video_model import BaseVideoModel, ComposeFn
 
-# Repo root -> external_repos/Wan2.2 (the upstream Wan2.2 package lives here).
+# Repo root -> external_repos/wan22 (the upstream Wan2.2 package lives here).
 _WAN22_REPO = Path(__file__).resolve().parents[4] / "external_repos" / "Wan2.2"
 
 
