@@ -21,6 +21,7 @@ trainable adapter is conditioned on the action via the ``action`` key.
 
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -94,27 +95,48 @@ class PromptContextProvider:
     frozen base can be conditioned on a task prompt during training **without
     loading T5**.
 
-    Loads the table produced by ``precompute_prompt_contexts.py`` — a dict with
-    ``{"positive": {task_name: [L, C] tensor, "__default__": ...}, ...}``. Unknown
-    tasks fall back to ``__default__``. Returns a *list* of per-sample ``[Lᵢ, C]``
-    tensors (prompts differ in length; the Wan DiT pads each internally), which is
-    exactly the ``context`` form ``WanTI2VVideoModel.denoise`` forwards to the DiT.
+    Loads the table produced by ``precompute_prompt_contexts.py``. Two modes:
+
+    - **Pool** (``table["pool"]`` present): a flat, task-independent list of prompt
+      embeddings. Every clip samples one at random during training (element 0 at
+      eval). No ``task_name`` needed. This is the simple "a set of prompts, sampled
+      per run" setup — pool takes precedence over ``positive``.
+    - **Task** (``table["positive"]`` = ``{task_name: emb, "__default__": ...}``):
+      per-task prompt (or a per-task list of paraphrases). Looks up the clip's
+      ``task_name``; unknown tasks fall back to ``__default__``.
+
+    Either way returns a *list* of per-sample ``[Lᵢ, C]`` tensors (prompts differ in
+    length; the Wan DiT pads each) — the ``context`` form ``denoise`` forwards.
     """
 
     def __init__(self, contexts_path: str) -> None:
         table = torch.load(contexts_path, map_location="cpu", weights_only=False)
+        # Pool mode: a flat, task-independent set of prompt embeddings. When present
+        # it takes precedence over `positive` — every clip samples from the same pool
+        # (no task_name needed). Element 0 is the deterministic eval choice.
+        self._pool = table.get("pool")
+        self.pool_mode = isinstance(self._pool, (list, tuple)) and len(self._pool) > 0
         positive = table.get("positive")
-        if not isinstance(positive, Mapping) or not positive:
-            raise ValueError(
-                f"{contexts_path}: expected a non-empty 'positive' mapping "
-                "{task_name: embedding}; re-run precompute_prompt_contexts.py."
-            )
-        self._positive = dict(positive)
+        self._positive = dict(positive) if isinstance(positive, Mapping) else {}
         self._default = self._positive.get("__default__")
+        if not self.pool_mode and not self._positive:
+            raise ValueError(
+                f"{contexts_path}: expected a 'pool' list or a non-empty 'positive' "
+                "mapping; re-run precompute_prompt_contexts.py."
+            )
         self.text_len = table.get("text_len")
         self.contexts_path = contexts_path
 
-    def contexts_for(self, task_names: Any, device: torch.device) -> list[Tensor]:
+    def contexts_for(self, batch: Any, device: torch.device, sample: bool = True) -> list[Tensor]:
+        """One ``[Lᵢ, C]`` embedding per clip. ``batch`` is a list of task_names
+        (task mode) or an int batch size (pool mode). A random draw when ``sample``
+        (training augmentation), the first/deterministic element at eval."""
+        if self.pool_mode:  # task-independent: sample the shared pool per clip
+            n = batch if isinstance(batch, int) else len(batch)
+            pool = self._pool
+            pick = lambda: pool[random.randrange(len(pool))] if sample and len(pool) > 1 else pool[0]
+            return [pick().to(device) for _ in range(n)]
+        task_names = batch
         if not isinstance(task_names, (list, tuple)):
             raise TypeError(
                 "PromptContextProvider expects batch['task_name'] to be a list of "
@@ -128,6 +150,8 @@ class PromptContextProvider:
                     f"No prompt embedding for task {name!r} and no '__default__' in "
                     f"{self.contexts_path}. Add it to the prompts file and re-run precompute."
                 )
+            if isinstance(emb, (list, tuple)):  # a set of paraphrases -> pick one
+                emb = emb[random.randrange(len(emb))] if sample and len(emb) > 1 else emb[0]
             out.append(emb.to(device))
         return out
 
@@ -189,7 +213,6 @@ class WanBatchPreprocessor:
         return torch.float32
 
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
-        del train
         video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
         batch_size = video.shape[0]
 
@@ -205,13 +228,13 @@ class WanBatchPreprocessor:
         target = noise - z0  # rectified-flow velocity (sigma-independent)
         t = sigma * self.config.timestep_scale
 
-        cond = self._build_condition(batch, batch_size)
+        cond = self._build_condition(batch, batch_size, train)
         # `x0` (clean latent) is kept alongside the velocity `target` so the
         # eval video logger can decode a correct ground-truth panel — decoding
         # `target` (= noise - z0) would render noise, not the source clip.
         return {"x_t": x_t, "t": t, "target": target, "x0": z0, "cond": cond}
 
-    def _build_condition(self, batch: Mapping[str, Any], batch_size: int) -> dict[str, Any]:
+    def _build_condition(self, batch: Mapping[str, Any], batch_size: int, train: bool = True) -> dict[str, Any]:
         cond: dict[str, Any] = {}
         keys = self.condition_keys or ("act",)
         for i, key in enumerate(keys):
@@ -226,13 +249,17 @@ class WanBatchPreprocessor:
         # passed as cond["context"] (a list of per-sample [Lᵢ, C] tensors). The
         # adapter's condition encoder ignores this key (reads only its own).
         if self.prompt_contexts is not None:
-            task_names = batch.get(self.config.task_key)
-            if task_names is None:
-                raise KeyError(
-                    f"prompt_contexts_path is set but batch has no '{self.config.task_key}'. "
-                    "Ensure the dataset emits task_name (MetaWorldTranslator does)."
-                )
-            cond["context"] = self.prompt_contexts.contexts_for(task_names, self.device)
+            if self.prompt_contexts.pool_mode:
+                # Task-independent: every clip samples the shared prompt pool.
+                cond["context"] = self.prompt_contexts.contexts_for(batch_size, self.device, sample=train)
+            else:
+                task_names = batch.get(self.config.task_key)
+                if task_names is None:
+                    raise KeyError(
+                        f"prompt_contexts_path is set but batch has no '{self.config.task_key}'. "
+                        "Ensure the dataset emits task_name (MetaWorldTranslator does)."
+                    )
+                cond["context"] = self.prompt_contexts.contexts_for(task_names, self.device, sample=train)
         return cond
 
     def _aggregate_action(self, action: Tensor) -> Tensor:
