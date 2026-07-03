@@ -82,14 +82,21 @@ class _TorchmetricPaired:
     def __init__(self, metric, key: str) -> None:
         self._metric = metric
         self._key = key
+        self._updated = False
 
     def reset(self) -> None:
         self._metric.reset()
+        self._updated = False
 
     def update(self, batch: _Batch) -> None:
         self._metric.update(batch.pred_frames01, batch.real_frames01)
+        self._updated = True
 
     def compute(self, prefix: str) -> dict[str, float]:
+        # No successful update this cycle (e.g. every eval batch OOM'd before it
+        # reached this metric): torchmetrics.compute() would raise on empty state.
+        if not self._updated:
+            return {}
         return {f"{prefix}/{self._key}": float(self._metric.compute().item())}
 
 
@@ -104,15 +111,20 @@ class _FID:
         from torchmetrics.image.fid import FrechetInceptionDistance
 
         self._metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+        self._updated = False
 
     def reset(self) -> None:
         self._metric.reset()
+        self._updated = False
 
     def update(self, batch: _Batch) -> None:
         self._metric.update(batch.real_frames01, real=True)
         self._metric.update(batch.pred_frames01, real=False)
+        self._updated = True
 
     def compute(self, prefix: str) -> dict[str, float]:
+        if not self._updated:
+            return {}
         return {f"{prefix}/fid": float(self._metric.compute().item())}
 
 
@@ -135,6 +147,7 @@ class _FVD:
     def reset(self) -> None:
         self._evaluator.empty_real_stats()
         self._evaluator.empty_fake_stats()
+        self._updated = False
 
     @staticmethod
     def _to_clip_uint8(pixels: Tensor):
@@ -144,8 +157,11 @@ class _FVD:
     def update(self, batch: _Batch) -> None:
         self._evaluator.add_real_stats(self._to_clip_uint8(batch.real_pixels))
         self._evaluator.add_fake_stats(self._to_clip_uint8(batch.pred_pixels))
+        self._updated = True
 
     def compute(self, prefix: str) -> dict[str, float]:
+        if not self._updated:
+            return {}
         return {f"{prefix}/fvd_{self.model_name}": float(self._evaluator.compute_fvd_from_stats())}
 
 
