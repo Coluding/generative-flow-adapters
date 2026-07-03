@@ -1,5 +1,5 @@
 # Wan2.2-TI2V-5B DiT backbone config (flow matching / velocity prediction).
-# Dims mirror external_repos/wan22/wan/configs/wan_ti2v_5B.py + shared_config.py.
+# Dims mirror external_repos/Wan2.2/wan/configs/wan_ti2v_5B.py + shared_config.py.
 # Consumed by models/base/wan2_2.py:Wan22DiTWrapper via model.params.dit_config.params.
 #
 # TI2V-5B is the unified text+image-to-video model. in_dim == VAE z_dim == 48

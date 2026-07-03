@@ -98,6 +98,6 @@ training:
     wandb:
       enable: true
       require_vae: false                # Wan2.2-VAE injected at runtime
-      project: wan22-avid-i2v-metaworld-noshortcut34
+      project: Wan2.2-avid-i2v-metaworld-noshortcut34
       num_samples: 3                    # three clips logged per eval grid
       fps: 3

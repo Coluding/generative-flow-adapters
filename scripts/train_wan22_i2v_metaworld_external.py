@@ -9,15 +9,16 @@ base is built:
 - old: provider ``wan2.2`` -> the vendored ``Wan22DiTWrapper`` (a hand-copied
   fork of the Wan code, with our own forward/sampling wiring);
 - new: provider ``wan2.2_external`` -> ``WanTI2VVideoModel``, which wraps the
-  upstream ``wan.WanTI2V`` from ``external_repos/wan22`` and exposes the strict
+  upstream ``wan.WanTI2V`` from ``external_repos/Wan2.2`` and exposes the strict
   ``BaseVideoModel`` interface (``encode``/``decode``/``denoise``/``generate``).
   The adapter composes at the ``denoise`` seam via ``AdaptedModel`` exactly as
   before — training is untouched; only the base object changed.
 
 The base's own Wan2.2-VAE is reused for the pixel->latent encode (no second VAE
-load). Generation-based eval (video panels, FID/FVD) is OFF by default here,
-since that path still uses the legacy reimplemented sampler we are retiring;
-held-out **loss** eval is unaffected. Pass ``--enable-eval-gen`` to re-enable.
+load). Generation-based eval (the native Wan step-size grid + FID/FVD) runs the
+frozen base's own ``generate`` loop and is ON by default, driven by the config
+cadences; held-out **loss** eval is unaffected. Pass ``--no-eval-gen`` to skip
+generation for a fast smoke run.
 
 Requires a CUDA device (the upstream WanTI2V pins ``cuda``).
 
@@ -75,10 +76,13 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--enable-eval-gen",
-        action="store_true",
-        help="Keep the config's generation-based eval (video panels + FID/FVD). Off by default "
-        "because that path still uses the legacy sampler; held-out loss eval always runs.",
+        "--eval-gen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run generation-based eval (the native Wan step-size grid + quality/FID/FVD metrics) "
+        "at the config's cadences. ON by default now that eval uses the native `generate` loop "
+        "(not the retired sampler). Pass --no-eval-gen to skip it (e.g. a fast smoke run); "
+        "held-out loss eval always runs.",
     )
     parser.add_argument("--eval-hdf5", default=None, help="Separate held-out MetaWorld HDF5 for loss eval.")
     parser.add_argument(
@@ -120,9 +124,10 @@ def main() -> None:
     val_fraction = args.val_fraction if args.val_fraction is not None else config.data.val_fraction
     want_eval = bool(config.training.eval_every_n_steps) and (eval_hdf5 is not None or val_fraction > 0.0)
 
-    # Generation-based eval uses the legacy sampler we are retiring — off unless
-    # explicitly requested. Held-out loss eval (above) is unaffected.
-    if not args.enable_eval_gen:
+    # Generation-based eval runs the native Wan `generate` loop now, so it is
+    # driven by the config cadences by default. --no-eval-gen zeros them for a
+    # fast smoke run. Held-out loss eval (above) is unaffected either way.
+    if not args.eval_gen:
         config.training.inference_every_n_steps = 0
         config.training.quality_metrics = []
         config.training.quality_dist_metrics = []
@@ -139,6 +144,32 @@ def main() -> None:
     max_area = args.max_area if args.max_area is not None else config.model.extra.get("max_area")
     max_area = int(max_area) if max_area is not None else None
     align = 2 * _WAN22_VAE_SPATIAL_STRIDE  # = 32
+
+    # Optional text conditioning for the frozen base. When model.extra.
+    # text_prompts_file is set, load its precomputed <stem>.contexts.pt table
+    # (from precompute_prompt_contexts.py) and condition the base on each clip's
+    # task prompt. null -> frame-only training (base uses its uncond context).
+    prompt_contexts_path = None
+    prompts_file = config.model.extra.get("text_prompts_file")
+    if prompts_file:
+        prompt_contexts_path = str(Path(prompts_file).with_suffix(".contexts.pt"))
+        if not Path(prompt_contexts_path).exists():
+            raise FileNotFoundError(
+                f"text_prompts_file={prompts_file} is set but {prompt_contexts_path} is missing. "
+                f"Run: python external_repos/Wan2.2/precompute_prompt_contexts.py "
+                f"--ckpt_dir {ckpt_dir} --prompts_file {prompts_file}"
+            )
+
+    # Feed the native eval grid/metrics the geometry + prompt table it needs
+    # (the Trainer only sees config.training). guide_scale / shift / use_prompt /
+    # frame_num are already user-facing in training.extra.
+    # setdefault so a smaller eval resolution set in the YAML (training.extra.
+    # inference_max_area) wins — lets eval generate at a lighter res than training
+    # to fit VRAM, without touching the training resolution.
+    config.training.extra.setdefault("inference_max_area", max_area)
+    config.training.extra["inference_temporal_length"] = temporal_length
+    config.training.extra["inference_prompt_contexts_path"] = prompt_contexts_path
+    config.training.extra.setdefault("inference_use_prompt", prompt_contexts_path is not None)
 
     # build_experiment now constructs AdaptedModel(WanTI2VVideoModel, AVID adapter).
     experiment = build_experiment(config)
@@ -169,11 +200,18 @@ def main() -> None:
         config=WanBatchPreprocessConfig(
             target_height=target_height, target_width=target_width, timestep_scale=timestep_scale,
             max_area=max_area, align_h=align, align_w=align,
+            prompt_contexts_path=prompt_contexts_path,
         ),
         condition_keys=condition_keys or ("act",),
         cond_frames=cond_frames,
         cond_frames_dist=cond_frames_dist,
     )
+    if prompt_contexts_path is not None:
+        n_tasks = len(preprocessor.prompt_contexts._positive) - 1  # minus __default__
+        print(f"text conditioning: ON — base conditioned on task prompts "
+              f"({n_tasks} tasks) from {prompt_contexts_path}")
+    else:
+        print("text conditioning: OFF — frame-only (base uses its unconditional context)")
 
     translator, dataset = build_metaworld_clip_dataset(
         config.data,
@@ -242,7 +280,7 @@ def main() -> None:
     print(f"params trainable={trainable:,} total={total:,} ({100.0 * trainable / max(total, 1):.2f}%)")
     print(f"dataset_size={len(dataset)} | steps={args.steps} batch_size={args.batch_size}")
     print(f"eval: {'loss@every=' + str(config.training.eval_every_n_steps) if eval_loader is not None else 'disabled'}"
-          f"  gen_eval={'on' if args.enable_eval_gen else 'off'}")
+          f"  gen_eval={'on' if args.eval_gen else 'off'}")
 
     trainer.train(
         loader=loader,

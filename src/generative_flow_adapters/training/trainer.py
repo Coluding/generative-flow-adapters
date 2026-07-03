@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import inspect
+import os
 import time
 from collections.abc import Callable, Iterable, Mapping
 
@@ -13,6 +15,7 @@ from generative_flow_adapters.inference import DiffusionInferenceSampler, FlowIn
 from generative_flow_adapters.losses.diffusion import DiffusionTrainingObjective
 from generative_flow_adapters.losses.flow_matching import FlowMatchingTrainingObjective
 from generative_flow_adapters.losses.registry import LossRegistry
+from generative_flow_adapters.models.base.video_model import BaseVideoModel
 from generative_flow_adapters.training.shortcut_targets import (
     compute_self_consistency_target_v,
     compute_self_consistency_target_v_flow,
@@ -70,6 +73,11 @@ class Trainer:
             self.base_inference_sampler = self._build_inference_sampler(base_model)
         else:
             self.base_inference_sampler = None
+        # The base model iff it is a BaseVideoModel (owns a native `.generate`
+        # loop, e.g. Wan2.2). When set, eval uses that loop (real CFG/shift/prompt)
+        # instead of the reimplemented latent sampler. `isinstance` — NOT just
+        # "has a .generate" — since diffusers/DynamiCrafter also expose a generate.
+        self._native_base = base_model if isinstance(base_model, BaseVideoModel) else None
         # Paper-faithful step-size schedule (normalised s ∈ (0,1]). When set it
         # drives both training (sampled step size per batch) and the eval grid,
         # and the injected step_level becomes normalised. Absent → legacy raw-
@@ -85,6 +93,9 @@ class Trainer:
         # bucket the shortcut loss into one per-rung series so the otherwise
         # `s`-marginalised aggregate curve becomes readable.
         self._last_shortcut_step_level: float | None = None
+        # Lazy cache for the CFG negative embedding used by native eval generation.
+        self._neg_ctx_loaded = False
+        self._neg_ctx: Tensor | None = None
         self.flow_objective = FlowMatchingTrainingObjective(
             sigma_min=float(config.extra.get("flow_sigma_min", 1e-5)),
             shift_schedule=bool(config.extra.get("flow_shift_schedule", True)),
@@ -257,10 +268,6 @@ class Trainer:
             prediction = prediction.float()
             loss = self._flow_loss(prediction, target, batch)
 
-        # Record each loss term separately so wandb shows the base loss and
-        # every shortcut-consistency term next to the combined total. For
-        # shortcut training their relative magnitudes are the key signal for
-        # spotting collapse or a mis-weighted term.
         loss_components: dict[str, float] = {"base_loss": float(loss.detach().cpu())}
 
         batch = dict(batch)
@@ -268,10 +275,6 @@ class Trainer:
             batch.setdefault("shortcut_target", shortcut_target)
             batch.setdefault("self_consistency_target", shortcut_target)
 
-        # The shortcut / consistency terms are plain MSE, so on diffusion-forcing
-        # batches they get the same predicted-frame masking as the base loss
-        # (observation frames carry no target); without a frame_mask this is the
-        # registry loss unchanged.
         def _consistency(name: str, pred: Tensor, tgt: Tensor) -> Tensor:
             masked = self._frame_masked_mse(pred, tgt, batch)
             return masked if masked is not None else LossRegistry.get_consistency_loss(name)(pred, tgt)
@@ -300,11 +303,6 @@ class Trainer:
             loss_components["multistep_consistency_loss"] = float(consistency.detach().cpu())
             loss = loss + self.config.multistep_consistency_weight * consistency
 
-        # Heun-smoothness regularizer (opt-in, orthogonal to shortcut training):
-        # penalize the velocity field's material derivative along its own
-        # predicted one-step trajectory. Adds one extra adapter forward (v0,
-        # with grad) plus one no-grad reference forward (v1). See thesis-vault
-        # theory/heun-smoothness-regularizer.md.
         if self.config.heun_smoothness_weight > 0.0:
             heun_loss = self._compute_heun_smoothness(x_t=x_t, t=t, cond=cond)
             loss_components["heun_smoothness_loss"] = float(heun_loss.detach().cpu())
@@ -325,14 +323,7 @@ class Trainer:
         self.global_step += 1
 
         metrics: dict[str, object] = {"loss": float(loss.detach().cpu())}
-        # Components were captured during the forward (pre-backward), so they
-        # reflect the loss at the params actually used — no redundant re-forward.
         metrics.update(loss_components)
-        # Per-rung shortcut loss: the aggregate `shortcut_direction_loss` mixes
-        # all sampled step sizes, so its magnitude swings with whichever `s` was
-        # drawn that batch. Re-log it under a per-`s` key (N = round(1/s) steps)
-        # so wandb shows one convergence curve per rung. Sparse by design — each
-        # step contributes to exactly one series.
         shortcut_s = self._last_shortcut_step_level
         if shortcut_s is not None and "shortcut_direction_loss" in loss_components:
             n_steps = max(1, int(round(1.0 / shortcut_s)))
@@ -340,9 +331,6 @@ class Trainer:
         generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
         if generated_samples is not None:
             metrics["generated_samples"] = generated_samples.detach().cpu()
-        # Push scalar metrics to wandb every step. Non-scalar entries (e.g.
-        # the `generated_samples` tensor) are filtered inside log_metrics; the
-        # video panels are pushed separately by `_maybe_generate_samples`.
         if self.wandb_logger is not None:
             self.wandb_logger.log_metrics(metrics, step=self.global_step)
         return metrics
@@ -466,6 +454,15 @@ class Trainer:
                     )
                 if eval_loader is not None and self._cadence_due(self.config.eval_every_n_steps):
                     self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
+                # Native eval grid (Wan2.2): the frozen base's own i2v loop on
+                # held-out clips at config CFG/shift/prompt. Legacy backbones build
+                # their grid inside `training_step` via `_maybe_generate_samples`.
+                if (
+                    eval_loader is not None
+                    and self._native_base is not None
+                    and self._cadence_due(self.config.inference_every_n_steps)
+                ):
+                    self._native_eval_grid(eval_loader, preprocessor=preprocessor)
                 if (
                     eval_loader is not None
                     and self.config.quality_dist_metrics
@@ -618,6 +615,10 @@ class Trainer:
         """
         if not metric_names:
             return {}
+        # Native backbones score on pixels from their own `.generate` loop, at the
+        # correct CFG/shift/prompt — not the reimplemented latent sampler.
+        if self._native_base is not None:
+            return self._native_quality_eval(eval_loader, preprocessor, metric_names, num_batches, num_steps)
         decoder = self.wandb_logger if getattr(self.wandb_logger, "can_decode", False) else None
         if decoder is None:
             return {}
@@ -678,6 +679,284 @@ class Trainer:
         if log:
             summary = " ".join(f"{k}={v:.4f}" for k, v in sorted(results.items()))
             print(f"  quality step={self.global_step} ({count} batches) {summary}")
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Native eval generation (backbone `.generate`) — the correct pipeline #
+    # for Wan2.2: the frozen base's own i2v loop with config-driven CFG /   #
+    # shift / prompt, producing decoded PIXELS. Used instead of the         #
+    # reimplemented flow sampler whenever the base is a BaseVideoModel that  #
+    # exposes `.generate` (falls back to the legacy sampler otherwise).      #
+    # ------------------------------------------------------------------ #
+    def _eval_gen_params(self) -> dict[str, object]:
+        """Config-driven inference parameters for the native eval rollout. All
+        live under ``training.extra`` so they are set in the YAML."""
+        e = self.config.extra
+        frame_num = e.get("inference_frame_num") or e.get("inference_temporal_length")
+        return {
+            "guide_scale": float(e.get("inference_guide_scale", 5.0)),
+            "shift": float(e.get("inference_shift", 5.0)),
+            "max_area": int(e.get("inference_max_area") or 704 * 1280),
+            "frame_num": int(frame_num) if frame_num else 121,
+            "seed": int(e.get("inference_seed", 0)),
+            "use_prompt": bool(e.get("inference_use_prompt", False)),
+        }
+
+    @staticmethod
+    def _release_cuda_cache() -> None:
+        """Return the caching allocator's reserved-but-idle blocks to the driver.
+
+        A training step reserves several GB of activations at native resolution
+        that stay *reserved* (not freed to the OS) after the step. Native eval
+        generation needs its own multi-GB activations on top — so without this the
+        rollout OOMs against a ~full device even though most of it is idle."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _eval_negative_ctx(self) -> Tensor | None:
+        """Lazily load the CFG negative embedding from the prompt table injected
+        via ``inference_prompt_contexts_path``; cached across eval cycles."""
+        if self._neg_ctx_loaded:
+            return self._neg_ctx
+        self._neg_ctx_loaded = True
+        path = self.config.extra.get("inference_prompt_contexts_path")
+        if path and os.path.exists(str(path)):
+            table = torch.load(str(path), map_location="cpu", weights_only=False)
+            neg = table.get("negative")
+            self._neg_ctx = neg if isinstance(neg, Tensor) else None
+        return self._neg_ctx
+
+    @staticmethod
+    def _pixels_to_uint8(video: Tensor) -> Tensor:
+        """``[3, N, H, W]`` in [-1,1] -> ``[N, 3, H, W]`` uint8 (logger layout)."""
+        v = video.detach().float().clamp(-1.0, 1.0).add(1.0).mul(127.5).round()
+        return v.permute(1, 0, 2, 3).to(torch.uint8).cpu()
+
+    @staticmethod
+    def _gt_to_uint8(raw_video_i: Tensor, out_h: int, out_w: int, num_frames: int) -> Tensor:
+        """Raw clip ``[T, H, W, 3]`` uint8 -> ``[n, 3, out_h, out_w]`` uint8, resized
+        to the generated resolution and sliced to ``num_frames``."""
+        v = raw_video_i[:num_frames].float().permute(0, 3, 1, 2)  # [n, 3, H, W]
+        v = torch.nn.functional.interpolate(v, size=(out_h, out_w), mode="bilinear", align_corners=False)
+        return v.round().clamp(0.0, 255.0).to(torch.uint8).cpu()
+
+    @torch.no_grad()
+    def _native_clip_rollout(
+        self, frame: Tensor, adapted_cond: dict | None, context: Tensor | None,
+        context_null: Tensor | None, num_steps: int, params: Mapping[str, object], device: object,
+    ) -> tuple[Tensor, Tensor]:
+        """Generate base + adapted PIXEL rollouts for one clip via the native
+        loop. Returns ``(adapted [3,N,H,W], base [3,N,H,W])`` in [-1, 1]."""
+        kw: dict[str, object] = {
+            "max_area": params["max_area"], "frame_num": params["frame_num"],
+            "sampling_steps": int(num_steps), "shift": params["shift"],
+            "guide_scale": params["guide_scale"], "seed": params["seed"],
+            # Offload the 10 GB DiT to CPU before the VAE decode (upstream does this
+            # when offload_model=True) so the decode fits alongside the resident
+            # training model on a 24 GB card. Restored to GPU after the eval loop.
+            "offload_model": True,
+        }
+        if context is not None:
+            kw["context"] = context.to(device)
+            kw["context_null"] = context_null.to(device) if context_null is not None else None
+        self._eval_mem("rollout-start")
+        base_px = self.model.base_model.generate(frame, **kw).cpu()  # off GPU before the next rollout
+        self._eval_mem("after-base-gen")
+        self._release_cuda_cache()
+        self._eval_mem("after-base-release")
+        adapted_px = self.model.generate(frame, cond=adapted_cond, **kw).cpu()
+        self._eval_mem("after-adapted-gen")
+        self._release_cuda_cache()
+        return adapted_px, base_px
+
+    def _eval_mem(self, tag: str) -> None:
+        """One-line GPU memory + DiT-device probe (first eval only) so we can see
+        whether the offload actually frees the DiT and where memory accumulates."""
+        if getattr(self, "_eval_mem_done", False) or not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        try:
+            dit_dev = str(next(self.model.base_model.dit.parameters()).device)
+        except Exception:
+            dit_dev = "?"
+        print(f"[eval-mem] {tag}: alloc={alloc:.2f}G reserved={reserved:.2f}G dit={dit_dev}", flush=True)
+
+    def _native_batch_conditions(self, raw_batch: Mapping[str, object], preprocessor, use_prompt: bool):
+        """Resolve per-clip conditioning for a raw eval batch: the observation
+        video, the adapter action tensor, and the positive text contexts (when
+        text conditioning is on). Returns ``(video, actions, contexts, negative)``."""
+        batch = _call_preprocessor(preprocessor, raw_batch, train=False) if preprocessor is not None else raw_batch
+        cond = batch.get("cond") if isinstance(batch.get("cond"), Mapping) else {}
+        actions = cond.get("action")
+        contexts = cond.get("context") if use_prompt else None
+        negative = self._eval_negative_ctx() if contexts is not None else None
+        # The observation frames are the RAW pixels — the preprocessed batch keeps
+        # only latents (x_t/x0/...), so read `video` from the raw batch.
+        return raw_batch.get("video"), actions, contexts, negative
+
+    @torch.no_grad()
+    def _native_eval_grid(self, eval_loader: Iterable, preprocessor) -> None:
+        """Native step-size eval grid: run the frozen base's own i2v loop (with
+        config CFG / shift / prompt) at every step count in the schedule, for both
+        the adapted and base models, and log a pixel grid. No-op unless native
+        generation, a wandb logger, and a schedule are all present."""
+        if self._native_base is None or self.wandb_logger is None:
+            return
+        schedule = self._eval_step_schedule()
+        if not schedule:
+            return
+        params = self._eval_gen_params()
+        use_prompt = bool(params["use_prompt"])
+        want = int(self.wandb_logger.num_samples)
+
+        # Collect `want` held-out clips across successive eval batches, so the grid
+        # honours num_samples regardless of the (memory-bound, usually 1) eval
+        # batch size — generation is per-clip, so this adds no per-rollout memory.
+        frames: list[Tensor] = []           # observation frame [H,W,3] per sample
+        clips: list[Tensor] = []            # full raw clip [T,H,W,3] for the GT panel
+        acts: list[Tensor | None] = []      # [1, A] adapter action per sample
+        ctxs: list[Tensor | None] = []      # positive text embedding per sample (or None)
+        neg: Tensor | None = None
+        for raw_batch in eval_loader:
+            if len(frames) >= want:
+                break
+            video, actions, contexts, neg = self._native_batch_conditions(raw_batch, preprocessor, use_prompt)
+            if not isinstance(video, Tensor):
+                continue
+            for i in range(video.shape[0]):
+                if len(frames) >= want:
+                    break
+                frames.append(video[i, 0])
+                clips.append(video[i])
+                acts.append(actions[i : i + 1] if isinstance(actions, Tensor) else None)
+                ctxs.append(contexts[i] if contexts is not None else None)
+        if not frames:
+            return
+        n_samples = len(frames)
+        step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
+        device = next(self.model.parameters()).device
+
+        was_training = self.model.training
+        self.model.eval()
+        self._release_cuda_cache()  # free the training step's reserved activations first
+        try:
+            adapted_by_steps: list[tuple[int, Tensor]] = []
+            base_by_steps: list[tuple[int, Tensor]] = []
+            out_h = out_w = n_frames = None
+            for num_steps, step_level in schedule:
+                ad_rows, bs_rows = [], []
+                for j in range(n_samples):
+                    adapted_cond = None
+                    if acts[j] is not None:
+                        adapted_cond = {"action": acts[j].to(device)}
+                        if step_level is not None:
+                            adapted_cond[step_level_key] = torch.full((1,), float(step_level), device=device)
+                    adapted_px, base_px = self._native_clip_rollout(
+                        frames[j], adapted_cond, ctxs[j], neg, num_steps, params, device
+                    )
+                    if out_h is None:
+                        out_h, out_w = int(base_px.shape[-2]), int(base_px.shape[-1])
+                        n_frames = min(int(base_px.shape[1]), int(clips[j].shape[0]))
+                    ad_rows.append(self._pixels_to_uint8(adapted_px)[:n_frames])
+                    bs_rows.append(self._pixels_to_uint8(base_px)[:n_frames])
+                adapted_by_steps.append((num_steps, torch.stack(ad_rows)))
+                base_by_steps.append((num_steps, torch.stack(bs_rows)))
+            gt = torch.stack([self._gt_to_uint8(clips[j], out_h, out_w, n_frames) for j in range(n_samples)])
+            cond_actions = [a for a in acts if a is not None]
+            self.wandb_logger.log_step_size_grid_pixels(
+                target_pixels=gt,
+                adapted_by_steps=adapted_by_steps,
+                base_by_steps=base_by_steps,
+                cond={"action": torch.cat(cond_actions)} if cond_actions else None,
+                step=self.global_step,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # A monitoring grid must never kill training. Drop the grid this cycle
+            # and free everything so the restore below can bring the DiT back.
+            print(
+                f"[eval] OOM during native eval grid at step {self.global_step} — "
+                "skipping this grid (lower training.extra.inference_max_area for larger grids).",
+                flush=True,
+            )
+            self._release_cuda_cache()
+        finally:
+            self.model.train(was_training)
+            self._eval_mem_done = True  # probe the first grid only
+            # Free eval-generation memory FIRST, then bring the DiT (offloaded to
+            # CPU during generation) back to `device` for the next training step.
+            self._release_cuda_cache()
+            self.model.to(device)
+            self._release_cuda_cache()
+
+    @torch.no_grad()
+    def _native_quality_eval(
+        self, eval_loader: Iterable, preprocessor, metric_names: list[str], num_batches: int, num_steps: int
+    ) -> dict[str, float]:
+        """Score quality metrics on native PIXEL rollouts (adapted + base) vs the
+        ground-truth clip, at a cheaper step count. Pixel twin of
+        ``_run_quality_eval`` — the native path decodes inside ``generate``."""
+        if not metric_names or self._native_base is None:
+            return {}
+        params = self._eval_gen_params()
+        device = next(self.model.parameters()).device
+        suites: dict[str, QualityMetricSuite] = {}
+        was_training = self.model.training
+        self.model.eval()
+        self._release_cuda_cache()  # free the training step's reserved activations first
+        count = 0
+        try:
+            for raw_batch in eval_loader:
+                if count >= num_batches:
+                    break
+                video, actions, contexts, neg = self._native_batch_conditions(
+                    raw_batch, preprocessor, bool(params["use_prompt"])
+                )
+                if not isinstance(video, Tensor):
+                    continue
+                ad_list, bs_list, gt_list = [], [], []
+                for i in range(video.shape[0]):
+                    adapted_cond = {"action": actions[i : i + 1].to(device)} if isinstance(actions, Tensor) else None
+                    ctx = contexts[i] if contexts is not None else None
+                    adapted_px, base_px = self._native_clip_rollout(
+                        video[i, 0], adapted_cond, ctx, neg, num_steps, params, device
+                    )
+                    n = min(int(base_px.shape[1]), int(video.shape[1]))
+                    oh, ow = int(base_px.shape[-2]), int(base_px.shape[-1])
+                    ad_list.append(self._pixels_to_uint8(adapted_px)[:n])
+                    bs_list.append(self._pixels_to_uint8(base_px)[:n])
+                    gt_list.append(self._gt_to_uint8(video[i], oh, ow, n))
+                adapted_px, base_px, gt_px = torch.stack(ad_list), torch.stack(bs_list), torch.stack(gt_list)
+                nf = int(adapted_px.shape[1])
+                suites.setdefault(
+                    "adapted", QualityMetricSuite(metric_names, device=device, num_video_frames=nf)
+                ).update(adapted_px, gt_px)
+                suites.setdefault(
+                    "base", QualityMetricSuite(metric_names, device=device, num_video_frames=nf)
+                ).update(base_px, gt_px)
+                count += 1
+        except torch.cuda.OutOfMemoryError:
+            print(
+                f"[eval] OOM during native quality eval at step {self.global_step} — "
+                "reporting metrics from the batches that fit (lower inference_max_area for more).",
+                flush=True,
+            )
+            self._release_cuda_cache()
+        finally:
+            self.model.train(was_training)
+            # Free FIRST, then restore the DiT to GPU after offloaded generation.
+            self._release_cuda_cache()
+            self.model.to(device)
+            self._release_cuda_cache()
+
+        results: dict[str, float] = {}
+        for variant, suite in suites.items():
+            results.update(suite.compute(prefix=f"eval/{variant}"))
+        if results and self.wandb_logger is not None:
+            self.wandb_logger.log_metrics(results, step=self.global_step)
+        if results and self.jsonl_logger is not None:
+            self.jsonl_logger.log(results, step=self.global_step, split="eval")
         return results
 
     def _save_checkpoint(
@@ -1075,6 +1354,8 @@ class Trainer:
 
     def _maybe_generate_samples(self, batch: Mapping[str, Tensor | object], model_type: str | None) -> Tensor | None:
         if model_type not in ("diffusion", "flow", "flow_matching"):
+            return None
+        if self._native_base is not None:
             return None
         if self.config.inference_every_n_steps is None or self.config.inference_every_n_steps <= 0:
             return None

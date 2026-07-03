@@ -253,6 +253,9 @@ class MetaWorldTranslator(Translator):
     def _base_clip(self, meta, *, start: int, stride: int, env_name: str) -> dict[str, object]:
         return {
             "caption": self._caption_for(meta["task_name"]),
+            # Raw task name (independent of caption_mode) — the key the Wan text
+            # preprocessor uses to look up a precomputed task prompt embedding.
+            "task_name": str(meta["task_name"]),
             "fps": int(self.fps),
             # `fs` is the value fed to the frozen base's fps channel — a fixed
             # constant decoupled from the real slice stride. `frame_stride`

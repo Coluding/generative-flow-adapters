@@ -106,7 +106,14 @@ def main() -> None:
     parser.add_argument("--frame-num", type=int, default=41, help="Pixel frames to generate (4n+1).")
     parser.add_argument("--steps", type=int, default=30, help="Sampling steps (unipc).")
     parser.add_argument("--shift", type=float, default=5.0, help="Flow-schedule shift (Wan2.2 TI2V-5B native = 5.0).")
-    parser.add_argument("--guide-scale", type=float, default=1.0, help="CFG scale (native command uses 1.0 = no CFG).")
+    parser.add_argument("--guide-scale", type=float, default=5.0,
+                        help="CFG scale. With a task prompt (--task), 5.0 steers toward it; 1.0 = no CFG. "
+                        "Inert for the unconditional/frame-only rollout (both branches equal).")
+    parser.add_argument("--prompt-contexts", default=None,
+                        help="Path to the precomputed prompt-context table (.contexts.pt). Default: derived "
+                        "from the config's model.extra.text_prompts_file. Enables the conditional rollout.")
+    parser.add_argument("--task", default="__default__",
+                        help="task_name key into the prompt table for the positive prompt (falls back to __default__).")
     parser.add_argument(
         "--offload-model",
         action=argparse.BooleanOptionalAction,
@@ -168,9 +175,27 @@ def main() -> None:
         frame_num=args.frame_num,
         sampling_steps=args.steps,
         shift=args.shift,
-        guide_scale=args.guide_scale,
         seed=args.seed,
     )
+
+    # Resolve the positive/negative text embeddings for the CONDITIONAL rollout.
+    # Path defaults to <config text_prompts_file>.contexts.pt; if neither is
+    # available we only run the unconditional (frame-only) rollout.
+    context = context_null = None
+    contexts_path = args.prompt_contexts
+    if contexts_path is None:
+        pf = config.model.extra.get("text_prompts_file")
+        if pf:
+            contexts_path = str(Path(pf).with_suffix(".contexts.pt"))
+    if contexts_path and Path(contexts_path).exists():
+        table = torch.load(contexts_path, map_location="cpu", weights_only=False)
+        positive = table["positive"]
+        context = positive.get(args.task, positive.get("__default__")).to(device)
+        context_null = table["negative"].to(device)
+        prompt_str = table.get("prompts", {}).get(args.task, table.get("prompts", {}).get("__default__", ""))
+        print(f"text conditioning: ON — task={args.task!r} -> {prompt_str[:70]!r}  (guide_scale={args.guide_scale})")
+    else:
+        print(f"text conditioning: OFF — no prompt table ({contexts_path}); unconditional rollout only.")
 
     frame = _load_frame(args.image, args.hdf5, args.clip_idx)
     iio.imwrite(os.path.join(args.out_dir, "cond_frame.png"), frame)
@@ -178,12 +203,22 @@ def main() -> None:
     print(f"base={type(model.base_model).__name__} (external wan.WanTI2V)  adapter={config.adapter.extra.get('backbone')}")
     print(f"conditioning frame: {frame.shape}  ({'file ' + args.image if args.image else 'hdf5 clip ' + str(args.clip_idx)})")
     print(f"gen: max_area={max_area} frame_num={args.frame_num} steps={args.steps} "
-          f"shift={args.shift} guide_scale={args.guide_scale} offload={args.offload_model}")
+          f"shift={args.shift} offload={args.offload_model}")
     print(f"adapter trainable params={trainable:,} (UNTRAINED — this is a plumbing check)")
 
-    print("\n[1/2] base-only generation (delegates to upstream wan.WanTI2V.generate)")
-    base_video = model.base_model.generate(frame, **gen_kwargs)
-    _save_video(base_video, os.path.join(args.out_dir, "base_only.mp4"), args.fps)
+    # --- Base-only: unconditional (frame-only) vs conditional (prompt + CFG) ----
+    print("\n[base] unconditional / frame-only rollout")
+    base_uncond = model.base_model.generate(frame, guide_scale=args.guide_scale, **gen_kwargs)
+    _save_video(base_uncond, os.path.join(args.out_dir, "base_uncond.mp4"), args.fps)
+
+    if context is not None:
+        print("[base] conditional rollout (task prompt + real CFG)")
+        base_cond = model.base_model.generate(
+            frame, context=context, context_null=context_null, guide_scale=args.guide_scale, **gen_kwargs
+        )
+        _save_video(base_cond, os.path.join(args.out_dir, "base_cond.mp4"), args.fps)
+        delta = (base_cond.float() - base_uncond.float()).abs().mean().item()
+        print(f"  mean|cond - uncond| = {delta:.4e}  (should be clearly > 0: the prompt is steering the base)")
 
     if args.base_only:
         print("\ndone (base only).")
@@ -200,11 +235,15 @@ def main() -> None:
         action = torch.zeros(action_dim, dtype=torch.float32, device=device)
     cond = {"action": action.unsqueeze(0)}  # [1, action_dim]
 
-    print("\n[2/2] adapted generation via AdaptedModel (real AVID adapter injected at the denoise seam)")
-    adapted_video = model.generate(frame, cond=cond, **gen_kwargs)
+    # --- Adapted: same conditioning as the base it composes on top of -----------
+    ctx_kwargs = dict(context=context, context_null=context_null) if context is not None else {}
+    tag = "conditional (task prompt + CFG)" if context is not None else "unconditional / frame-only"
+    print(f"\n[adapted] {tag} via AdaptedModel (real AVID adapter at the denoise seam)")
+    adapted_video = model.generate(frame, cond=cond, guide_scale=args.guide_scale, **ctx_kwargs, **gen_kwargs)
     _save_video(adapted_video, os.path.join(args.out_dir, "adapted.mp4"), args.fps)
 
-    max_abs = (adapted_video.float() - base_video.float()).abs().max().item()
+    ref = base_cond if context is not None else base_uncond
+    max_abs = (adapted_video.float() - ref.float()).abs().max().item()
     print(f"\n|adapted - base| max = {max_abs:.4e}  "
           "(small if the adapter residual is ~0 at init; large delta = adapter is already perturbing the base)")
     print(f"done -> {args.out_dir}")

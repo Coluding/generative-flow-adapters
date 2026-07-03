@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gfa-test-wan22-i2v
+#SBATCH --job-name=gfa-test-Wan2.2-i2v
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -57,5 +57,5 @@ GPU_MONITOR_PID=$!
 trap 'kill "$GPU_MONITOR_PID" 2>/dev/null || true' EXIT
 
 # ---- run --------------------------------------------------------------------
-# -s streams the [wan22-i2v] MSE print; extra args are forwarded to pytest.
+# -s streams the [Wan2.2-i2v] MSE print; extra args are forwarded to pytest.
 srun uv run pytest tests/test_wan22_i2v.py -v -s "$@"

@@ -30,11 +30,6 @@ model:
     dtype: bf16
     # Wan2.2-VAE latent geometry (vae_stride = (4, 16, 16), z_dim = 48).
     latent_channels: 48
-<<<<<<< HEAD
-    temporal_length: 121      # pixel-frame window -> 5 latent frames at stride 4
-    latent_height: 16        # 256 px. Bump to 32 (512 px) for a sharper eval grid
-    latent_width: 16         # (more GPU memory; the eval looks washed at 256 px).
-=======
     temporal_length: 41     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
     # Aspect-preserving, patch/VAE-aligned resolution à la Wan `best_output_size`
     # (external-base training script). Frames are sized to the largest (w,h) under
@@ -46,7 +41,11 @@ model:
     # vendored-base script): 256 px runs the base off-distribution ("looks washed").
     latent_height: 16
     latent_width: 16
->>>>>>> ed6e42c3a750b3a64d9c1664919bcb300bb5784a
+    # Text conditioning for the frozen base. Path to a prompts YAML
+    # (task_name -> prompt); precompute_prompt_contexts.py turns it into a
+    # <stem>.contexts.pt embedding table that training loads (no T5 at train
+    # time). null -> skip text conditioning: frame-only / unconditional base.
+    text_prompts_file: null   # e.g. configs/prompts/metaworld_tasks.yaml
 
 adapter:
   type: output
@@ -73,9 +72,8 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
-  inference_every_n_steps: 300
-  eval_every_n_steps: 5
-  inference_num_steps: 50
+  inference_every_n_steps: 2
+  eval_every_n_steps: 3
   # Paired generative-quality metrics scored on decoded pixels vs the aligned
   # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
   # and the frozen-base rollout are scored, so wandb shows the base→adapted
@@ -83,24 +81,37 @@ training:
   # (--eval-hdf5 or data.val_fraction). Rollout uses quality_eval_num_steps.
   quality_metrics: [psnr, ssim, lpips, mse]
   quality_eval_num_batches: 4
-  quality_eval_num_steps: 10          # cheaper sampler than the 50-step video panel
+  quality_eval_num_steps: 10
   # Distribution metrics (per-frame FID + clip FVD) on their own rarer cadence —
   # they load Inception / I3D and only mean anything over many samples, so they
   # stay off the per-cycle path. Needs cd-fvd installed.
   quality_dist_metrics: [fvd, fid]
   quality_dist_every_n_steps: 3
-  quality_dist_num_batches: 16
+  quality_dist_num_batches: 4
 
   extra:
     amp_dtype: bf16                  # autocast (NOT model dtype) — see bf16 memory note
     use_batch_timesteps_for_flow: true  # use the (x_t,t,target) the diffusion-forcing preprocessor builds
     flow_timestep_scale: 1000            # model fed t = sigma*scale (Wan native [0,1000])
+    # Native eval: grid step counts come from `eval_step_schedule` (per row);
+    # metrics use `quality_eval_num_steps`. inference_num_steps is NOT the grid.
+    inference_guide_scale: 5.0           # CFG at eval (the "much better" scale); needs a real prompt to bite
+    inference_shift: 5.0                 # Wan2.2 TI2V-5B native flow shift (the legacy sampler used 3.0)
+    inference_use_prompt: true           # condition the eval base on the task prompt (if text conditioning is on)
+    inference_frame_num: 41            # null -> temporal_length (must be 4n+1)
+    inference_seed: 0
+    # Eval-only resolution. UNSET -> training max_area (native 960x928). Offload
+    # already frees the DiT (probe: alloc 13.4G -> 3.4G, dit=cpu), so the DiT is
+    # NOT the limit — the VAE *decode* of a full clip at native res peaks ~15-18 GB
+    # of conv feature maps and just tips a 24 GB card over (base rollout fits, the
+    # adapted one misses by a fragmentation sliver). Decode cost scales with pixel
+    # area, so cap eval res here. 589824=768² (near-native, ~35% smaller decode,
+    # comfortable margin); 692224=832² (closer to native, tighter); 262144=512²
+    # (washed — base off-distribution). Only affects the monitoring grid, not training.
+    inference_max_area: 589824
     cond_frames: 1                       # eval/no-dist: leading observation frames held clean
     cond_frames_dist:
-      1: 0.4
-      2: 0.3
-      4: 0.2
-      8: 0.1
+      1: 1
     shortcut_anchor_prob: 0.6            # P(anchor step: standard flow loss only, no shortcut target)
     # Paper-faithful shortcut step schedule (normalised s ∈ (0,1], log2 ladder).
     shortcut_step_schedule:
@@ -111,17 +122,17 @@ training:
       base: 2
     # Multi-step shortcut eval grid (incl. the 25-step many-step reference).
     eval_step_schedule:
-      - {num_steps: 1,  step_level: 1.0}
-      - {num_steps: 2,  step_level: 0.5}
-      - {num_steps: 4,  step_level: 0.25}
-      - {num_steps: 8,  step_level: 0.125}
-      - {num_steps: 25, step_level: 0.04}
-      - {num_steps: 50, step_level: 0.02}
-      - {num_steps: 100, step_level: 0.01}
+     # - {num_steps: 1,  step_level: 1.0}
+     # - {num_steps: 2,  step_level: 0.5}
+     # - {num_steps: 4,  step_level: 0.25}
+     # - {num_steps: 8,  step_level: 0.125}
+     # - {num_steps: 25, step_level: 0.04}
+       - {num_steps: 50, step_level: 0.02}
+     # - {num_steps: 100, step_level: 0.01}
 
     wandb:
       enable: true
       require_vae: false                # Wan2.2-VAE injected at runtime
-      project: wan22-avid-i2v-metaworld34
+      project: Wan2.2-avid-i2v-metaworld34
       num_samples: 3                    # three clips logged per eval grid
       fps: 3

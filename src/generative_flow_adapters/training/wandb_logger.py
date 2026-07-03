@@ -186,6 +186,53 @@ class WandbLogger:
             )
         self._wandb.log(videos, step=int(step))
 
+    def log_step_size_grid_pixels(
+        self,
+        *,
+        target_pixels: Tensor,
+        adapted_by_steps: list[tuple[int, Tensor]],
+        base_by_steps: list[tuple[int, Tensor]] | None,
+        cond: object | None,
+        step: int,
+    ) -> None:
+        """Pixel-space twin of :meth:`log_step_size_grid` for backbones whose
+        native ``generate`` already returns decoded pixels (no VAE decode here).
+
+        All tensors are uint8 ``[S, T, C, H, W]`` (``S`` samples already sliced to
+        ``num_samples``); ``adapted_by_steps`` / ``base_by_steps`` are lists of
+        ``(num_steps, pixels)``. Layout matches ``log_step_size_grid``: each row is
+        ``[ground_truth | base@N | adapted@N]`` along width, rows stacked along
+        height top→bottom in schedule order.
+        """
+        if not adapted_by_steps:
+            return
+        sample_count = target_pixels.shape[0]
+        base_pixels = {n: px for n, px in base_by_steps} if base_by_steps else {}
+        actions = _maybe_extract_actions(cond)
+
+        videos: dict[str, Any] = {}
+        for i in range(sample_count):
+            rows = []
+            for num_steps, pixels in adapted_by_steps:
+                panels = [target_pixels[i]]
+                if num_steps in base_pixels:
+                    panels.append(base_pixels[num_steps][i])
+                panels.append(pixels[i])
+                rows.append(torch.cat(panels, dim=-1))
+            grid = torch.cat(rows, dim=-2)
+            cols = "gt | base | adapted" if base_pixels else "gt | adapted"
+            order = ", ".join(f"N={n}" for n, _ in adapted_by_steps)
+            caption = f"sample={i} | rows top→bottom: {order} | cols: {cols}"
+            if isinstance(actions, Tensor) and actions.shape[0] > i:
+                caption += self._format_action_block(actions[i])
+            videos[f"eval_step_grid/sample_{i}"] = self._wandb.Video(
+                grid.numpy(),
+                fps=self.fps,
+                format="mp4",
+                caption=caption,
+            )
+        self._wandb.log(videos, step=int(step))
+
     def log_step_size_grid(
         self,
         *,

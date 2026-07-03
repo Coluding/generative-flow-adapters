@@ -2,7 +2,7 @@
 
 Instead of vendoring Wan's model + sampling code (and reimplementing the
 denoising loop — which is what produced washed-out garbage), this wraps the
-upstream ``wan.WanTI2V`` from ``external_repos/wan22`` and calls **its own**
+upstream ``wan.WanTI2V`` from ``external_repos/Wan2.2`` and calls **its own**
 ``generate`` for sampling. Base-only output therefore matches the upstream repo
 by construction.
 
@@ -32,47 +32,91 @@ from torch import Tensor
 
 from generative_flow_adapters.models.base.video_model import BaseVideoModel, ComposeFn
 
-# Repo root -> external_repos/wan22 (the upstream Wan2.2 package lives here).
-_WAN22_REPO = Path(__file__).resolve().parents[4] / "external_repos" / "wan22"
+# Repo root -> external_repos/Wan2.2 (the upstream Wan2.2 package lives here).
+_WAN22_REPO = Path(__file__).resolve().parents[4] / "external_repos" / "Wan2.2"
 
 
 def _ensure_wan_importable() -> None:
-    """Put ``external_repos/wan22`` on ``sys.path`` so ``import wan`` resolves.
+    """Put ``external_repos/Wan2.2`` on ``sys.path`` so ``import wan`` resolves.
 
-    A deliberate alternative to ``pip install -e external_repos/wan22``: the repo
+    A deliberate alternative to ``pip install -e external_repos/Wan2.2``: the repo
     pins ``flash_attn`` / ``numpy<2`` etc., and installing it would churn the
     working venv even though its runtime deps are already satisfied here."""
     path = str(_WAN22_REPO)
     if path not in sys.path:
         if not _WAN22_REPO.exists():
             raise FileNotFoundError(
-                f"External Wan2.2 repo not found at {_WAN22_REPO}. Clone it into external_repos/wan22."
+                f"External Wan2.2 repo not found at {_WAN22_REPO}. Clone it into external_repos/Wan2.2."
             )
         sys.path.insert(0, path)
 
 
 class _ComposedDiT:
-    """Drop-in stand-in for ``wan.WanTI2V.model`` that routes each prediction
-    through a ``compose_fn``.
+    """Drop-in stand-in for ``wan.WanTI2V.model`` that (a) optionally routes each
+    prediction through a ``compose_fn`` (the adapter residual) and (b) **memoizes**
+    so a redundant, identical model call inside a denoising step runs only once.
 
-    Mirrors the DiT's call convention — ``(x, t, context, seq_len, y=None)`` with
-    ``x`` a list of ``[C, F, h, w]`` latents and the return a list of the same —
-    so Wan's denoising loop is unchanged. Attribute access (``.to``, ``.cpu``,
-    ``.parameters`` ...) passes through to the real DiT."""
+    Wan's loop calls the DiT twice per step — positive context then negative —
+    and combines them as ``uncond + g·(cond - uncond)``. In frame-only /
+    prompt-free generation both branches use the *same* cached unconditional
+    embedding, so the two calls are identical and the CFG term is zero. The
+    1-entry cache turns the second call into a hit, so the frozen DiT **and** the
+    adapter run once, not twice. With a genuine positive≠negative prompt the two
+    calls differ (different ``context`` tensor) → cache miss → both run, so real
+    CFG is untouched.
 
-    def __init__(self, dit, compose_fn: ComposeFn = lambda x,y,z : x) -> None:
+    The key is the per-step latent + timestep + context *identity*: a new step
+    brings fresh latent/timestep tensors, so there are no stale cross-step hits.
+    Correctness relies on generation being deterministic (``eval``/``no_grad``),
+    which the frozen base and the adapter both are here.
+
+    Mirrors the DiT call convention ``(x, t, context, seq_len, y=None)`` (``x`` a
+    list of ``[C,F,h,w]`` latents, returning a list of the same), so Wan's loop
+    is unchanged. Attribute access passes through to the real DiT.
+    """
+
+    def __init__(self, dit, compose_fn: ComposeFn | None = None) -> None:
         self._dit = dit
         self._compose_fn = compose_fn
+        self._cache_key: object | None = None
+        self._cache_out: list | None = None
 
     def __call__(self, x, t, context, seq_len, y=None):
+        # Identity of this (step, CFG-branch): the timestep value pins the step
+        # (monotonic schedule), the context tensor id distinguishes cond/uncond.
+        key = (float(t.reshape(-1).max()), id(x[0]), id(context[0]))
+        if key == self._cache_key:
+            return self._cache_out  # identical call this step -> skip the forward
         base = self._dit(x, t=t, context=context, seq_len=seq_len, y=y)  # list[[C,F,h,w]]
-        x_b = torch.stack(list(x), dim=0)          # [B, C, F, h, w]
-        base_b = torch.stack(list(base), dim=0)    # [B, C, F, h, w]
-        final = self._compose_fn(x_b, t, base_b)   # [B, C, F, h, w]
-        return [final[i] for i in range(final.shape[0])]
+        if self._compose_fn is None:
+            out = base
+        else:
+            x_b = torch.stack(list(x), dim=0)        # [B, C, F, h, w]
+            base_b = torch.stack(list(base), dim=0)  # [B, C, F, h, w]
+            final = self._compose_fn(x_b, t, base_b)
+            out = [final[i] for i in range(final.shape[0])]
+        self._cache_key, self._cache_out = key, out
+        return out
 
     def __getattr__(self, name):  # delegate .to / .cpu / .parameters / ...
         return getattr(self._dit, name)
+
+
+class _CachedT5:
+    """Stand-in for ``wan.WanTI2V.text_encoder`` that returns **precomputed** T5
+    embeddings by string, so upstream's own positive/negative CFG path runs at
+    inference without ever loading the 11 GB T5.
+
+    Upstream (in ``t5_cpu`` mode) calls ``text_encoder([prompt], device)`` and
+    expects a list of ``[L, C]`` tensors, then moves them to the DiT device — so
+    this only needs to look each prompt up in a small ``{string: embedding}`` map.
+    """
+
+    def __init__(self, table: dict) -> None:
+        self._table = table
+
+    def __call__(self, prompts, device=None):  # noqa: ARG002 (device applied upstream)
+        return [self._table[p] for p in prompts]
 
 
 class WanTI2VVideoModel(BaseVideoModel):
@@ -138,7 +182,16 @@ class WanTI2VVideoModel(BaseVideoModel):
 
         context = cond.get("context") if isinstance(cond, dict) else None
         if context is None:
+            # Frame-only regime: cached unconditional (empty-prompt) embedding.
             context = [self.wan._uncond_ctx.to(device)] * batch
+        else:
+            # Text-conditioned: a list of per-sample [Lᵢ, C] embeddings (or a
+            # [B, L, C] tensor). Move to the DiT device; the DiT pads to text_len.
+            if isinstance(context, Tensor):
+                context = [context[i] for i in range(context.shape[0])]
+            context = [c.to(device) for c in context]
+            if len(context) != batch:
+                raise ValueError(f"cond['context'] has {len(context)} entries but batch is {batch}.")
 
         x_list = [x_t[i].to(device) for i in range(batch)]
         t_model = self._to_dit_timesteps(t, batch, f, seq_len, tokens_per_frame, device)
@@ -179,12 +232,15 @@ class WanTI2VVideoModel(BaseVideoModel):
         conditioning: object,
         *,
         compose_fn: ComposeFn | None = None,
+        context: Tensor | None = None,
+        context_null: Tensor | None = None,
         max_area: int = 704 * 1280,
         frame_num: int = 121,
         sampling_steps: int = 50,
         shift: float = 5.0,
         guide_scale: float = 5.0,
         seed: int = 0,
+        offload_model: bool | None = None,
         **kwargs: object,
     ) -> Tensor:
         """Run Wan's native i2v rollout conditioned on the observation frame
@@ -193,15 +249,38 @@ class WanTI2VVideoModel(BaseVideoModel):
 
         ``compose_fn is None`` -> byte-for-byte upstream output. Otherwise every
         DiT prediction is replaced by ``compose_fn(x, t, base_pred)`` (see
-        :class:`~...models.base.video_model.BaseVideoModel.generate`)."""
+        :class:`~...models.base.video_model.BaseVideoModel.generate`).
+
+        **Text conditioning.** ``context is None`` -> frame-only / prompt-free
+        (both CFG branches use the cached unconditional embedding, so ``guide_scale``
+        is inert and the redundant forward is memoized away). Pass a precomputed
+        positive embedding ``context`` (``[L, C]``, from ``precompute_prompt_contexts``)
+        to run **real CFG** at ``guide_scale``: the positive prompt vs ``context_null``
+        (the negative embedding; defaults to the cached unconditional). No T5 is
+        loaded — a :class:`_CachedT5` stub feeds the embeddings into upstream's own
+        positive/negative loop.
+
+        The DiT is always wrapped in :class:`_ComposedDiT`, which memoizes the
+        redundant CFG forward when the two branches are identical (frame-only), so
+        the base (and, when adapted, the adapter) run once per step there; real CFG
+        (positive != negative) still runs both branches."""
         img = self._to_pil(conditioning)
+        prompted = context is not None
 
         original = self.wan.model
-        if compose_fn is not None:
-            self.wan.model = _ComposedDiT(original, compose_fn)
+        self.wan.model = _ComposedDiT(original, compose_fn)  # compose_fn None -> pass-through + memoize
+        saved_te, saved_t5_cpu = self.wan.text_encoder, self.wan.t5_cpu
+        input_prompt, n_prompt = None, ""
+        if prompted:
+            # Real CFG from cached embeddings: install a stub text encoder so
+            # upstream's own positive/negative path runs without T5.
+            neg = context_null if context_null is not None else self.wan._uncond_ctx
+            self.wan.text_encoder = _CachedT5({"__pos__": context, "__neg__": neg})
+            self.wan.t5_cpu = True  # take the branch that just looks up + moves to device
+            input_prompt, n_prompt = "__pos__", "__neg__"
         try:
             video = self.wan.generate(
-                None,  # input_prompt: unused in frame-only mode
+                input_prompt,  # None -> frame-only; "__pos__" -> stub lookup
                 img=img,
                 max_area=max_area,
                 frame_num=frame_num,
@@ -209,11 +288,13 @@ class WanTI2VVideoModel(BaseVideoModel):
                 sample_solver="unipc",
                 sampling_steps=sampling_steps,
                 guide_scale=guide_scale,
+                n_prompt=n_prompt,
                 seed=seed,
-                offload_model=self.offload_model,
+                offload_model=self.offload_model if offload_model is None else offload_model,
             )
         finally:
             self.wan.model = original
+            self.wan.text_encoder, self.wan.t5_cpu = saved_te, saved_t5_cpu
         return video
 
     @staticmethod

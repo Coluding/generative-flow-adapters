@@ -89,6 +89,49 @@ def best_output_size(w: int, h: int, dw: int, dh: int, expected_area: int) -> tu
     return ow2, oh2
 
 
+class PromptContextProvider:
+    """Maps a clip's ``task_name`` to its precomputed T5 text embedding so the
+    frozen base can be conditioned on a task prompt during training **without
+    loading T5**.
+
+    Loads the table produced by ``precompute_prompt_contexts.py`` — a dict with
+    ``{"positive": {task_name: [L, C] tensor, "__default__": ...}, ...}``. Unknown
+    tasks fall back to ``__default__``. Returns a *list* of per-sample ``[Lᵢ, C]``
+    tensors (prompts differ in length; the Wan DiT pads each internally), which is
+    exactly the ``context`` form ``WanTI2VVideoModel.denoise`` forwards to the DiT.
+    """
+
+    def __init__(self, contexts_path: str) -> None:
+        table = torch.load(contexts_path, map_location="cpu", weights_only=False)
+        positive = table.get("positive")
+        if not isinstance(positive, Mapping) or not positive:
+            raise ValueError(
+                f"{contexts_path}: expected a non-empty 'positive' mapping "
+                "{task_name: embedding}; re-run precompute_prompt_contexts.py."
+            )
+        self._positive = dict(positive)
+        self._default = self._positive.get("__default__")
+        self.text_len = table.get("text_len")
+        self.contexts_path = contexts_path
+
+    def contexts_for(self, task_names: Any, device: torch.device) -> list[Tensor]:
+        if not isinstance(task_names, (list, tuple)):
+            raise TypeError(
+                "PromptContextProvider expects batch['task_name'] to be a list of "
+                f"strings (got {type(task_names).__name__}); is the dataset emitting task_name?"
+            )
+        out: list[Tensor] = []
+        for name in task_names:
+            emb = self._positive.get(str(name), self._default)
+            if emb is None:
+                raise KeyError(
+                    f"No prompt embedding for task {name!r} and no '__default__' in "
+                    f"{self.contexts_path}. Add it to the prompts file and re-run precompute."
+                )
+            out.append(emb.to(device))
+        return out
+
+
 @dataclass(slots=True)
 class WanBatchPreprocessConfig:
     target_height: int | None = 256
@@ -105,6 +148,13 @@ class WanBatchPreprocessConfig:
     align_w: int = 32  # patch_size[2] * vae_stride[2]
     action_key: str = "action"
     action_aggregation: str = "sum"  # "sum" | "mean" | "last" over the clip's frames
+    # Optional text conditioning for the frozen base: path to the precomputed
+    # prompt-context table (from precompute_prompt_contexts.py). When set, each
+    # clip's `task_name` is mapped to its cached T5 embedding and passed to the
+    # base as cond["context"] — no T5 at train time. None -> frame-only (the base
+    # uses its cached unconditional context, current behaviour).
+    prompt_contexts_path: str | None = None
+    task_key: str = "task_name"  # batch key holding the per-clip task name
     sigma_min: float = 1e-5
     # The model is fed t = sigma * timestep_scale. Wan's pretrained convention is
     # t in [0, num_train_timesteps] = [0, 1000], so the interpolation coordinate
@@ -122,6 +172,13 @@ class WanBatchPreprocessor:
         # Dataset-emitted structured conditions (e.g. ("act",)); the first is
         # routed to the adapter's MLP action encoder under `action_key`.
         self.condition_keys = tuple(condition_keys)
+        # Optional text conditioning for the frozen base (task prompt -> cached
+        # T5 embedding). None -> frame-only (base uses its unconditional context).
+        self.prompt_contexts: PromptContextProvider | None = (
+            PromptContextProvider(config.prompt_contexts_path)
+            if config.prompt_contexts_path
+            else None
+        )
 
     @property
     def device(self) -> torch.device:
@@ -154,8 +211,8 @@ class WanBatchPreprocessor:
         # `target` (= noise - z0) would render noise, not the source clip.
         return {"x_t": x_t, "t": t, "target": target, "x0": z0, "cond": cond}
 
-    def _build_condition(self, batch: Mapping[str, Any], batch_size: int) -> dict[str, Tensor]:
-        cond: dict[str, Tensor] = {}
+    def _build_condition(self, batch: Mapping[str, Any], batch_size: int) -> dict[str, Any]:
+        cond: dict[str, Any] = {}
         keys = self.condition_keys or ("act",)
         for i, key in enumerate(keys):
             value = batch.get(key)
@@ -165,6 +222,17 @@ class WanBatchPreprocessor:
             # The first structured condition feeds the adapter's action encoder.
             out_key = self.config.action_key if i == 0 else key
             cond[out_key] = agg
+        # Text conditioning for the frozen base: task_name -> cached T5 embedding,
+        # passed as cond["context"] (a list of per-sample [Lᵢ, C] tensors). The
+        # adapter's condition encoder ignores this key (reads only its own).
+        if self.prompt_contexts is not None:
+            task_names = batch.get(self.config.task_key)
+            if task_names is None:
+                raise KeyError(
+                    f"prompt_contexts_path is set but batch has no '{self.config.task_key}'. "
+                    "Ensure the dataset emits task_name (MetaWorldTranslator does)."
+                )
+            cond["context"] = self.prompt_contexts.contexts_for(task_names, self.device)
         return cond
 
     def _aggregate_action(self, action: Tensor) -> Tensor:
