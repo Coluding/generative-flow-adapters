@@ -152,3 +152,19 @@ Output adapters are composed in [adapted_model.py](/Users/lukasbierling/Document
 
 - The LoRA path is implemented as a reusable injection mechanism for `nn.Linear` layers. It computes the adapter correction as the difference between the frozen base pass and a temporarily enabled low-rank pass.
 - The `diffusers` integration is intentionally thin. The repository should wrap pretrained models and route tensor I/O through a shared interface rather than fork core model code.
+
+│ max_area │ resolution │ vs native area │                    note                     │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 901120   │ 960×928    │ 1.00×          │ native (baseline, what works in the script) │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 802816   │ 896×896    │ 0.90×          │                                             │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 692224   │ 832×832    │ 0.78×          │                                             │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 589824   │ 768×768    │ 0.66×          │ drifted in eval — but with a 128px frame    │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 495616   │ 704×704    │ 0.56×          │                                             │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 409600   │ 640×640    │ 0.46×          │                                             │                                                                                                                                          
+  ├──────────┼────────────┼────────────────┼─────────────────────────────────────────────┤                                                                                                                                          
+  │ 262144   │ 512×512    │ 0.29×          │ washed                                      │
