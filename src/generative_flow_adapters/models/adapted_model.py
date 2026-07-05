@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import os
+import time
 from collections.abc import Mapping
 
 import torch
@@ -10,6 +13,26 @@ from generative_flow_adapters.adapters.output.interface import OutputAdapterResu
 from generative_flow_adapters.conditioning.encoders import ConditionEncoder
 from generative_flow_adapters.losses.diffusion import DiffusionScheduleConfig
 from generative_flow_adapters.models.base.interfaces import BaseGenerativeModel
+
+# Env-gated phase timer (shared switch with the trainer: GFA_PROFILE=1). Splits
+# the base vs adapter forward, which the trainer's single `model forward` can't see.
+_PROFILE = os.environ.get("GFA_PROFILE", "").strip().lower() not in ("", "0", "false", "no")
+
+
+@contextlib.contextmanager
+def _prof(name: str):
+    if not _PROFILE:
+        yield
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"[prof]     {name}: {(time.perf_counter() - t0) * 1000:.1f} ms", flush=True)
 
 
 class AdaptedModel(nn.Module):
@@ -64,7 +87,7 @@ class AdaptedModel(nn.Module):
         # unmodified base.
         if hasattr(self.adapter, "clear_dynamic_parameters"):
             self.adapter.clear_dynamic_parameters()
-        with torch.no_grad():
+        with torch.no_grad(), _prof("base forward (frozen 5B, no_grad)"):
             base_output = self.base_model(x_t, t, cond=cond)
         return self._compose_with_adapter(x_t, t, cond, base_output)
 
@@ -79,7 +102,8 @@ class AdaptedModel(nn.Module):
         encoded_cond = self.condition_encoder(cond, drop_mask=drop_mask) if self.condition_encoder is not None else cond
         base_direction = self._build_base_direction(base_output)
         adapter_cond = self._build_adapter_condition(raw_cond=cond, encoded_cond=encoded_cond, base_direction=base_direction)
-        adapter_result = self.adapter(x_t, t, adapter_cond, base_output=base_output)
+        with _prof("adapter forward (delta, trainable)"):
+            adapter_result = self.adapter(x_t, t, adapter_cond, base_output=base_output)
         return self._compose(base_output, adapter_result)
 
     @torch.no_grad()

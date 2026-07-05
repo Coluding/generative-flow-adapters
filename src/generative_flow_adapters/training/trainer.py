@@ -24,6 +24,11 @@ from generative_flow_adapters.training.shortcut_targets import (
 from generative_flow_adapters.training.quality_metrics import QualityMetricSuite
 from generative_flow_adapters.training.step_schedule import ShortcutStepSchedule
 
+# Per-phase step timing. Enable with `GFA_PROFILE=1 python ...` to see which part
+# of a training step (data, preprocess, base forward, shortcut target, backward,
+# optimizer, eval) is slow. Off by default (zero overhead).
+_PROFILE = os.environ.get("GFA_PROFILE", "").strip().lower() not in ("", "0", "false", "no")
+
 
 class Trainer:
     def __init__(
@@ -213,10 +218,11 @@ class Trainer:
             #TODO this is very dynamicrafter orientated atm --> for the future we need to adjust it
             target_scaled = self.diffusion_objective.scale_x_start(target, t)
             x_t = self.diffusion_objective.q_sample(x_start=target_scaled, t=t, noise=noise)
-            cond, shortcut_target = self._maybe_prepare_shortcut(
-                batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
-            )
-            with self._autocast():
+            with self._prof("  shortcut target prep (_maybe_prepare_shortcut)"):
+                cond, shortcut_target = self._maybe_prepare_shortcut(
+                    batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
+                )
+            with self._prof("  model forward (base + adapter)"), self._autocast():
                 prediction = self.model(x_t, t, cond)
             # Upcast the (possibly bf16) prediction back to fp32 so the loss and
             # backward run in full precision — keeps autograd dtypes consistent
@@ -258,10 +264,11 @@ class Trainer:
                     num_frames=num_frames,
                     patch_size=patch_size,
                 )
-            cond, shortcut_target = self._maybe_prepare_shortcut(
-                batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
-            )
-            with self._autocast():
+            with self._prof("  shortcut target prep (_maybe_prepare_shortcut)"):
+                cond, shortcut_target = self._maybe_prepare_shortcut(
+                    batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
+                )
+            with self._prof("  model forward (base + adapter)"), self._autocast():
                 prediction = self.model(x_t, t, cond)
             # See diffusion branch: upcast to fp32 for a precision-consistent
             # loss/backward. No-op when amp is off.
@@ -316,10 +323,12 @@ class Trainer:
         model_type = getattr(self.model, "model_type", None)
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        with self._prof("  backward"):
+            loss.backward()
         if self.config.grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-        self.optimizer.step()
+        with self._prof("  optimizer.step"):
+            self.optimizer.step()
         self.global_step += 1
 
         metrics: dict[str, object] = {"loss": float(loss.detach().cpu())}
@@ -429,15 +438,21 @@ class Trainer:
         start = time.time()
         while self.global_step < max_steps:
             epoch += 1
+            _prof_last = time.perf_counter()
             for raw_batch in loader:
                 if self.global_step >= max_steps:
                     break
-                batch = (
-                    _call_preprocessor(preprocessor, raw_batch)
-                    if preprocessor is not None
-                    else raw_batch
-                )
-                metrics = self.training_step(batch)
+                if _PROFILE:
+                    print(f"[prof] --- step {self.global_step} --- data(load+wait): "
+                          f"{(time.perf_counter() - _prof_last) * 1000:.1f} ms", flush=True)
+                with self._prof("preprocess (VAE encode + cond)"):
+                    batch = (
+                        _call_preprocessor(preprocessor, raw_batch)
+                        if preprocessor is not None
+                        else raw_batch
+                    )
+                with self._prof("training_step (fwd+bwd+opt) TOTAL"):
+                    metrics = self.training_step(batch)
                 loss_value = float(metrics["loss"])
                 running_loss += loss_value
                 running_count += 1
@@ -453,7 +468,8 @@ class Trainer:
                         f"steps/s={self.global_step / max(elapsed, 1e-6):.2f}"
                     )
                 if eval_loader is not None and self._cadence_due(self.config.eval_every_n_steps):
-                    self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
+                    with self._prof("eval cycle (loss)"):
+                        self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
                 # Native eval grid (Wan2.2): the frozen base's own i2v loop on
                 # held-out clips at config CFG/shift/prompt. Legacy backbones build
                 # their grid inside `training_step` via `_maybe_generate_samples`.
@@ -462,7 +478,8 @@ class Trainer:
                     and self._native_base is not None
                     and self._cadence_due(self.config.inference_every_n_steps)
                 ):
-                    self._native_eval_grid(eval_loader, preprocessor=preprocessor)
+                    with self._prof("native eval grid (generation)"):
+                        self._native_eval_grid(eval_loader, preprocessor=preprocessor)
                 if (
                     eval_loader is not None
                     and self.config.quality_dist_metrics
@@ -478,6 +495,7 @@ class Trainer:
                     )
                 if self._cadence_due(self.config.checkpoint_every_n_steps):
                     self._save_checkpoint(log=log_every > 0)
+                _prof_last = time.perf_counter()  # start of next-step data-wait window
 
         elapsed = time.time() - start
         avg_loss = running_loss / max(running_count, 1)
@@ -701,6 +719,23 @@ class Trainer:
             "seed": int(e.get("inference_seed", 0)),
             "use_prompt": bool(e.get("inference_use_prompt", False)),
         }
+
+    @contextlib.contextmanager
+    def _prof(self, name: str):
+        """Env-gated phase timer. Enable with ``GFA_PROFILE=1``. Syncs CUDA around
+        the block so async kernels are actually timed (otherwise numbers are lies)."""
+        if not _PROFILE:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[prof] {name}: {(time.perf_counter() - t0) * 1000:.1f} ms", flush=True)
 
     @staticmethod
     def _release_cuda_cache() -> None:

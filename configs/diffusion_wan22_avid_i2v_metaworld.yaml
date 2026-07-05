@@ -36,7 +36,7 @@ model:
     # `max_area` px, divisible by 32, matching the source aspect — the base's
     # native regime. 704*1280 is Wan's native budget; lower it (e.g. 262144=512²,
     # 147456=384²) to trade fidelity for GPU memory.
-    max_area: 901120         # 704 * 1280
+    max_area: 589824         # 704 * 1280
     # Fallback fixed size (used only when max_area is unset, e.g. the legacy
     # vendored-base script): 256 px runs the base off-distribution ("looks washed").
     latent_height: 16
@@ -45,7 +45,7 @@ model:
     # (task_name -> prompt); precompute_prompt_contexts.py turns it into a
     # <stem>.contexts.pt embedding table that training loads (no T5 at train
     # time). null -> skip text conditioning: frame-only / unconditional base.
-    text_prompts_file: null   # e.g. configs/prompts/metaworld_tasks.yaml
+    text_prompts_file: configs/prompts/metaworld_tasks.yaml   # null -> frame-only (no text)
 
 adapter:
   type: output
@@ -72,8 +72,8 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
-  inference_every_n_steps: 2
-  eval_every_n_steps: 3
+  inference_every_n_steps: 50
+  eval_every_n_steps: 50
   # Paired generative-quality metrics scored on decoded pixels vs the aligned
   # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
   # and the frozen-base rollout are scored, so wandb shows the base→adapted
@@ -86,7 +86,7 @@ training:
   # they load Inception / I3D and only mean anything over many samples, so they
   # stay off the per-cycle path. Needs cd-fvd installed.
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 3
+  quality_dist_every_n_steps: 50
   quality_dist_num_batches: 4
 
   extra:

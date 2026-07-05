@@ -23,6 +23,7 @@ def build_metaworld_clip_dataset(
     hdf5: str | None = None,
     frame_stride: int | None = None,
     sampling: str | None = None,
+    num_windows: int | None = None,
 ) -> tuple[MetaWorldTranslator, TranslatedClipDataset]:
     """Build ``(translator, dataset)`` from a :class:`DataConfig`.
 
@@ -42,6 +43,7 @@ def build_metaworld_clip_dataset(
     resolved_stride = data.frame_stride if frame_stride is None else int(frame_stride)
     resolved_sampling = sampling or data.sampling
     resolved_window = int(data.window_width) if data.window_width else int(default_window_width)
+    resolved_num_windows = num_windows if num_windows is not None else getattr(data, "num_windows", None)
 
     translator = MetaWorldTranslator(
         resolved_hdf5,
@@ -55,5 +57,6 @@ def build_metaworld_clip_dataset(
         window_width=resolved_window,
         frame_stride=resolved_stride,
         sampling=resolved_sampling,
+        num_windows=resolved_num_windows,
     )
     return translator, dataset

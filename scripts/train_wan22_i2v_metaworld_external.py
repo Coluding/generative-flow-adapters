@@ -73,6 +73,9 @@ def main() -> None:
     )
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
+    parser.add_argument("--num-windows", type=int, default=16,
+                        help="random mode: draw each clip from a fixed pool of K deterministic windows "
+                             "per episode (enables latent caching). 0 = unbounded random (cache can't hit).")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -93,6 +96,12 @@ def main() -> None:
     )
     parser.add_argument("--eval-every", type=int, default=None, help="Held-out loss eval cadence (steps). Overrides config.")
     parser.add_argument("--eval-batches", type=int, default=None, help="Batches averaged per loss-eval cycle. Overrides config.")
+    parser.add_argument("--latent-cache-dir", default=None,
+                        help="Dir for cached VAE latents (skips the ~3s/step encode). Default: <hdf5>.latents/.")
+    parser.add_argument("--no-latent-cache", action="store_true",
+                        help="Disable the latent cache (always run the VAE encode).")
+    parser.add_argument("--precompute-latents", action="store_true",
+                        help="Encode every clip to the latent cache and exit (no training). Run once before training.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -188,6 +197,18 @@ def main() -> None:
     from generative_flow_adapters.models.base.wan import make_wan_decode_fn
 
     vae = model.base_model.wan.vae
+    # VAE encode is the per-step bottleneck (profiler: ~4.4s at fp32). The Wan VAE
+    # runs encode/decode under `amp.autocast(dtype=self.dtype)`, defaulting to fp32.
+    # Switching to bf16 ~halves the encode (and speeds the eval decode) — the latent
+    # is still returned as fp32, so downstream is unchanged. Override with
+    # training.extra.vae_dtype: float32 to keep full precision.
+    vae_dtype_str = str(config.training.extra.get("vae_dtype", "bf16")).lower()
+    _vae_dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                  "fp16": torch.float16, "float16": torch.float16,
+                  "fp32": torch.float32, "float32": torch.float32}.get(vae_dtype_str)
+    if _vae_dtype is not None and getattr(vae, "dtype", None) != _vae_dtype:
+        vae.dtype = _vae_dtype
+        print(f"VAE encode/decode dtype -> {vae_dtype_str} (was fp32; speeds the per-step VAE encode)")
     if trainer.wandb_logger is not None:
         trainer.wandb_logger.set_decode_fn(make_wan_decode_fn(vae))
 
@@ -195,12 +216,19 @@ def main() -> None:
     timestep_scale = float(config.training.extra.get("flow_timestep_scale", 1000.0))
     cond_frames = int(config.training.extra.get("cond_frames", 1))
     cond_frames_dist = config.training.extra.get("cond_frames_dist")
+    # Latent cache: skip the frozen-VAE encode (per-step bottleneck) by caching z0
+    # per clip. Default dir derives from the hdf5 (resolution is in each key, so one
+    # dir is safe across max_area). Disabled with --no-latent-cache.
+    latent_cache_dir = None if args.no_latent_cache else (
+        args.latent_cache_dir or str(Path(args.hdf5).with_suffix("")) + ".latents"
+    )
     preprocessor = Wan22DiffusionForcingPreprocessor(
         vae=vae,
         config=WanBatchPreprocessConfig(
             target_height=target_height, target_width=target_width, timestep_scale=timestep_scale,
             max_area=max_area, align_h=align, align_w=align,
             prompt_contexts_path=prompt_contexts_path,
+            latent_cache_dir=latent_cache_dir,
         ),
         condition_keys=condition_keys or ("act",),
         cond_frames=cond_frames,
@@ -213,12 +241,14 @@ def main() -> None:
     else:
         print("text conditioning: OFF — frame-only (base uses its unconditional context)")
 
+    num_windows = args.num_windows or None  # 0 -> None (unbounded random, cache can't hit)
     translator, dataset = build_metaworld_clip_dataset(
         config.data,
         default_window_width=temporal_length,
         hdf5=args.hdf5,
         frame_stride=args.frame_stride,
         sampling=args.sampling,
+        num_windows=num_windows,
     )
 
     eval_dataset = None
@@ -230,6 +260,7 @@ def main() -> None:
             hdf5=eval_hdf5,
             frame_stride=args.frame_stride,
             sampling=args.sampling,
+            num_windows=num_windows,
         )
     elif want_eval:
         val_len = max(args.batch_size, int(len(dataset) * val_fraction))
@@ -281,6 +312,40 @@ def main() -> None:
     print(f"dataset_size={len(dataset)} | steps={args.steps} batch_size={args.batch_size}")
     print(f"eval: {'loss@every=' + str(config.training.eval_every_n_steps) if eval_loader is not None else 'disabled'}"
           f"  gen_eval={'on' if args.eval_gen else 'off'}")
+
+    # Offline latent precompute: encode EVERY clip (train + eval) into the cache and
+    # exit. Run once; subsequent training reads latents and skips the VAE (~3s/step).
+    if args.precompute_latents:
+        if preprocessor.latent_cache is None:
+            raise SystemExit("--precompute-latents needs the latent cache (drop --no-latent-cache).")
+        import time as _time
+
+        # Enumerate EXACTLY the windows the random sampler can draw. With a fixed
+        # K-window pool that's the deterministic (episode, start) set; otherwise
+        # (unbounded random / exhaustive) the dataset itself is the enumeration —
+        # though unbounded random can't be fully precomputed (infinite windows).
+        if num_windows is not None and dataset.sampling == "random":
+            precompute_set = dataset.fixed_window_enumeration()
+        else:
+            if dataset.sampling == "random":
+                print("WARNING: --num-windows 0 (unbounded random) — precompute only covers one "
+                      "random draw per episode; training will still miss most windows. Use K>0.")
+            precompute_set = dataset
+        full_loader = DataLoader(precompute_set, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, drop_last=False)
+        print(f"precomputing latents -> {latent_cache_dir}  ({len(precompute_set)} windows)")
+        total = len(precompute_set)
+        done, encoded, t0 = 0, 0, _time.time()
+        for raw_batch in full_loader:
+            bs, enc = preprocessor.precompute(raw_batch)
+            done += bs
+            encoded += enc
+            if done % 25 == 0 or done >= total:
+                print(f"  {done}/{total} windows  (encoded {encoded}, cached {done - encoded}) "
+                      f"{(_time.time() - t0) / max(done, 1):.2f}s/clip", flush=True)
+        print(f"done: encoded {encoded} new, {done - encoded} already cached "
+              f"-> {preprocessor.latent_cache.num_files()} files in {latent_cache_dir}")
+        return
 
     trainer.train(
         loader=loader,

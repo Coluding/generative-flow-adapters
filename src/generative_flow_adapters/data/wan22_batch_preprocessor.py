@@ -113,7 +113,9 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         batch_size = video.shape[0]
 
         # Wan2.2-VAE: list of [3, T, H, W] clips -> list of [48, T', h, w] latents.
-        z0 = torch.stack(self.vae.encode([video[i] for i in range(batch_size)]), dim=0).float()
+        # Cached per clip (data/latent_cache.py) — skips the VAE encode on a hit,
+        # which is the per-step bottleneck. Falls back to a plain encode with no cache.
+        z0 = self._encode_z0(video, batch, batch_size)
         t_lat = z0.shape[2]
 
         # Per-sample number of clean observation frames (>= 1 predicted frame
