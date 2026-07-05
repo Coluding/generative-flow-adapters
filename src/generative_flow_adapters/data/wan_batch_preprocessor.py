@@ -21,6 +21,7 @@ trainable adapter is conditioned on the action via the ``action`` key.
 
 from __future__ import annotations
 
+import os
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
+
+from generative_flow_adapters.data.latent_cache import LatentCache, latent_key
 
 from generative_flow_adapters.data.batch_preprocessor import (
     _center_crop_to,
@@ -179,6 +182,12 @@ class WanBatchPreprocessConfig:
     # uses its cached unconditional context, current behaviour).
     prompt_contexts_path: str | None = None
     task_key: str = "task_name"  # batch key holding the per-clip task name
+    # Disk cache of VAE-encoded latents (see data/latent_cache.py). The VAE encode
+    # is the per-step bottleneck and is pure recomputation (frozen VAE, deterministic
+    # pixels), so `z0` is cached per clip. None -> always encode. `write_latent_cache`
+    # controls filling it on a miss (training fills lazily; precompute forces it).
+    latent_cache_dir: str | None = None
+    write_latent_cache: bool = True
     sigma_min: float = 1e-5
     # The model is fed t = sigma * timestep_scale. Wan's pretrained convention is
     # t in [0, num_train_timesteps] = [0, 1000], so the interpolation coordinate
@@ -203,6 +212,9 @@ class WanBatchPreprocessor:
             if config.prompt_contexts_path
             else None
         )
+        self.latent_cache: LatentCache | None = (
+            LatentCache(config.latent_cache_dir) if config.latent_cache_dir else None
+        )
 
     @property
     def device(self) -> torch.device:
@@ -216,8 +228,9 @@ class WanBatchPreprocessor:
         video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
         batch_size = video.shape[0]
 
-        # Wan-VAE encodes a list of [C, T, H, W] clips -> list of [16, f, h, w].
-        z0 = torch.stack(self.vae.encode([video[i] for i in range(batch_size)]), dim=0).float()
+        # Wan-VAE encodes a list of [C, T, H, W] clips -> list of [48, f, h, w].
+        # Cached per clip when a latent cache is configured (skips the VAE on a hit).
+        z0 = self._encode_z0(video, batch, batch_size)
 
         noise = torch.randn_like(z0)
         # sigma in [0,1] is the interpolation coordinate; t fed to the model is
@@ -233,6 +246,69 @@ class WanBatchPreprocessor:
         # eval video logger can decode a correct ground-truth panel — decoding
         # `target` (= noise - z0) would render noise, not the source clip.
         return {"x_t": x_t, "t": t, "target": target, "x0": z0, "cond": cond}
+
+    def _encode_z0(self, video: Tensor, batch: Mapping[str, Any], batch_size: int) -> Tensor:
+        """VAE-encode ``video`` ([B,C,T,H,W]) to ``z0`` ([B,48,f,h,w]), using the
+        latent cache when configured: cache hits skip the VAE, misses encode (only
+        the misses, in one VAE call) and are written back when ``write_latent_cache``."""
+        if self.latent_cache is None:
+            return torch.stack(self.vae.encode([video[i] for i in range(batch_size)]), dim=0).float()
+
+        keys = self._latent_keys(video, batch, batch_size)
+        z_list: list[Tensor | None] = [None] * batch_size
+        miss_idx: list[int] = []
+        for i, k in enumerate(keys):
+            cached = self.latent_cache.get(k) if k is not None else None
+            if cached is not None:
+                z_list[i] = cached.to(self.device).float()
+            else:
+                miss_idx.append(i)
+        self.last_encoded = len(miss_idx)  # how many this call had to run the VAE on (misses)
+        if os.environ.get("GFA_DEBUG_CACHE") and keys:
+            k0 = keys[0]
+            present = (k0 in self.latent_cache) if k0 is not None else "NO-KEY(missing batch fields)"
+            print(f"[cache] miss {len(miss_idx)}/{batch_size} | key0={k0!r} present={present}", flush=True)
+        if miss_idx:
+            encoded = self.vae.encode([video[i] for i in miss_idx])  # same order as miss_idx
+            for j, i in enumerate(miss_idx):
+                z = encoded[j].float()
+                z_list[i] = z
+                if keys[i] is not None and self.config.write_latent_cache:
+                    self.latent_cache.put(keys[i], z)
+        return torch.stack([z for z in z_list if z is not None], dim=0)
+
+    def _latent_keys(self, video: Tensor, batch: Mapping[str, Any], batch_size: int) -> list[str | None]:
+        """Per-sample cache keys from the clip's stable identity + its T×H×W. Returns
+        ``None`` for a sample if the dataset didn't emit the identity fields (then it
+        is always encoded, never cached)."""
+        env, ep = batch.get("env_name"), batch.get("episode_idx")
+        st, fs = batch.get("start_idx"), batch.get("frame_stride")
+        if any(v is None for v in (env, ep, st, fs)):
+            return [None] * batch_size
+
+        def _item(seq: Any, i: int) -> Any:
+            v = seq[i]
+            return v.item() if isinstance(v, Tensor) else v
+
+        t, h, w = int(video.shape[2]), int(video.shape[3]), int(video.shape[4])
+        keys: list[str | None] = []
+        for i in range(batch_size):
+            try:
+                keys.append(latent_key(_item(env, i), _item(ep, i), _item(st, i), _item(fs, i), t, h, w))
+            except Exception:
+                keys.append(None)
+        return keys
+
+    @torch.no_grad()
+    def precompute(self, batch: Mapping[str, Any]) -> tuple[int, int]:
+        """Encode a batch's clips and write them to the latent cache (no flow-matching
+        triple built). Used by the offline precompute pass. Returns
+        ``(batch_size, num_newly_encoded)`` — the second is 0 when all were cache hits."""
+        if self.latent_cache is None:
+            raise RuntimeError("precompute() needs latent_cache_dir set on the preprocessor config.")
+        video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
+        self._encode_z0(video, batch, video.shape[0])
+        return int(video.shape[0]), int(getattr(self, "last_encoded", 0))
 
     def _build_condition(self, batch: Mapping[str, Any], batch_size: int, train: bool = True) -> dict[str, Any]:
         cond: dict[str, Any] = {}
