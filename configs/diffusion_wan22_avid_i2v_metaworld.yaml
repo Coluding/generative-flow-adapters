@@ -51,8 +51,10 @@ adapter:
   type: output
   hidden_dim: 256
   feature_dim: 48            # Wan2.2 latent channel count
+  composition: mask_mix      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
+  gate_bias: 4.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
   extra:
-    backbone: wan            # AVID-style: a small action-conditioned Wan DiT delta
+    backbone: wan            # AVID-style: a small action-conditioned Wan DiT
     wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
     condition_on_base_outputs: true
     use_step_level_conditioning: true

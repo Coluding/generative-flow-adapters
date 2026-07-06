@@ -42,9 +42,13 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         use_step_level: bool = True,
         step_level_key: str = "step_level",
         step_level_transform: str = "log2",
+        output_mask: bool = False,
+        predict_full: bool = False,
     ) -> None:
         super().__init__()
         self.step_level_key = step_level_key
+        self.output_mask = output_mask
+        self.predict_full = predict_full
         self.module = ActionWanModel(
             in_dim=in_dim,
             out_dim=out_dim,
@@ -57,6 +61,8 @@ class Wan21OutputAdapter(OutputAdapterInterface):
             use_step_level=use_step_level,
             step_level_transform=step_level_transform,
             condition_on_base_outputs=condition_on_base_outputs,
+            output_mask=output_mask,
+            predict_full=predict_full,
         )
 
     @classmethod
@@ -83,14 +89,27 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         # condition dropout / CFG is applied upstream by the encoder's null path.
         cond_embedding = resolve_condition_embedding(cond)
         step_level = cond.get(self.step_level_key) if isinstance(cond, Mapping) else None
-        delta = self.module(
+        result = self.module(
             x_t,
             t,
             cond_embedding=cond_embedding,
             step_level=step_level if isinstance(step_level, Tensor) else None,
             base_output=base_output,
         )
-        return OutputAdapterResult(adapter_output=delta.to(x_t.dtype), output_kind="delta")
+        if self.output_mask:
+            # Gated composition: the main head plus a per-pixel gate.
+            #   mask_mix (predict_full):  main is a standalone *prediction*;
+            #     AdaptedModel composes base*σ(gate+b) + pred*(1-σ(gate+b)).
+            #   gated_residual:           main is a ~0-init *delta*;
+            #     AdaptedModel composes base + σ(gate+b)*Δ.
+            main, gate = result
+            kind = "prediction" if self.predict_full else "delta"
+            return OutputAdapterResult(
+                adapter_output=main.to(x_t.dtype),
+                output_kind=kind,
+                gate=gate.to(x_t.dtype),
+            )
+        return OutputAdapterResult(adapter_output=result.to(x_t.dtype), output_kind="delta")
 
 
 def _load_action_wan_params(config_path: str) -> dict[str, Any]:
