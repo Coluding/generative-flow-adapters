@@ -59,6 +59,8 @@ class ActionWanModel(nn.Module):
         step_level_transform: str = "log2",
         condition_on_base_outputs: bool = True,
         use_text_context: bool = False,
+        output_mask: bool = False,
+        predict_full: bool = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0 and (dim // num_heads) % 2 == 0
@@ -79,6 +81,11 @@ class ActionWanModel(nn.Module):
         self.step_level_transform = step_level_transform
         self.condition_on_base_outputs = condition_on_base_outputs
         self.use_text_context = use_text_context
+        # output_mask: emit a per-pixel gate head alongside the main head.
+        # predict_full: the main head is a *standalone prediction* (xavier init,
+        # for mask_mix) rather than a ~0 delta (zero init, for add / gated_residual).
+        self.output_mask = output_mask
+        self.predict_full = predict_full
 
         # The adapter optionally sees the base output concatenated on channels.
         effective_in = in_dim * (2 if condition_on_base_outputs else 1)
@@ -113,6 +120,11 @@ class ActionWanModel(nn.Module):
             ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
+        # AVID prediction-blend (mask_mix): emit a per-pixel gate/mask logit
+        # alongside the prediction. 1 channel, broadcast over the out_dim latent
+        # channels in the blend base*sigma(gate) + pred*(1-sigma(gate)).
+        if output_mask:
+            self.gate_head = Head(dim, 1, patch_size, eps)
 
         d = dim // num_heads
         self.freqs = torch.cat(
@@ -128,9 +140,20 @@ class ActionWanModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
-        # Zero-init the head so the delta is ~0 at init (identity composition).
-        nn.init.zeros_(self.head.head.weight)
-        nn.init.zeros_(self.head.head.bias)
+        if self.output_mask:
+            # Zero-init the gate head so its logit is 0 at init. For mask_mix a
+            # positive gate_bias then makes sigma(gate)≈1 (keep the base); for
+            # gated_residual sigma(0)=0.5 but the residual is ~0 anyway, so both
+            # start at identity.
+            nn.init.zeros_(self.gate_head.head.weight)
+            nn.init.zeros_(self.gate_head.head.bias)
+        if not self.predict_full:
+            # Delta modes (add / gated_residual): zero-init the main head so the
+            # residual is ~0 at init (identity composition). mask_mix instead
+            # keeps the xavier init — its main head is a real prediction that the
+            # gate blends in, and identity comes from the gate.
+            nn.init.zeros_(self.head.head.weight)
+            nn.init.zeros_(self.head.head.bias)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -161,8 +184,12 @@ class ActionWanModel(nn.Module):
         step_level: Tensor | None = None,
         base_output: Tensor | None = None,
         context: Tensor | None = None,
-    ) -> Tensor:
-        """``x``: ``[B, in_dim, T, H, W]`` -> delta ``[B, out_dim, T, H, W]``."""
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """``x``: ``[B, in_dim, T, H, W]`` -> ``[B, out_dim, T, H, W]``.
+
+        Returns a single tensor (delta or standalone prediction) by default; when
+        ``output_mask`` is set, returns ``(prediction, gate)`` where ``gate`` is a
+        ``[B, 1, T, H, W]`` per-pixel mask logit for the AVID prediction-blend."""
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
@@ -193,13 +220,16 @@ class ActionWanModel(nn.Module):
 
         for block in self.blocks:
             seq = block(seq, e0, seq_lens, grid_sizes, self.freqs, ctx, None)
-        seq = self.head(seq, e)
-        return self._unpatchify(seq, (f, h, w), b)
+        prediction = self._unpatchify(self.head(seq, e), (f, h, w), b, self.out_dim)
+        if self.output_mask:
+            gate = self._unpatchify(self.gate_head(seq, e), (f, h, w), b, 1)
+            return prediction, gate
+        return prediction
 
-    def _unpatchify(self, x: Tensor, grid: tuple[int, int, int], batch: int) -> Tensor:
+    def _unpatchify(self, x: Tensor, grid: tuple[int, int, int], batch: int, channels: int) -> Tensor:
         f, h, w = grid
         pt, ph, pw = self.patch_size
-        c = self.out_dim
+        c = channels
         x = x.view(batch, f, h, w, pt, ph, pw, c)
         x = torch.einsum("bfhwpqrc->bcfphqwr", x)
         return x.reshape(batch, c, f * pt, h * ph, w * pw)

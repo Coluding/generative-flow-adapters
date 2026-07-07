@@ -51,8 +51,10 @@ adapter:
   type: output
   hidden_dim: 256
   feature_dim: 48            # Wan2.2 latent channel count
+  composition: mask_mix      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
+  gate_bias: 4.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
   extra:
-    backbone: wan            # AVID-style: a small action-conditioned Wan DiT delta
+    backbone: wan            # AVID-style: a small action-conditioned Wan DiT
     wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
     condition_on_base_outputs: true
     use_step_level_conditioning: true
@@ -72,7 +74,7 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
-  inference_every_n_steps: 50
+  inference_every_n_steps: 3
   eval_every_n_steps: 50
   # Paired generative-quality metrics scored on decoded pixels vs the aligned
   # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
@@ -122,12 +124,12 @@ training:
       base: 2
     # Multi-step shortcut eval grid (incl. the 25-step many-step reference).
     eval_step_schedule:
-     # - {num_steps: 1,  step_level: 1.0}
-     # - {num_steps: 2,  step_level: 0.5}
-     # - {num_steps: 4,  step_level: 0.25}
-     # - {num_steps: 8,  step_level: 0.125}
-     # - {num_steps: 25, step_level: 0.04}
-       - {num_steps: 50, step_level: 0.02}
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
      # - {num_steps: 100, step_level: 0.01}
 
     wandb:

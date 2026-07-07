@@ -230,6 +230,13 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
         # Thread feature_dim through as in_dim/out_dim so the patch-embed matches
         # the real latents; falls back to the tier file's value when unset.
         latent_channels = int(feature_dim) if feature_dim else None
+        # Derive the head layout from the composition (single source of truth):
+        #   mask_mix       -> gate + standalone prediction (output_kind="prediction")
+        #   gated_residual -> gate + ~0-init delta         (output_kind="delta")
+        #   add / other    -> no gate, plain delta
+        composition = (adapter.composition or "add").lower()
+        is_mask_mix = composition in {"mask_mix", "avid_mask_mix"}
+        is_gated_residual = composition in {"gated_residual", "gated_add", "residual_mask"}
         return Wan21OutputAdapter.from_config(
             wan_adapter_config_path=wan_adapter_config_path,
             cond_dim=cond_dim,
@@ -239,6 +246,8 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
             use_step_level=adapter.extra.get("use_step_level_conditioning"),
             step_level_key=adapter.extra.get("step_level_key"),
             step_level_transform=adapter.extra.get("step_level_transform"),
+            output_mask=is_mask_mix or is_gated_residual,
+            predict_full=is_mask_mix,
         )
 
     if backbone in {"unet", "dynamicrafter"}:
