@@ -109,13 +109,15 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         return ks.clamp_(min=0, max=t_lat - 1)
 
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
-        video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
-        batch_size = video.shape[0]
+        raw_video = batch["video"]
+        batch_size = int(raw_video.shape[0])
 
         # Wan2.2-VAE: list of [3, T, H, W] clips -> list of [48, T', h, w] latents.
-        # Cached per clip (data/latent_cache.py) — skips the VAE encode on a hit,
-        # which is the per-step bottleneck. Falls back to a plain encode with no cache.
-        z0 = self._encode_z0(video, batch, batch_size)
+        # `_encode_z0` is cache-first (data/latent_cache.py): on a hit it returns
+        # the cached latent WITHOUT resizing/encoding the raw frames — skipping both
+        # the VAE encode and the CPU LANCZOS resize (the per-step bottleneck). Pass
+        # the RAW uint8 video so the resize is deferred to the miss path only.
+        z0 = self._encode_z0(raw_video, batch, batch_size)
         t_lat = z0.shape[2]
 
         # Per-sample number of clean observation frames (>= 1 predicted frame
