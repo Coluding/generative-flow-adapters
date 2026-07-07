@@ -225,12 +225,15 @@ class WanBatchPreprocessor:
         return torch.float32
 
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
-        video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
-        batch_size = video.shape[0]
+        raw_video = batch["video"]
+        batch_size = int(raw_video.shape[0])
 
         # Wan-VAE encodes a list of [C, T, H, W] clips -> list of [48, f, h, w].
-        # Cached per clip when a latent cache is configured (skips the VAE on a hit).
-        z0 = self._encode_z0(video, batch, batch_size)
+        # Cached per clip when a latent cache is configured. `_encode_z0` is
+        # cache-first: on a full hit the raw frames are never resized/uploaded
+        # (the resized latent already exists), skipping both the VAE and the
+        # LANCZOS resize — the per-step cost collapses to a disk read.
+        z0 = self._encode_z0(raw_video, batch, batch_size)
 
         noise = torch.randn_like(z0)
         # sigma in [0,1] is the interpolation coordinate; t fed to the model is
@@ -247,14 +250,32 @@ class WanBatchPreprocessor:
         # `target` (= noise - z0) would render noise, not the source clip.
         return {"x_t": x_t, "t": t, "target": target, "x0": z0, "cond": cond}
 
-    def _encode_z0(self, video: Tensor, batch: Mapping[str, Any], batch_size: int) -> Tensor:
-        """VAE-encode ``video`` ([B,C,T,H,W]) to ``z0`` ([B,48,f,h,w]), using the
-        latent cache when configured: cache hits skip the VAE, misses encode (only
-        the misses, in one VAE call) and are written back when ``write_latent_cache``."""
+    def _encode_z0(self, raw_video: Tensor, batch: Mapping[str, Any], batch_size: int) -> Tensor:
+        """VAE-encode the batch's clips to ``z0`` ([B,48,f,h,w]), cache-first.
+
+        ``raw_video`` is the *un-resized* dataset video ([B,T,H,W,3] uint8). Cache
+        keys are built from the raw frame dims via ``_output_hw`` (the resized
+        geometry is deterministic, so no resize is needed to look a clip up). Only
+        the **misses** are then resized, uploaded and VAE-encoded — on a full hit
+        the pixels are never touched. Misses are written back when
+        ``write_latent_cache``."""
         if self.latent_cache is None:
+            video = self._normalize_video(raw_video).to(device=self.device, dtype=torch.float32)
+            self.last_encoded = batch_size
             return torch.stack(self.vae.encode([video[i] for i in range(batch_size)]), dim=0).float()
 
-        keys = self._latent_keys(video, batch, batch_size)
+        # Predict the resized T×H×W without resizing (the fast path). The dataset
+        # never emits non-uint8 video; if it did, fall back to resizing up front.
+        standard = raw_video.dim() == 5 and raw_video.shape[-1] == 3 and raw_video.dtype == torch.uint8
+        normalized: Tensor | None = None
+        if standard:
+            frames = int(raw_video.shape[1])
+            out_h, out_w = self._output_hw(int(raw_video.shape[2]), int(raw_video.shape[3]))
+        else:
+            normalized = self._normalize_video(raw_video).to(device=self.device, dtype=torch.float32)
+            frames, out_h, out_w = int(normalized.shape[2]), int(normalized.shape[3]), int(normalized.shape[4])
+
+        keys = self._latent_keys(batch, batch_size, frames, out_h, out_w)
         z_list: list[Tensor | None] = [None] * batch_size
         miss_idx: list[int] = []
         for i, k in enumerate(keys):
@@ -269,7 +290,13 @@ class WanBatchPreprocessor:
             present = (k0 in self.latent_cache) if k0 is not None else "NO-KEY(missing batch fields)"
             print(f"[cache] miss {len(miss_idx)}/{batch_size} | key0={k0!r} present={present}", flush=True)
         if miss_idx:
-            encoded = self.vae.encode([video[i] for i in miss_idx])  # same order as miss_idx
+            # Resize + normalize + upload ONLY the missing clips: all of them on a
+            # cold cache, none on a warm one (this whole block is skipped).
+            if normalized is None:
+                miss_video = self._normalize_video(raw_video[miss_idx]).to(device=self.device, dtype=torch.float32)
+                encoded = self.vae.encode([miss_video[j] for j in range(len(miss_idx))])
+            else:
+                encoded = self.vae.encode([normalized[i] for i in miss_idx])
             for j, i in enumerate(miss_idx):
                 z = encoded[j].float()
                 z_list[i] = z
@@ -277,10 +304,22 @@ class WanBatchPreprocessor:
                     self.latent_cache.put(keys[i], z)
         return torch.stack([z for z in z_list if z is not None], dim=0)
 
-    def _latent_keys(self, video: Tensor, batch: Mapping[str, Any], batch_size: int) -> list[str | None]:
-        """Per-sample cache keys from the clip's stable identity + its T×H×W. Returns
-        ``None`` for a sample if the dataset didn't emit the identity fields (then it
-        is always encoded, never cached)."""
+    def _output_hw(self, src_h: int, src_w: int) -> tuple[int, int]:
+        """Resized (H, W) a clip of source ``(src_h, src_w)`` would get from
+        ``_normalize_video`` — computed WITHOUT resizing, so cache keys can be
+        built from the raw frames. Mirrors the branches in ``_normalize_video``."""
+        cfg = self.config
+        if cfg.max_area is not None:
+            out_w, out_h = best_output_size(src_w, src_h, cfg.align_w, cfg.align_h, cfg.max_area)
+            return int(out_h), int(out_w)
+        if cfg.target_height is None or cfg.target_width is None:
+            return int(src_h), int(src_w)  # no resize
+        return int(cfg.target_height), int(cfg.target_width)  # fixed target (pad/stretch)
+
+    def _latent_keys(self, batch: Mapping[str, Any], batch_size: int, t: int, h: int, w: int) -> list[str | None]:
+        """Per-sample cache keys from the clip's stable identity + its resized T×H×W.
+        Returns ``None`` for a sample if the dataset didn't emit the identity fields
+        (then it is always encoded, never cached)."""
         env, ep = batch.get("env_name"), batch.get("episode_idx")
         st, fs = batch.get("start_idx"), batch.get("frame_stride")
         if any(v is None for v in (env, ep, st, fs)):
@@ -290,7 +329,6 @@ class WanBatchPreprocessor:
             v = seq[i]
             return v.item() if isinstance(v, Tensor) else v
 
-        t, h, w = int(video.shape[2]), int(video.shape[3]), int(video.shape[4])
         keys: list[str | None] = []
         for i in range(batch_size):
             try:
@@ -306,9 +344,10 @@ class WanBatchPreprocessor:
         ``(batch_size, num_newly_encoded)`` — the second is 0 when all were cache hits."""
         if self.latent_cache is None:
             raise RuntimeError("precompute() needs latent_cache_dir set on the preprocessor config.")
-        video = self._normalize_video(batch["video"]).to(device=self.device, dtype=torch.float32)
-        self._encode_z0(video, batch, video.shape[0])
-        return int(video.shape[0]), int(getattr(self, "last_encoded", 0))
+        raw_video = batch["video"]
+        batch_size = int(raw_video.shape[0])
+        self._encode_z0(raw_video, batch, batch_size)
+        return batch_size, int(getattr(self, "last_encoded", 0))
 
     def _build_condition(self, batch: Mapping[str, Any], batch_size: int, train: bool = True) -> dict[str, Any]:
         cond: dict[str, Any] = {}

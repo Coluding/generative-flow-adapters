@@ -68,7 +68,7 @@ training:
   # Eval video grid logged every 300 steps: rows are sampling-step counts,
   # columns [GT | base | adapted], conditioned on the observation frame. Three
   # clips per grid (num_samples).
-  inference_every_n_steps: 300
+  inference_every_n_steps: 3
   inference_num_steps: 50
   extra:
     amp_dtype: bf16                  # autocast (NOT model dtype) — see bf16 memory note

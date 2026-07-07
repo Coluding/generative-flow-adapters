@@ -61,8 +61,8 @@ def main() -> None:
         default="ckpts/Wan2.2-TI2V-5B",
         help="Wan2.2-TI2V-5B checkpoint DIR (DiT safetensors + Wan2.2_VAE.pth + uncond_context.pt).",
     )
-    parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=50000)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument(
         "--max-area",
