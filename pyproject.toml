@@ -17,6 +17,10 @@ dependencies = [
   "PyYAML>=6.0",
   "einops>=0.8.2",
   "diffusers>=0.37.1",
+  # Pin below 1.0: transformers/peft (pulled in via diffusers) hard-require
+  # huggingface-hub<1.0. Without this pin uv floats hub up to 1.x and the
+  # training entrypoint dies with an ImportError at `import transformers`.
+  "huggingface-hub>=0.30,<1.0",
   "wandb[media]>=0.27.0",
   "open-clip-torch>=3.3.0",
   "h5py>=3.16.0",
@@ -26,6 +30,7 @@ dependencies = [
   # torch-fidelity (FID) + lpips; cd-fvd provides FVD (i3d / VideoMAE).
   "torchmetrics[image]>=1.4",
   "cd-fvd>=0.1",
+  "easydict>=1.13",
 ]
 
 [project.optional-dependencies]
