@@ -175,6 +175,14 @@ class WanBatchPreprocessConfig:
     align_w: int = 32  # patch_size[2] * vae_stride[2]
     action_key: str = "action"
     action_aggregation: str = "sum"  # "sum" | "mean" | "last" over the clip's frames
+    # Per-frame action tokens for the cross-attention conditioning path (in
+    # addition to the aggregated `action_key`). Emitted as cond[action_seq_key]
+    # with shape [B, L, A]. `action_seq_len`: None -> pass the raw per-frame
+    # actions through unchanged; an int -> bin the frames into that many
+    # contiguous tokens, summing the (delta) actions within each bin (the
+    # aggregated `action` is just the 1-bin case).
+    action_seq_key: str = "action_seq"
+    action_seq_len: int | None = None
     # Optional text conditioning for the frozen base: path to the precomputed
     # prompt-context table (from precompute_prompt_contexts.py). When set, each
     # clip's `task_name` is mapped to its cached T5 embedding and passed to the
@@ -360,6 +368,11 @@ class WanBatchPreprocessor:
             # The first structured condition feeds the adapter's action encoder.
             out_key = self.config.action_key if i == 0 else key
             cond[out_key] = agg
+            if i == 0:
+                # Per-frame action tokens for the cross-attention path (the AdaLN
+                # path uses the aggregated `agg` above via the condition encoder).
+                seq = self._action_sequence(value).to(device=self.device, dtype=torch.float32)
+                cond[self.config.action_seq_key] = seq
         # Text conditioning for the frozen base: task_name -> cached T5 embedding,
         # passed as cond["context"] (a list of per-sample [Lᵢ, C] tensors). The
         # adapter's condition encoder ignores this key (reads only its own).
@@ -392,6 +405,28 @@ class WanBatchPreprocessor:
         if mode == "last":
             return action[:, -1]
         raise ValueError(f"Unknown action_aggregation: {mode!r}")
+
+    def _action_sequence(self, action: Tensor) -> Tensor:
+        # action: [B, T, A] per-frame -> [B, L, A] tokens for the cross-attention
+        # conditioning path. Raw delta-actions (no normalization), matching the
+        # aggregated path. `action_seq_len` None -> passthrough (L = T); an int
+        # -> bin the T frames into that many contiguous tokens, summing deltas
+        # within each bin (consistent with the "sum" aggregation).
+        if action.dim() == 2:  # already [B, A] -> a single token
+            return action.unsqueeze(1)
+        if action.dim() != 3:
+            raise ValueError(f"Expected action [B,T,A] or [B,A], got {tuple(action.shape)}")
+        n = self.config.action_seq_len
+        t = int(action.shape[1])
+        if n is None or n <= 0 or n >= t:
+            return action  # per-frame passthrough
+        b, _, a = action.shape
+        edges = torch.linspace(0, t, n + 1).round().long().tolist()
+        bins = [
+            action[:, edges[j] : edges[j + 1]].sum(dim=1) if edges[j + 1] > edges[j] else action.new_zeros(b, a)
+            for j in range(n)
+        ]
+        return torch.stack(bins, dim=1)  # [B, n, A]
 
     def _normalize_video(self, video: Any) -> Tensor:
         if not isinstance(video, Tensor):

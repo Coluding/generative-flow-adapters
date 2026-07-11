@@ -42,11 +42,18 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         use_step_level: bool = True,
         step_level_key: str = "step_level",
         step_level_transform: str = "log2",
+        action_injection: str = "adaln",
+        action_token_dim: int = 0,
+        action_token_key: str = "action_seq",
+        action_fallback_key: str = "action",
+        action_max_len: int = 64,
         output_mask: bool = False,
         predict_full: bool = False,
     ) -> None:
         super().__init__()
         self.step_level_key = step_level_key
+        self.action_token_key = action_token_key
+        self.action_fallback_key = action_fallback_key
         self.output_mask = output_mask
         self.predict_full = predict_full
         self.module = ActionWanModel(
@@ -61,6 +68,9 @@ class Wan21OutputAdapter(OutputAdapterInterface):
             use_step_level=use_step_level,
             step_level_transform=step_level_transform,
             condition_on_base_outputs=condition_on_base_outputs,
+            action_injection=action_injection,
+            action_token_dim=action_token_dim,
+            action_max_len=action_max_len,
             output_mask=output_mask,
             predict_full=predict_full,
         )
@@ -89,12 +99,23 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         # condition dropout / CFG is applied upstream by the encoder's null path.
         cond_embedding = resolve_condition_embedding(cond)
         step_level = cond.get(self.step_level_key) if isinstance(cond, Mapping) else None
+        # Per-frame action tokens for the cross-attention path. Prefer the
+        # per-frame `action_seq`; fall back to the aggregated `action` [B,A] as a
+        # single token (e.g. at inference when only one action vector is passed).
+        # Ignored unless the tiny DiT is in a cross-attention injection mode.
+        action_tokens = None #TODO: remove fallback. if we traaned on action_seq then we shouldnt be able to pass aggregated actions during inference
+        if isinstance(cond, Mapping):
+            at = cond.get(self.action_token_key)
+            if not isinstance(at, Tensor):
+                at = cond.get(self.action_fallback_key)
+            action_tokens = at if isinstance(at, Tensor) else None
         result = self.module(
             x_t,
             t,
             cond_embedding=cond_embedding,
             step_level=step_level if isinstance(step_level, Tensor) else None,
             base_output=base_output,
+            action_tokens=action_tokens,
         )
         if self.output_mask:
             # Gated composition: the main head plus a per-pixel gate.

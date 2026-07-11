@@ -59,6 +59,9 @@ class ActionWanModel(nn.Module):
         step_level_transform: str = "log2",
         condition_on_base_outputs: bool = True,
         use_text_context: bool = False,
+        action_injection: str = "adaln",
+        action_token_dim: int = 0,
+        action_max_len: int = 64,
         output_mask: bool = False,
         predict_full: bool = False,
     ) -> None:
@@ -81,6 +84,21 @@ class ActionWanModel(nn.Module):
         self.step_level_transform = step_level_transform
         self.condition_on_base_outputs = condition_on_base_outputs
         self.use_text_context = use_text_context
+        # Action-conditioning injection mechanism:
+        #   "adaln"          - action summed into the timestep embedding -> global
+        #                      AdaLN modulation (broadcast across all tokens; the
+        #                      original behaviour). Correct for global scalars, but
+        #                      cannot localise where the action acts.
+        #   "cross_attention"- action fed as per-frame tokens into the (already
+        #                      present) t2v cross-attention `context`, so each
+        #                      latent token attends to the action locally.
+        #   "both"           - AdaLN summary + cross-attention tokens.
+        # Global signals (timestep, step_level) always stay in AdaLN.
+        self.action_injection = str(action_injection).lower()
+        self.action_token_dim = int(action_token_dim)
+        self.action_max_len = int(action_max_len)
+        self._use_action_tokens = self.action_injection in ("cross_attention", "both") and self.action_token_dim > 0
+        self._use_adaln_action = self.action_injection in ("adaln", "both")
         # output_mask: emit a per-pixel gate head alongside the main head.
         # predict_full: the main head is a *standalone prediction* (xavier init,
         # for mask_mix) rather than a ~0 delta (zero init, for add / gated_residual).
@@ -111,6 +129,18 @@ class ActionWanModel(nn.Module):
             if use_text_context
             else None
         )
+
+        # Per-frame action -> cross-attention context tokens. Mirrors
+        # text_embedding; adds a learned temporal position embedding so the
+        # (permutation-invariant) cross-attention can route by frame order.
+        if self._use_action_tokens:
+            self.action_embedding = nn.Sequential(
+                nn.Linear(self.action_token_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
+            )
+            self.action_pos_emb = nn.Parameter(torch.zeros(self.action_max_len, dim))
+        else:
+            self.action_embedding = None
+            self.action_pos_emb = None
 
         cross_attn_type = "t2v_cross_attn"
         self.blocks = nn.ModuleList(
@@ -184,6 +214,7 @@ class ActionWanModel(nn.Module):
         step_level: Tensor | None = None,
         base_output: Tensor | None = None,
         context: Tensor | None = None,
+        action_tokens: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """``x``: ``[B, in_dim, T, H, W]`` -> ``[B, out_dim, T, H, W]``.
 
@@ -208,14 +239,33 @@ class ActionWanModel(nn.Module):
         # WanAttentionBlock asserts the AdaLN modulation is fp32, so compute the
         # time/action/step embedding with autocast disabled (the vendored
         # WanModel does the same under amp.autocast(float32)).
+        # The action stays out of the AdaLN embedding unless we're in an AdaLN
+        # (or "both") mode; the timestep + step_level always go through AdaLN.
+        adaln_cond = cond_embedding if self._use_adaln_action else None
         with torch.autocast(device_type=device.type, enabled=False):
-            e = self._conditioning_embedding(t, cond_embedding, step_level).float()
+            e = self._conditioning_embedding(t, adaln_cond, step_level).float()
             e0 = self.time_projection(e).unflatten(1, (6, self.dim)).float()
 
+        # Cross-attention context: optional text tokens + optional per-frame
+        # action tokens. Empty -> a single zero token (cross-attn is a no-op shift).
+        ctx_parts: list[Tensor] = []
         if self.text_embedding is not None and context is not None:
-            ctx = self.text_embedding(context.to(self.dtype))
+            ctx_parts.append(self.text_embedding(context.to(self.dtype)))
+        if self._use_action_tokens and action_tokens is not None:
+            at = action_tokens.to(self.dtype)
+            if at.dim() == 2:  # [B, A] -> single token
+                at = at.unsqueeze(1)
+            length = at.shape[1]
+            if length > self.action_max_len:
+                raise ValueError(
+                    f"action token sequence length {length} exceeds action_max_len {self.action_max_len}; "
+                    "raise action_max_len."
+                )
+            at = self.action_embedding(at) + self.action_pos_emb[:length].to(self.dtype).unsqueeze(0)
+            ctx_parts.append(at)
+        if ctx_parts:
+            ctx = torch.cat(ctx_parts, dim=1)
         else:
-            # Null context: a single zero token; cross-attn becomes a no-op shift.
             ctx = torch.zeros(b, 1, self.dim, device=device, dtype=self.dtype)
 
         for block in self.blocks:
