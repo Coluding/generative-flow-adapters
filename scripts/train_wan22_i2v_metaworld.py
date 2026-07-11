@@ -96,6 +96,12 @@ def main() -> None:
 
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for the eval loader. Defaults to --batch-size when unset.",
+    )
     parser.add_argument("--frame-stride", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
@@ -266,7 +272,7 @@ def main() -> None:
     if eval_dataset is not None:
         eval_loader = DataLoader(
             eval_dataset,
-            batch_size=args.batch_size,
+            batch_size=args.eval_batch_size or args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=True,

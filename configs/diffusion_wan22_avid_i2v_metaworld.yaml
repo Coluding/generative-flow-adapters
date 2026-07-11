@@ -30,7 +30,7 @@ model:
     dtype: bf16
     # Wan2.2-VAE latent geometry (vae_stride = (4, 16, 16), z_dim = 48).
     latent_channels: 48
-    temporal_length: 41     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
+    temporal_length: 97     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
     # Aspect-preserving, patch/VAE-aligned resolution à la Wan `best_output_size`
     # (external-base training script). Frames are sized to the largest (w,h) under
     # `max_area` px, divisible by 32, matching the source aspect — the base's
@@ -51,7 +51,7 @@ adapter:
   type: output
   hidden_dim: 256
   feature_dim: 48            # Wan2.2 latent channel count
-  composition: mask_mix      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
+  composition: gated_residual      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
   gate_bias: 4.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
   extra:
     backbone: wan            # AVID-style: a small action-conditioned Wan DiT
@@ -75,7 +75,7 @@ training:
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
   inference_every_n_steps: 300
-  eval_every_n_steps: 5
+  eval_every_n_steps: 300
   # Paired generative-quality metrics scored on decoded pixels vs the aligned
   # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
   # and the frozen-base rollout are scored, so wandb shows the base→adapted
@@ -88,7 +88,7 @@ training:
   # they load Inception / I3D and only mean anything over many samples, so they
   # stay off the per-cycle path. Needs cd-fvd installed.
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 5
+  quality_dist_every_n_steps: 300
   quality_dist_num_batches: 4
 
   extra:
@@ -100,7 +100,7 @@ training:
     inference_guide_scale: 5.0           # CFG at eval (the "much better" scale); needs a real prompt to bite
     inference_shift: 5.0                 # Wan2.2 TI2V-5B native flow shift (the legacy sampler used 3.0)
     inference_use_prompt: true           # condition the eval base on the task prompt (if text conditioning is on)
-    inference_frame_num: 41            # null -> temporal_length (must be 4n+1)
+    inference_frame_num: null            # null -> temporal_length (must be 4n+1)
     inference_seed: 0
     # Eval-only resolution. UNSET -> training max_area (native 960x928). Offload
     # already frees the DiT (probe: alloc 13.4G -> 3.4G, dit=cpu), so the DiT is
@@ -114,7 +114,7 @@ training:
     cond_frames: 1                       # eval/no-dist: leading observation frames held clean
     cond_frames_dist:
       1: 1
-    shortcut_anchor_prob: 0.6            # P(anchor step: standard flow loss only, no shortcut target)
+    shortcut_anchor_prob: 0.75            # P(anchor step: standard flow loss only, no shortcut target)
     # Paper-faithful shortcut step schedule (normalised s ∈ (0,1], log2 ladder).
     shortcut_step_schedule:
       units: normalized
@@ -135,6 +135,6 @@ training:
     wandb:
       enable: true
       require_vae: false                # Wan2.2-VAE injected at runtime
-      project: Wan2.2-avid-i2v-metaworld34
+      project: Wan2.2-avid-i2v-metaworld34-button
       num_samples: 3                    # three clips logged per eval grid
       fps: 3

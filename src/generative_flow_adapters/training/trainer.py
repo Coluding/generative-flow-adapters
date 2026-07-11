@@ -541,7 +541,7 @@ class Trainer:
         if not eval_metrics:
             return {}
         if self.wandb_logger is not None:
-            self.wandb_logger.log_metrics(eval_metrics, step=self.global_step)
+            self.wandb_logger.log_metrics(eval_metrics, step=self.global_step, prefix="")
         if self.jsonl_logger is not None:
             self.jsonl_logger.log(eval_metrics, step=self.global_step, split="eval")
 
@@ -562,7 +562,7 @@ class Trainer:
         # Paired quality metrics (psnr/ssim/...) on every eval cycle — cheap,
         # reliable, scored vs aligned ground truth. Distribution metrics
         # (fid/fvd) run on their own rarer cadence from the train loop.
-        if self.config.quality_metrics:
+        if self.config.quality_metrics: #TODO I dont think we need this
             self._run_quality_eval(
                 eval_loader,
                 preprocessor=preprocessor,
@@ -570,6 +570,7 @@ class Trainer:
                 num_batches=self.config.quality_eval_num_batches,
                 num_steps=self.config.quality_eval_num_steps or self.config.inference_num_steps,
                 log=log,
+                eval_metrics=eval_metrics
             )
         return eval_metrics
 
@@ -621,6 +622,7 @@ class Trainer:
         num_batches: int,
         num_steps: int,
         log: bool,
+        eval_metrics: Dict[str, float] = None
     ) -> dict[str, float]:
         """Score generative-visual quality metrics on decoded eval rollouts.
 
@@ -691,12 +693,13 @@ class Trainer:
         if not results:
             return {}
         if self.wandb_logger is not None:
-            self.wandb_logger.log_metrics(results, step=self.global_step)
+            self.wandb_logger.log_metrics(results, step=self.global_step, prefix="")
         if self.jsonl_logger is not None:
             self.jsonl_logger.log(results, step=self.global_step, split="eval")
         if log:
             summary = " ".join(f"{k}={v:.4f}" for k, v in sorted(results.items()))
             print(f"  quality step={self.global_step} ({count} batches) {summary}")
+        eval_metrics.update(results) if eval_metrics is not None else None
         return results
 
     # ------------------------------------------------------------------ #
@@ -989,7 +992,7 @@ class Trainer:
         for variant, suite in suites.items():
             results.update(suite.compute(prefix=f"eval/{variant}"))
         if results and self.wandb_logger is not None:
-            self.wandb_logger.log_metrics(results, step=self.global_step)
+            self.wandb_logger.log_metrics(results, step=self.global_step, prefix="")
         if results and self.jsonl_logger is not None:
             self.jsonl_logger.log(results, step=self.global_step, split="eval")
         return results

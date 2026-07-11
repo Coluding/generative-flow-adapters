@@ -15,7 +15,9 @@ set -euo pipefail
 module purge
 module load 2024
 
-export BATCH_SIZE=48
+export GFA_PROFILE=0
+export GFA_DEBUG_CACHE=0
+export BATCH_SIZE=12
 
 # ---- uv env vars (in case .bashrc isn't sourced on compute nodes) -----------
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
@@ -41,23 +43,29 @@ print('cuda built:', torch.version.cuda)
 print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')
 "
 
-# ---- gpu usage monitor ------------------------------------------------------
-# Prints GPU utilisation / memory every GPU_LOG_INTERVAL seconds in the
-# background. The monitor is killed automatically when the script exits.
-export GPU_LOG_INTERVAL=${GPU_LOG_INTERVAL:-30}
-(
-    while true; do
-        echo "==== nvidia-smi $(date '+%Y-%m-%d %H:%M:%S') ===="
-        nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu \
-            --format=csv,noheader
-        sleep "$GPU_LOG_INTERVAL"
-    done
-) &
-GPU_MONITOR_PID=$!
-trap 'kill "$GPU_MONITOR_PID" 2>/dev/null || true' EXIT
+
+export ds_path="../scratch-shared/metaworld/button.hdf5"
+
+echo "Running training with dataset: $ds_path"
+
+if test ! -f "$ds_path"; then
+    echo "Error: Dataset file not found at $ds_path"
+    exit 1
+fi
+
+export latent_path=${ds_path%.hdf5}_latent.hdf5
+
+if test -f $latent_path; then
+echo "Found latent dataset file at $latent_path"
+else
+    echo "Error: Latent dataset file not found at $latent_path"
+    echo "Should run slower"
+    echo "==============================================================================="
+fi
+
 
 # ---- run --------------------------------------------------------------------
-srun uv run python scripts/train_wan22_i2v_metaworld.py \
+python scripts/train_wan22_i2v_metaworld_external.py \
     --config configs/diffusion_wan22_avid_i2v_metaworld.yaml \
-    --hdf5 "../scratch-shared/metaworld/mw_zoom13.hdf5" --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-    --batch-size $BATCH_SIZE "$@"
+    --hdf5 "$ds_path" --ckpt-dir ckpts/Wan2.2-TI2V-5B \
+    --batch-size $BATCH_SIZE "$@" --num-windows 8 --max-area 589824 --steps 5000000

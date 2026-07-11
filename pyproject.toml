@@ -31,6 +31,20 @@ dependencies = [
   "torchmetrics[image]>=1.4",
   "cd-fvd>=0.1",
   "easydict>=1.13",
+  # Wan2.2 runtime deps (external_repos/Wan2.2/requirements.txt). Declared here
+  # so `uv run`/`uv sync` keep them — bare `uv run` prunes anything not in the
+  # lock at job start, and these are undeclared extras otherwise. decord + cv2
+  # are imported by our own backbones/lvdm code; peft/librosa/accelerate are
+  # pulled in by `import wan`. transformers is capped below 5.x transitively by
+  # the huggingface-hub<1.0 pin above. Transitive deps (numba, llvmlite, soxr,
+  # scikit-learn, rich, typer, psutil, tokenizers, …) return automatically.
+  "accelerate>=1.1.1",
+  "peft>=0.19",
+  "decord>=0.6",
+  "opencv-python>=4.9.0.80",
+  "librosa>=0.11",
+  "ftfy>=6.1",
+  "imageio-ffmpeg>=0.4",
 ]
 
 [project.optional-dependencies]

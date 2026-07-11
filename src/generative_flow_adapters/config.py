@@ -182,6 +182,9 @@ class ExperimentConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     data: DataConfig = field(default_factory=DataConfig)
     name: str = "default"
+    # Filesystem path the config was loaded from (set by ``load_config``); used
+    # to upload the raw YAML to the wandb run so every run is reproducible.
+    source_path: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExperimentConfig":
@@ -222,7 +225,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if not isinstance(raw, dict):
         raise TypeError(f"Configuration at {config_path} must be a mapping.")
 
-    return ExperimentConfig.from_dict(raw)
+    config = ExperimentConfig.from_dict(raw)
+    config.source_path = str(config_path)
+    return config
 
 
 def _split_known(dataclass_type: type[Any], values: dict[str, Any]) -> dict[str, Any]:
