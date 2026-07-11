@@ -931,7 +931,7 @@ class Trainer:
     ) -> dict[str, float]:
         """Score quality metrics on native PIXEL rollouts (adapted + base) vs the
         ground-truth clip, at a cheaper step count. Pixel twin of
-        ``_run_quality_eval`` — the native path decodes inside ``generate``."""
+        ``_run_quality_eval`` — the native path decodes inside ``generate``. A native call makes sure to use the existign 'generate' method of a VideoBaseModel interface"""
         if not metric_names or self._native_base is None:
             return {}
         params = self._eval_gen_params()

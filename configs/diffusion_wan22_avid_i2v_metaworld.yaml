@@ -74,8 +74,8 @@ training:
   grad_clip_norm: 1.0
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
-  inference_every_n_steps: 3
-  eval_every_n_steps: 50
+  inference_every_n_steps: 300
+  eval_every_n_steps: 5
   # Paired generative-quality metrics scored on decoded pixels vs the aligned
   # ground-truth future, every eval cycle (eval_every_n_steps). Both the adapted
   # and the frozen-base rollout are scored, so wandb shows the base→adapted
@@ -83,12 +83,12 @@ training:
   # (--eval-hdf5 or data.val_fraction). Rollout uses quality_eval_num_steps.
   quality_metrics: [psnr, ssim, lpips, mse]
   quality_eval_num_batches: 4
-  quality_eval_num_steps: 10
+  quality_eval_num_steps: 1
   # Distribution metrics (per-frame FID + clip FVD) on their own rarer cadence —
   # they load Inception / I3D and only mean anything over many samples, so they
   # stay off the per-cycle path. Needs cd-fvd installed.
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 50
+  quality_dist_every_n_steps: 5
   quality_dist_num_batches: 4
 
   extra:

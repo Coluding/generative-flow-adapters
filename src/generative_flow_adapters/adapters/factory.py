@@ -246,6 +246,13 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
             use_step_level=adapter.extra.get("use_step_level_conditioning"),
             step_level_key=adapter.extra.get("step_level_key"),
             step_level_transform=adapter.extra.get("step_level_transform"),
+            # Action-conditioning injection: "adaln" (default), "cross_attention",
+            # or "both". The raw per-frame action width (input_dim) enables the
+            # cross-attention token path; the injection mode gates whether it fires.
+            action_injection=adapter.extra.get("action_injection"),
+            action_token_dim=int(conditioning.input_dim) if getattr(conditioning, "input_dim", None) else None,
+            action_token_key=adapter.extra.get("action_token_key"),
+            action_max_len=adapter.extra.get("action_max_len"),
             output_mask=is_mask_mix or is_gated_residual,
             predict_full=is_mask_mix,
         )
