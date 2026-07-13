@@ -54,7 +54,7 @@ _WAN22_VAE_SPATIAL_STRIDE = 16
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_xattn_i2v_metaworld.yaml")
+    parser.add_argument("--config", default="configs/diffusion_wan22_dcunet_output_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="Path to MetaWorld HDF5 file")
     parser.add_argument(
         "--ckpt-dir",
@@ -222,6 +222,12 @@ def main() -> None:
     timestep_scale = float(config.training.extra.get("flow_timestep_scale", 1000.0))
     cond_frames = int(config.training.extra.get("cond_frames", 1))
     cond_frames_dist = config.training.extra.get("cond_frames_dist")
+    # AVID-style per-frame action conditioning: feed the adapter's action encoder a
+    # per-frame sequence binned to the latent temporal grid rather than one
+    # aggregated vector. action_seq_len is pinned to the latent frame count so the
+    # per-frame embedding aligns with the UNet's [(b t)] layout.
+    action_per_frame = bool(config.training.extra.get("action_per_frame", False))
+    latent_frames = 1 + (temporal_length - 1) // 4
     # Latent cache: skip the frozen-VAE encode (per-step bottleneck) by caching z0
     # per clip. Default dir derives from the hdf5 (resolution is in each key, so one
     # dir is safe across max_area). Disabled with --no-latent-cache.
@@ -235,6 +241,8 @@ def main() -> None:
             max_area=max_area, align_h=align, align_w=align,
             prompt_contexts_path=prompt_contexts_path,
             latent_cache_dir=latent_cache_dir,
+            action_per_frame=action_per_frame,
+            action_seq_len=(latent_frames if action_per_frame else None),
         ),
         condition_keys=condition_keys or ("act",),
         cond_frames=cond_frames,
@@ -300,7 +308,8 @@ def main() -> None:
     total = sum(p.numel() for p in model.parameters())
     print(f"experiment={config.name}  (NEW BaseVideoModel building approach)")
     print(f"device={device}  base={type(model.base_model).__name__} (external wan.WanTI2V)")
-    print(f"adapter={config.adapter.type}/{config.adapter.extra.get('backbone')}  cond_frames={cond_frames}")
+    print(f"adapter={config.adapter.type}/{config.adapter.extra.get('backbone')}  cond_frames={cond_frames}  "
+          f"action={'per-frame[B,%d,A]' % latent_frames if action_per_frame else 'aggregated[B,A]'}")
     if max_area is not None:
         from generative_flow_adapters.data.wan_batch_preprocessor import best_output_size
 

@@ -738,26 +738,47 @@ class UNetModel(nn.Module):
         **kwargs,
     ):
         b, _, t, _, _ = x.shape
+        # Timesteps arrive either as one scalar per sample [b] (standard diffusion,
+        # broadcast across all frames) or as per-frame values [b, t] (WAN diffusion
+        # forcing: the leading observation frame(s) are held clean at t=0 while the
+        # future frames are noised). For the per-frame case flatten to [(b t)] and
+        # embed directly — the embedding is then already per-frame, so the
+        # repeat_interleave(t) applied to the scalar case below is skipped.
+        per_frame_t = timesteps.dim() == 2
+        if per_frame_t:
+            if timesteps.shape[0] != b or timesteps.shape[1] != t:
+                raise ValueError(
+                    f"per-frame timesteps {tuple(timesteps.shape)} must have shape "
+                    f"[batch={b}, frames={t}]"
+                )
+            timesteps = timesteps.reshape(b * t)
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).type(x.dtype)
 
         ## repeat t times for context [(b t) 77 768] & time embedding
         ## check if we use per-frame image conditioning
-        _, l_context, _ = context.shape
-        if l_context == 77 + t * 16:  ## !!! HARD CODE here
-            context_text, context_img = context[:, :77, :], context[:, 77:, :]
-            context_text = context_text.repeat_interleave(repeats=t, dim=0)
-            context_img = rearrange(context_img, "b (t l) c -> (b t) l c", t=t)
-            context = torch.cat([context_text, context_img], dim=1)
-        else:
-            context = context.repeat_interleave(repeats=t, dim=0)
+        ## context may be None (no cross-attn context -> SpatialTransformer
+        ## self-attends, see CrossAttention.forward: spatial_self_attn = context is None),
+        ## e.g. the action-conditioned output-adapter role where image_cross_attention
+        ## is off and conditioning arrives via adapter_embedding.
+        if context is not None:
+            _, l_context, _ = context.shape
+            if l_context == 77 + t * 16:  ## !!! HARD CODE here
+                context_text, context_img = context[:, :77, :], context[:, 77:, :]
+                context_text = context_text.repeat_interleave(repeats=t, dim=0)
+                context_img = rearrange(context_img, "b (t l) c -> (b t) l c", t=t)
+                context = torch.cat([context_text, context_img], dim=1)
+            else:
+                context = context.repeat_interleave(repeats=t, dim=0)
 
         if not self.action_conditioned and adapter_embedding is None:
             emb = self.time_embed(t_emb)
-            emb = emb.repeat_interleave(repeats=t, dim=0)
+            if not per_frame_t:
+                emb = emb.repeat_interleave(repeats=t, dim=0)
         else:
             act_drop_prob = self.action_dropout_prob if dropout_actions else 0.0
             time_emb = self.time_embed(t_emb)
-            time_emb = time_emb.repeat_interleave(repeats=t, dim=0)
+            if not per_frame_t:
+                time_emb = time_emb.repeat_interleave(repeats=t, dim=0)
 
             # if actions are provided embed them, apply random dropout, concat with time embedding
             if act is not None and adapter_embedding is None:
