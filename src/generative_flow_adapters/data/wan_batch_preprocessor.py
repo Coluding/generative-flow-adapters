@@ -183,6 +183,14 @@ class WanBatchPreprocessConfig:
     # aggregated `action` is just the 1-bin case).
     action_seq_key: str = "action_seq"
     action_seq_len: int | None = None
+    # Per-frame (AVID-style) action conditioning. When True, the adapter's action
+    # encoder is fed the per-frame binned sequence [B, L, A] under `action_key`
+    # (instead of the aggregated [B, A]), so each latent frame is conditioned on
+    # its own action — matching the original AVID action head — rather than one
+    # summed vector broadcast across the clip. Requires `action_seq_len` = the
+    # latent frame count so [B, L, A] aligns with the UNet's per-frame layout.
+    # False (default) keeps the aggregated AdaLN-broadcast behaviour.
+    action_per_frame: bool = False
     # Optional text conditioning for the frozen base: path to the precomputed
     # prompt-context table (from precompute_prompt_contexts.py). When set, each
     # clip's `task_name` is mapped to its cached T5 embedding and passed to the
@@ -369,10 +377,15 @@ class WanBatchPreprocessor:
             out_key = self.config.action_key if i == 0 else key
             cond[out_key] = agg
             if i == 0:
-                # Per-frame action tokens for the cross-attention path (the AdaLN
-                # path uses the aggregated `agg` above via the condition encoder).
+                # Per-frame action tokens, binned to the latent temporal grid. Also
+                # used by the cross-attention path via `action_seq_key`.
                 seq = self._action_sequence(value).to(device=self.device, dtype=torch.float32)
                 cond[self.config.action_seq_key] = seq
+                # AVID-style per-frame conditioning: override the aggregated `agg`
+                # so the encoder sees [B, L, A] and each latent frame is conditioned
+                # on its own action (vs one summed vector broadcast across the clip).
+                if self.config.action_per_frame:
+                    cond[out_key] = seq
         # Text conditioning for the frozen base: task_name -> cached T5 embedding,
         # passed as cond["context"] (a list of per-sample [Lᵢ, C] tensors). The
         # adapter's condition encoder ignores this key (reads only its own).

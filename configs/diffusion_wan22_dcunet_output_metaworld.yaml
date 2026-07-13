@@ -1,0 +1,134 @@
+# Wan2.2-TI2V-5B (flow matching, diffusion forcing) + high-capacity
+# DynamiCrafter 3D-UNet output adapter (Δ_φ), action-conditioned world model on
+# MetaWorld with shortcut self-consistency.
+#
+# This is diffusion_wan22_avid_i2v_metaworld.yaml (the AdaLN AVID baseline) with
+# ONLY the `adapter` block swapped: the lightweight ~34M `backbone: wan` DiT delta
+# is replaced by a 145M-tier `backbone: unet` DynamiCrafter 3D UNet
+# (configs/base/act_cond_diffusion_wan48_145M.yaml). Everything else — base, data,
+# shortcut schedule, eval grid, metrics — is held identical so the base-vs-adapted
+# delta is directly comparable to the AVID-adapter runs.
+#
+# WHY: the capacity lever for the "adapter helps on reconstruction but regresses
+# perceptual / cross-attn injection is a step back" finding
+# (thesis-vault: feat-adapter-dynamicrafter-output-on-wan-base,
+#  20260712-wan-xattn-action-no-improvement). A UNet-scale Δ_φ is the direct test
+# of the capacity hypothesis over the injection-mechanism one.
+#
+# Design fork = (a) architecture-only DC UNet, scratch init (no checkpoint_path) —
+# the clean capacity test. (b) pretrained-DC init is deferred (its prior lives in a
+# different latent space; see the ticket).
+#
+# STATUS: draft, NOT smoke-validated. Run the random-weight smoke test first (see
+# the three verification points in the base UNet config header) before the real run.
+#
+# PREREQUISITES: Wan2.2-TI2V-5B DiT + Wan2.2_VAE.pth in the ckpt dir.
+# Run with scripts/train_wan22_i2v_metaworld.py.
+
+name: diffusion_wan22_dcunet_output_metaworld
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+  # eval_hdf5: ds/metaworld_corner2_val.hdf5
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  # pretrained_model_name_or_path: ckpts/Wan2.2-TI2V-5B
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    latent_channels: 48
+    temporal_length: 41     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
+    max_area: 589824         # 704 * 1280 budget; aspect-preserving best_output_size
+    latent_height: 16
+    latent_width: 16
+    text_prompts_file: configs/prompts/metaworld_tasks.yaml   # null -> frame-only (no text)
+
+adapter:
+  type: output
+  hidden_dim: 256            # cond_hidden_dim for the adapter's conditioning MLP
+  feature_dim: 48            # Wan2.2 latent channel count
+  composition: mask_mix      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
+  gate_bias: 4.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
+  extra:
+    backbone: unet           # DynamiCrafter 3D UNet delta (vs `wan` tiny DiT)
+    unet_config_path: configs/base/act_cond_diffusion_wan48_11M.yaml
+    # (a) architecture-only: no checkpoint_path -> scratch init (the capacity test).
+    # checkpoint_path: ckpts/dynami512.ckpt   # (b) pretrained-DC init — deferred
+    condition_on_base_outputs: true   # concat base_output -> UNet sees 96 in-channels
+    output_mask: true                 # mask_mix needs the UNet's (prediction, gate)
+    use_adapter_conditioning: true    # action enters via adapter_embedding (cond_dim>0)
+    strict_checkpoint: false
+    allow_dummy_concat_condition: false
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+
+conditioning:
+  type: action
+  input_dim: 4             # MetaWorld action dimension
+  output_dim: 512          # fused embedding width -> adapter cond_dim
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  inference_every_n_steps: 300
+  eval_every_n_steps: 5
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 1
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 5
+  quality_dist_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_use_prompt: true
+    inference_frame_num: 41
+    inference_seed: 0
+    inference_max_area: 589824
+    cond_frames: 1
+    cond_frames_dist:
+      1: 1
+    # AVID-style per-frame action conditioning: feed the adapter a per-frame action
+    # sequence (binned to the 11 latent frames) instead of one summed vector. Each
+    # latent frame is conditioned on its own action, matching the original AVID
+    # action head. Set false for the aggregated-AdaLN control (the two are a clean
+    # one-switch ablation of the action-signal question).
+    action_per_frame: true
+    shortcut_anchor_prob: 0.6
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
+
+    wandb:
+      enable: true
+      require_vae: false
+      project: Wan2.2-dcunet-output-i2v-metaworld
+      num_samples: 3
+      fps: 3

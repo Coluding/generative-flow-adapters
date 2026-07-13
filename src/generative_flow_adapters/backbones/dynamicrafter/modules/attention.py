@@ -293,7 +293,14 @@ class BasicTransformerBlock(nn.Module):
 
     def _forward(self, x, context=None, mask=None):
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, mask=mask) + x
-        x = self.attn2(self.norm2(x), context=context, mask=mask) + x
+        # attn2 is cross-attention onto an external context (context_dim, e.g. 1024
+        # text/image CLIP tokens). With no context it cannot self-attend (its
+        # to_k/to_v are sized for context_dim, not query_dim), and there is nothing
+        # to attend to — so skip it. This is the action-conditioned output-adapter
+        # role (image_cross_attention off, conditioning via adapter_embedding): the
+        # block reduces to self-attention (attn1) + feed-forward.
+        if context is not None:
+            x = self.attn2(self.norm2(x), context=context, mask=mask) + x
         x = self.ff(self.norm3(x)) + x
         return x
 

@@ -135,6 +135,13 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
 
         if isinstance(cond, dict):
             context = cond.get("context")
+            # This adapter conditions on the action via `adapter_embedding` and
+            # self-attends spatially; it must NOT consume the frozen base's own
+            # cross-attn context. A WAN base passes its text context as a *list* of
+            # per-sample embeddings — only a genuine context tensor is honoured;
+            # anything else (list / None) -> None (SpatialTransformer self-attention).
+            if not isinstance(context, Tensor):
+                context = None
             act = cond.get("act")
             fs = cond.get("fs")
             adapter_embedding = cond.get("embedding")
