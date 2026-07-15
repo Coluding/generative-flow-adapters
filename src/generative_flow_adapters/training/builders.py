@@ -118,5 +118,6 @@ def _maybe_build_wandb_logger(config: ExperimentConfig, base_model) -> object | 
         project=cfg.get("wandb_project") or cfg.get("project"),
         run_name=cfg.get("wandb_run_name") or cfg.get("run_name") or config.name,
         config={"experiment": config.name},
+        config_path=getattr(config, "source_path", None),
         metrics_prefix=str(cfg.get("metrics_prefix", "train")),
     )

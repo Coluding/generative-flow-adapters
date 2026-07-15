@@ -26,6 +26,7 @@ class WandbLogger:
         project: str | None = None,
         run_name: str | None = None,
         config: Mapping[str, Any] | None = None,
+        config_path: str | None = None,
         metrics_prefix: str = "train",
     ) -> None:
         try:
@@ -41,6 +42,13 @@ class WandbLogger:
         self.metrics_prefix = metrics_prefix.rstrip("/")
         if wandb.run is None:
             wandb.init(project=project, name=run_name, config=dict(config) if config else None)
+        # Upload the raw config YAML so every run carries its exact source config.
+        if config_path:
+            from pathlib import Path
+
+            path = Path(config_path)
+            if path.is_file():
+                wandb.save(str(path), base_path=str(path.parent), policy="now")
 
     def set_decode_fn(self, decode_fn) -> None:
         """Attach the latent->pixel decoder after construction.
@@ -68,15 +76,22 @@ class WandbLogger:
 
     # ------------------------------------------------------------------ metrics
 
-    def log_metrics(self, metrics: Mapping[str, object], step: int) -> None:
+    def log_metrics(
+        self, metrics: Mapping[str, object], step: int, *, prefix: str | None = None
+    ) -> None:
         """Push scalar entries from `metrics` to wandb. Tensor / array entries
-        (e.g. `generated_samples`) are skipped — videos go through `log_videos`."""
+        (e.g. `generated_samples`) are skipped — videos go through `log_videos`.
+
+        `prefix` overrides the default `metrics_prefix` for this call; pass ``""``
+        for keys that already carry their own namespace (e.g. eval metrics keyed
+        ``eval/base/fvd_i3d``) so they aren't nested under ``train/``."""
+        active_prefix = self.metrics_prefix if prefix is None else prefix.rstrip("/")
         payload: dict[str, float] = {}
         for key, value in metrics.items():
             scalar = _coerce_scalar(value)
             if scalar is None:
                 continue
-            payload[f"{self.metrics_prefix}/{key}" if self.metrics_prefix else key] = scalar
+            payload[f"{active_prefix}/{key}" if active_prefix else key] = scalar
         if payload:
             self._wandb.log(payload, step=int(step))
 
