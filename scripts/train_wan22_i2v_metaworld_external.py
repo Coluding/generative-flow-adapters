@@ -114,6 +114,10 @@ def main() -> None:
                         help="Disable the latent cache (always run the VAE encode).")
     parser.add_argument("--precompute-latents", action="store_true",
                         help="Encode every clip to the latent cache and exit (no training). Run once before training.")
+    parser.add_argument("--wandb-project", default=None,
+                        help="Override training.extra.wandb.project (the W&B project). CLI wins over YAML.")
+    parser.add_argument("--wandb-run-name", default=None,
+                        help="Override the W&B run name (defaults to the wandb block's run_name, else config.name).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -191,6 +195,19 @@ def main() -> None:
     config.training.extra["inference_temporal_length"] = temporal_length
     config.training.extra["inference_prompt_contexts_path"] = prompt_contexts_path
     config.training.extra.setdefault("inference_use_prompt", prompt_contexts_path is not None)
+
+    # W&B project / run-name overrides (CLI wins over YAML). The logger is built
+    # inside build_experiment from training.extra.wandb, so inject here first.
+    # setdefault keeps `enable`/`require_vae`/etc. from the YAML block intact.
+    if args.wandb_project is not None or args.wandb_run_name is not None:
+        wandb_cfg = config.training.extra.get("wandb")
+        if not isinstance(wandb_cfg, dict):
+            wandb_cfg = {}
+            config.training.extra["wandb"] = wandb_cfg
+        if args.wandb_project is not None:
+            wandb_cfg["project"] = args.wandb_project
+        if args.wandb_run_name is not None:
+            wandb_cfg["run_name"] = args.wandb_run_name
 
     # build_experiment now constructs AdaptedModel(WanTI2VVideoModel, AVID adapter).
     experiment = build_experiment(config)
