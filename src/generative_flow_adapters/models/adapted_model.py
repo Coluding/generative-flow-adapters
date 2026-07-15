@@ -75,9 +75,20 @@ class AdaptedModel(nn.Module):
             return adapter_schedule
         return self.base_model.diffusion_schedule_config
 
-    def forward(self, x_t: Tensor, t: Tensor, cond: object | None = None) -> Tensor:
+    # The trainer can request the intermediate frozen-base prediction alongside
+    # the composed output (for paired base-vs-adapted diagnostics) via
+    # ``return_base=True`` — see Trainer._forward_and_loss. Advertised so the
+    # trainer can feature-detect without importing this class.
+    supports_return_base = True
+
+    def forward(
+        self, x_t: Tensor, t: Tensor, cond: object | None = None, *, return_base: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Single-step composition: compute the frozen base prediction, then
-        compose the adapter residual onto it. This is the training seam."""
+        compose the adapter residual onto it. This is the training seam. With
+        ``return_base=True`` also return the frozen base prediction (already
+        computed here), so the caller can score both on the same batch without a
+        second base forward."""
         if hasattr(self.adapter, "clear_captured_base_features"):
             self.adapter.clear_captured_base_features()
         # Some adapters (e.g. HyperAlign) inject dynamic LoRA weights into the
@@ -89,7 +100,10 @@ class AdaptedModel(nn.Module):
             self.adapter.clear_dynamic_parameters()
         with torch.no_grad(), _prof("base forward (frozen 5B, no_grad)"):
             base_output = self.base_model(x_t, t, cond=cond)
-        return self._compose_with_adapter(x_t, t, cond, base_output)
+        composed = self._compose_with_adapter(x_t, t, cond, base_output)
+        if return_base:
+            return composed, base_output
+        return composed
 
     def _compose_with_adapter(
         self, x_t: Tensor, t: object, cond: object | None, base_output: Tensor

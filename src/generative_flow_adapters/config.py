@@ -83,6 +83,13 @@ class TrainingConfig:
     # there. See thesis-vault decided/shortcut-target-endpoint-vs-v-averaging.
     shortcut_consistency_target: str = "v_average"
     grad_clip_norm: float | None = None
+    # Micro-batches accumulated per optimizer step (effective batch = physical
+    # batch_size * grad_accum_steps). 1 = no accumulation (previous behaviour).
+    grad_accum_steps: int = 1
+    # Linear LR warmup from 0 -> learning_rate over this many optimizer steps
+    # (not micro-batches). None/0 disables (previous behaviour: flat LR from
+    # step 0).
+    linear_warmup_steps: int | None = None
     diffusion_timesteps: int = 1000
     diffusion_beta_schedule: str = "linear"
     diffusion_linear_start: float = 8.5e-4
