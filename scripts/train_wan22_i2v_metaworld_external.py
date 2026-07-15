@@ -295,7 +295,16 @@ def main() -> None:
         # on the SAME clip. Repeat the index >= batch_size times or drop_last empties
         # the loader (Subset of len 1 < batch_size -> zero batches). With
         # --num-windows 1 the window start is pinned to 0, so the clip is identical
-        # every draw. No held-out eval in this mode (there is nothing to hold out).
+        # every draw.
+        #
+        # Eval targets that SAME clip (eval_dataset = train_dataset), not a held-out
+        # split: the native generation grid + quality metrics all read their
+        # conditioning batch from eval_loader (see Trainer), so pointing it at the
+        # overfit clip is what makes the inference grid run — and the ideal overfit
+        # signal is watching the model regenerate the exact clip it memorized.
+        # `want_eval = False` only skips the held-out split branches below; the
+        # eval loader is still built from eval_dataset further down. Gen eval still
+        # needs --eval-gen (default on) + a nonzero inference_every_n_steps.
         if not (0 <= args.overfit_index < len(dataset)):
             raise ValueError(
                 f"--overfit-index {args.overfit_index} out of range for dataset of "
@@ -307,9 +316,11 @@ def main() -> None:
                   f"{args.overfit_index}. Pass --num-windows 1 for a fixed clip.")
         repeat = max(args.batch_size, 8)
         train_dataset = torch.utils.data.Subset(dataset, [args.overfit_index] * repeat)
-        want_eval = False
+        eval_dataset = train_dataset      # eval/generate on the overfit clip itself
+        want_eval = False                 # skip the held-out split branches below
         print(f"OVERFIT MODE: training on dataset[{args.overfit_index}] repeated "
-              f"{repeat}x (single-clip sanity check; eval disabled).")
+              f"{repeat}x (single-clip). Eval/generation targets the same clip; "
+              f"pass --eval-gen (default) to see the inference grid regenerate it.")
     if want_eval and eval_hdf5 is not None:
         _, eval_dataset = build_metaworld_clip_dataset(
             config.data,
