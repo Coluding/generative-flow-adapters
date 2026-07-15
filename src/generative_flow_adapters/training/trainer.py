@@ -93,11 +93,15 @@ class Trainer:
             if isinstance(raw_schedule, Mapping)
             else None
         )
-        # Normalised step size `s` supervised by the most recent shortcut step
-        # (None on anchor steps / when no shortcut target). Lets `training_step`
-        # bucket the shortcut loss into one per-rung series so the otherwise
-        # `s`-marginalised aggregate curve becomes readable.
         self._last_shortcut_step_level: float | None = None
+        self._probe_batch: dict[str, object] | None = None
+        self._accum_micro_step = 0
+        warmup_steps = config.linear_warmup_steps
+        self.lr_scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
+        if warmup_steps and warmup_steps > 0:
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / warmup_steps)
+            )
         # Lazy cache for the CFG negative embedding used by native eval generation.
         self._neg_ctx_loaded = False
         self._neg_ctx: Tensor | None = None
@@ -207,6 +211,10 @@ class Trainer:
         if not isinstance(target, Tensor):
             raise TypeError("batch['target'] must be a tensor.")
 
+        # Frozen-base denoising loss on this batch (flow path only); stays None
+        # when the model can't return its base prediction (see the flow branch).
+        base_only_loss_val: float | None = None
+
         if model_type == "diffusion":
             batch_size = target.shape[0]
             t_value = batch.get("t")
@@ -268,14 +276,23 @@ class Trainer:
                 cond, shortcut_target = self._maybe_prepare_shortcut(
                     batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
                 )
+            want_base = getattr(self.model, "supports_return_base", False)
             with self._prof("  model forward (base + adapter)"), self._autocast():
-                prediction = self.model(x_t, t, cond)
-            # See diffusion branch: upcast to fp32 for a precision-consistent
-            # loss/backward. No-op when amp is off.
+                if want_base:
+                    prediction, base_output = self.model(x_t, t, cond, return_base=True)
+                else:
+                    prediction, base_output = self.model(x_t, t, cond), None
             prediction = prediction.float()
             loss = self._flow_loss(prediction, target, batch)
+            if base_output is not None:
+                with torch.no_grad():
+                    base_only = self._flow_loss(base_output.float(), target, batch)
+                base_only_loss_val = float(base_only.detach().cpu())
 
         loss_components: dict[str, float] = {"base_loss": float(loss.detach().cpu())}
+        if base_only_loss_val is not None:
+            loss_components["denoise_base_only"] = base_only_loss_val
+            loss_components["denoise_adapter_delta"] = base_only_loss_val - loss_components["base_loss"]
 
         batch = dict(batch)
         if shortcut_target is not None:
@@ -321,27 +338,36 @@ class Trainer:
         self.model.train()
         loss, loss_components, _x_t, _t, _cond, _prediction, batch = self._forward_and_loss(batch)
         model_type = getattr(self.model, "model_type", None)
-
-        self.optimizer.zero_grad(set_to_none=True)
+        accum_steps = max(2, int(self.config.grad_accum_steps))
         with self._prof("  backward"):
-            loss.backward()
-        if self.config.grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-        with self._prof("  optimizer.step"):
-            self.optimizer.step()
-        self.global_step += 1
+            (loss / accum_steps).backward()
+        self._accum_micro_step += 1
+        did_step = self._accum_micro_step >= accum_steps
+        if did_step:
+            if self.config.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+            with self._prof("  optimizer.step"):
+                self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+            self._accum_micro_step = 0
+            self.global_step += 1
 
-        metrics: dict[str, object] = {"loss": float(loss.detach().cpu())}
+        metrics: dict[str, object] = {"loss": float(loss.detach().cpu()), "optimizer_stepped": did_step}
+        if self.lr_scheduler is not None:
+            metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
         metrics.update(loss_components)
         shortcut_s = self._last_shortcut_step_level
         if shortcut_s is not None and "shortcut_direction_loss" in loss_components:
             n_steps = max(1, int(round(1.0 / shortcut_s)))
             metrics[f"shortcut_direction_loss/N{n_steps:03d}"] = loss_components["shortcut_direction_loss"]
-        generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
-        if generated_samples is not None:
-            metrics["generated_samples"] = generated_samples.detach().cpu()
-        if self.wandb_logger is not None:
-            self.wandb_logger.log_metrics(metrics, step=self.global_step)
+        if did_step:
+            generated_samples = self._maybe_generate_samples(batch=batch, model_type=model_type)
+            if generated_samples is not None:
+                metrics["generated_samples"] = generated_samples.detach().cpu()
+            if self.wandb_logger is not None:
+                self.wandb_logger.log_metrics(metrics, step=self.global_step)
         return metrics
 
     @torch.no_grad()
@@ -374,6 +400,15 @@ class Trainer:
                     if preprocessor is not None
                     else raw_batch
                 )
+                # Capture the first flow batch as the frozen probe (fully
+                # preprocessed: clip + timesteps + noise baked in), once.
+                if (
+                    self._probe_batch is None
+                    and getattr(self.model, "model_type", None) == "flow"
+                    and isinstance(batch.get("x_t"), Tensor)
+                    and isinstance(batch.get("t"), Tensor)
+                ):
+                    self._probe_batch = _detach_clone(dict(batch))
                 loss, loss_components, *_ = self._forward_and_loss(batch)
                 loss_components["loss"] = float(loss.detach().cpu())
                 for key, value in loss_components.items():
@@ -382,9 +417,41 @@ class Trainer:
         finally:
             self.model.train(was_training)
 
-        if count == 0:
+        result: dict[str, float] = {}
+        if count > 0:
+            result = {f"eval_{key}": value / count for key, value in totals.items()}
+        result.update({f"eval_{key}": value for key, value in self._probe_eval().items()})
+        return result
+
+    @torch.no_grad()
+    def _probe_eval(self) -> dict[str, float]:
+        """Denoising loss on the frozen probe batch for both the adapted model and
+        the frozen base. Deterministic up to the model weights (fixed clip,
+        timesteps, and noise), so the trend is readable without the per-batch
+        sampling variance. Returns ``probe_denoise_{adapted,base,delta}`` (delta =
+        base − adapted, > 0 ⇒ the adapter helps); empty if no probe / not flow."""
+        batch = self._probe_batch
+        if not isinstance(batch, dict):
             return {}
-        return {f"eval_{key}": value / count for key, value in totals.items()}
+        x_t, t, target = batch.get("x_t"), batch.get("t"), batch.get("target")
+        if not (isinstance(x_t, Tensor) and isinstance(t, Tensor) and isinstance(target, Tensor)):
+            return {}
+        if not getattr(self.model, "supports_return_base", False):
+            return {}
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with self._autocast():
+                prediction, base_output = self.model(x_t, t, batch.get("cond"), return_base=True)
+            adapted = float(self._flow_loss(prediction.float(), target, batch).detach().cpu())
+            base_only = float(self._flow_loss(base_output.float(), target, batch).detach().cpu())
+        finally:
+            self.model.train(was_training)
+        return {
+            "probe_denoise_adapted": adapted,
+            "probe_denoise_base": base_only,
+            "probe_denoise_delta": base_only - adapted,
+        }
 
     def train(
         self,
@@ -420,7 +487,12 @@ class Trainer:
                 ``config.eval_every_n_steps`` is set, an eval cycle runs at that
                 cadence (averaging over ``config.eval_num_batches`` batches) and
                 a ``best.pt`` checkpoint is saved whenever ``config.eval_metric``
-                improves. A final eval also runs at the end of training.
+                improves. A final eval also runs at the end of training. On a
+                fresh run (``global_step == 0``), a full baseline eval cycle
+                (loss, native generation grid, distribution quality metrics —
+                whichever are configured) also runs *before* the first gradient
+                update, so every metric has a genuine pre-training reference
+                point. Skipped on resume (``global_step > 0`` already).
 
         Side effects driven by ``config`` (all opt-in, no-ops when unset):
             * ``jsonl_logger`` — every step's metrics and each eval are appended.
@@ -436,6 +508,29 @@ class Trainer:
         running_count = 0
         epoch = 0
         start = time.time()
+        # Baseline eval BEFORE any gradient update, on a fresh run (skipped when
+        # resuming — global_step > 0 already). Gives every metric (eval loss,
+        # denoise_adapter_delta/probe_denoise_*, quality metrics, the native
+        # generation grid) a genuine step-0 reference point, uncontaminated by
+        # even a single optimizer step — the cleanest possible "at init" value
+        # to compare the rest of the run against. Also means the lazily-captured
+        # `self._probe_batch` (see evaluate()) is captured from the untrained
+        # model, not from whatever step happened to hit the first eval cadence.
+        if self.global_step == 0 and eval_loader is not None:
+            with self._prof("eval cycle (loss) — pre-training baseline"):
+                self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
+            if self._native_base is not None and self.config.inference_every_n_steps:
+                with self._prof("native eval grid (generation) — pre-training baseline"):
+                    self._native_eval_grid(eval_loader, preprocessor=preprocessor)
+            if self.config.quality_dist_metrics and self.config.quality_dist_every_n_steps:
+                self._run_quality_eval(
+                    eval_loader,
+                    preprocessor=preprocessor,
+                    metric_names=self.config.quality_dist_metrics,
+                    num_batches=self.config.quality_dist_num_batches,
+                    num_steps=self.config.quality_eval_num_steps or self.config.inference_num_steps,
+                    log=log_every > 0,
+                )
         while self.global_step < max_steps:
             epoch += 1
             _prof_last = time.perf_counter()
@@ -456,6 +551,9 @@ class Trainer:
                 loss_value = float(metrics["loss"])
                 running_loss += loss_value
                 running_count += 1
+                if not metrics.get("optimizer_stepped", True):
+                    _prof_last = time.perf_counter()
+                    continue
                 if self.jsonl_logger is not None:
                     self.jsonl_logger.log(metrics, step=self.global_step, split="train")
                 if on_step is not None:
@@ -470,9 +568,6 @@ class Trainer:
                 if eval_loader is not None and self._cadence_due(self.config.eval_every_n_steps):
                     with self._prof("eval cycle (loss)"):
                         self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
-                # Native eval grid (Wan2.2): the frozen base's own i2v loop on
-                # held-out clips at config CFG/shift/prompt. Legacy backbones build
-                # their grid inside `training_step` via `_maybe_generate_samples`.
                 if (
                     eval_loader is not None
                     and self._native_base is not None
@@ -499,9 +594,6 @@ class Trainer:
 
         elapsed = time.time() - start
         avg_loss = running_loss / max(running_count, 1)
-        # Final eval + checkpoint so a run always ends with up-to-date artifacts,
-        # regardless of where the last cadence boundary fell. Skip the final eval
-        # if the last step already landed on the eval cadence (no double-compute).
         if (
             eval_loader is not None
             and self.config.eval_every_n_steps
@@ -559,10 +651,7 @@ class Trainer:
             )
             if log:
                 print(f"  new best {metric_key}={value:.5f} -> {path}")
-        # Paired quality metrics (psnr/ssim/...) on every eval cycle — cheap,
-        # reliable, scored vs aligned ground truth. Distribution metrics
-        # (fid/fvd) run on their own rarer cadence from the train loop.
-        if self.config.quality_metrics: #TODO I dont think we need this
+        if self.config.quality_metrics:
             self._run_quality_eval(
                 eval_loader,
                 preprocessor=preprocessor,
@@ -1633,6 +1722,19 @@ class Trainer:
             step=self.global_step,
         )
         return last_adapted
+
+
+def _detach_clone(obj: object) -> object:
+    """Deep detached clone of a batch (tensors → detach().clone(), containers
+    recursed, everything else passed through). Used to freeze the probe batch so
+    later loader iterations reusing the same buffers can't mutate it."""
+    if isinstance(obj, Tensor):
+        return obj.detach().clone()
+    if isinstance(obj, dict):
+        return {k: _detach_clone(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_detach_clone(v) for v in obj)
+    return obj
 
 
 def _call_preprocessor(

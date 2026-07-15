@@ -1,0 +1,164 @@
+# "CRAZY EXPERIMENT" — full-override diagnostic. Wan2.2-TI2V-5B (flow matching,
+# diffusion forcing) + DynamiCrafter 3D-UNet output adapter, but the adapter's
+# output FULLY REPLACES the base prediction instead of composing with it.
+#
+# f = f_base + g(d)·Δ_φ  (the thesis rule)  -->  f = Δ_φ(x_t, t, a_t, base_output)
+# for THIS diagnostic run only. The base is still given to the adapter as an
+# INPUT (condition_on_base_outputs: true concatenates base_output into the UNet's
+# input channels, unchanged) — the adapter still sees the base's prediction and
+# can use it. What changes is the OUTPUT: `composition: replace` (already a
+# supported AdaptedModel._compose branch, adapted_model.py:159-160) drops the
+# base entirely at composition time and returns the adapter's own prediction
+# unmodified. No new code — config-only.
+#
+# WHY (2026-07-14, thesis-vault: why-adapter-underlearns-diagnosis): the two
+# confirmed confounds so far — gate saturation (mask_mix + gate_bias=4.0 throttles
+# adapter gradient ~50x) and the vendored-base-vs-real-base script split — both
+# affect how much and how *cleanly* gradient reaches the adapter. This config
+# removes the composition confound entirely: there is no gate, no (1-gate)
+# multiplier, nothing standing between the loss and the adapter's own output
+# layer. It isolates "can THIS optimization setup (lr, batch size, adapter arch)
+# learn at all" from "is the composition throttling it" — the same question the
+# broken-base control run (wan22-avid-i2v-metaworld34/l3p8kygb) answered, but
+# WITHOUT discarding the base's information: the adapter still gets base_output
+# concatenated as input, so it isn't learning image generation from scratch like
+# that control run was, only learning to *use* what the base already computed.
+#
+# Differs from diffusion_wan22_dcunet_output_metaworld.yaml in exactly:
+#   composition: mask_mix -> replace
+#   adapter.extra.output_mask: true -> false   (no gate head needed under replace)
+#   unet_config_path: wan48_11M -> wan48_34M   (the adapter must reconstruct the
+#     FULL velocity field now, not just a residual on top of the base — give it
+#     more room; 34M matches the working AVID Wan adapter's scale)
+# Everything else (base, data, shortcut schedule, per-frame actions, eval grid)
+# held identical to the mask_mix run for a clean single-variable comparison.
+#
+# EXPECTED BEHAVIOUR AT INIT (not a bug): the DC UNet's final conv is NOT
+# zero-init (openaimodel3d.py, "don't zero initialize outputs"), so at step 0 the
+# adapter emits an untrained, non-trivial full prediction — loss will start HIGH
+# (like the broken-base control), not near the base's floor like mask_mix does.
+# That's the point: we've deliberately removed the free ride the base's own
+# prediction gave the composition at init.
+#
+# DECISION RULE:
+#   - Loss descends cleanly (like the broken-base control, SNR >> 1) despite the
+#     adapter having a much easier job (base info available as input) -> gate
+#     saturation (or general dilution from composing with a strong base) WAS the
+#     binding constraint. Fixing composition on the real mask_mix/gated_residual
+#     runs should help a lot.
+#   - Loss still barely moves / stays noisy -> the bottleneck is upstream of
+#     composition (optimization, action-embedding magnitude, injection design,
+#     or the adapter architecture itself) — composition wasn't the (sole) issue.
+#   - Compare `probe_denoise_delta` (base − adapted, on the frozen probe batch)
+#     against the mask_mix run's — under `replace` this trivially reduces to
+#     `base_only − adapted` with no gate in the way, so it's the cleanest
+#     available read of whether the adapter, given everything, can do better
+#     than the base at all.
+#
+# NOT a proposed final architecture — this deliberately throws away the
+# plug-and-play composition (f_base + g·Δ) that is the whole thesis contribution.
+# It exists purely to isolate an optimization/gradient-flow confound. Do not
+# report results from this config as a D2/D4 result; it's a diagnostic.
+#
+# PREREQUISITES: Wan2.2-TI2V-5B DiT + Wan2.2_VAE.pth in the ckpt dir.
+# Run with scripts/train_wan22_i2v_metaworld_EXTERNAL.py — NOT the plain
+# train_wan22_i2v_metaworld.py (see diffusion_wan22_dcunet_output_metaworld.yaml's
+# header for why; same reasoning applies here).
+
+name: diffusion_wan22_dcunet_replace_metaworld
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    latent_channels: 48
+    temporal_length: 41
+    max_area: 589824
+    latent_height: 16
+    latent_width: 16
+    text_prompts_file: configs/prompts/metaworld_tasks.yaml
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 48
+  composition: replace       # <-- the whole experiment: f = Δ_φ, base bypassed at output
+  extra:
+    backbone: unet
+    unet_config_path: configs/base/act_cond_diffusion_wan48_34M.yaml
+    condition_on_base_outputs: true   # <-- base_output still concatenated as INPUT
+    output_mask: false                # no gate — replace doesn't consume one
+    use_adapter_conditioning: true
+    strict_checkpoint: false
+    allow_dummy_concat_condition: false
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+
+conditioning:
+  type: action
+  input_dim: 4
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  inference_every_n_steps: 300
+  eval_every_n_steps: 5
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 1
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 5
+  quality_dist_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_use_prompt: true
+    inference_frame_num: 41
+    inference_seed: 0
+    inference_max_area: 589824
+    cond_frames: 1
+    cond_frames_dist:
+      1: 1
+    action_per_frame: true
+    shortcut_anchor_prob: 0.6
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
+
+    wandb:
+      enable: true
+      require_vae: false
+      project: Wan2.2-dcunet-replace-i2v-metaworld
+      num_samples: 3
+      fps: 3

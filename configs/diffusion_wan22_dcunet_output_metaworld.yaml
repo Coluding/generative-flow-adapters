@@ -23,7 +23,17 @@
 # the three verification points in the base UNet config header) before the real run.
 #
 # PREREQUISITES: Wan2.2-TI2V-5B DiT + Wan2.2_VAE.pth in the ckpt dir.
-# Run with scripts/train_wan22_i2v_metaworld.py.
+# Run with scripts/train_wan22_i2v_metaworld_EXTERNAL.py — NOT the plain
+# train_wan22_i2v_metaworld.py. The plain script's `provider: wan2.2` loads the
+# vendored, hand-copied Wan22DiTWrapper; the "broken base learned from scratch"
+# control run (wandb coluding/wan22-avid-i2v-metaworld34/l3p8kygb) used exactly
+# that script and got a base with no real prior. `_external.py` uses
+# `provider: wan2.2_external` -> the real upstream wan.WanTI2V with genuine
+# pretrained weights (confirmed: both real-prior xattn runs, cq3e83pj and
+# xb76ptw2, used _external.py). `_external.py` is also the ONLY script wired to
+# read `training.extra.action_per_frame`/`action_seq_len` (added 2026-07-14) —
+# the plain script silently ignores both, so `action_per_frame: true` below
+# would be a no-op under it.
 
 name: diffusion_wan22_dcunet_output_metaworld
 
