@@ -76,6 +76,12 @@ def main() -> None:
     parser.add_argument("--num-windows", type=int, default=16,
                         help="random mode: draw each clip from a fixed pool of K deterministic windows "
                              "per episode (enables latent caching). 0 = unbounded random (cache can't hit).")
+    parser.add_argument("--overfit-index", type=int, default=None,
+                        help="Single-clip overfit sanity check: pin training to ONE dataset entry "
+                             "(this episode index) repeated every step, so the target is a constant "
+                             "clip the adapter only has to memorize. Pair with --num-windows 1 so the "
+                             "window start is fixed at 0 (byte-identical clip each draw). Disables the "
+                             "train/val split. See thesis-vault exp-single-clip-overfit.")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -261,6 +267,26 @@ def main() -> None:
 
     eval_dataset = None
     train_dataset = dataset
+    if args.overfit_index is not None:
+        # Single-clip overfit: alias every access to one entry so each step trains
+        # on the SAME clip. Repeat the index >= batch_size times or drop_last empties
+        # the loader (Subset of len 1 < batch_size -> zero batches). With
+        # --num-windows 1 the window start is pinned to 0, so the clip is identical
+        # every draw. No held-out eval in this mode (there is nothing to hold out).
+        if not (0 <= args.overfit_index < len(dataset)):
+            raise ValueError(
+                f"--overfit-index {args.overfit_index} out of range for dataset of "
+                f"length {len(dataset)}."
+            )
+        if num_windows != 1:
+            print(f"  warning: --overfit-index set but --num-windows={num_windows} "
+                  f"(not 1); window start will still jitter within episode "
+                  f"{args.overfit_index}. Pass --num-windows 1 for a fixed clip.")
+        repeat = max(args.batch_size, 8)
+        train_dataset = torch.utils.data.Subset(dataset, [args.overfit_index] * repeat)
+        want_eval = False
+        print(f"OVERFIT MODE: training on dataset[{args.overfit_index}] repeated "
+              f"{repeat}x (single-clip sanity check; eval disabled).")
     if want_eval and eval_hdf5 is not None:
         _, eval_dataset = build_metaworld_clip_dataset(
             config.data,

@@ -19,8 +19,12 @@
 # the clean capacity test. (b) pretrained-DC init is deferred (its prior lives in a
 # different latent space; see the ticket).
 #
-# STATUS: draft, NOT smoke-validated. Run the random-weight smoke test first (see
-# the three verification points in the base UNet config header) before the real run.
+# STATUS (2026-07-15): DC-UNet wiring smoke-validated (training steps run
+# end-to-end, see feat-adapter-dynamicrafter-output-on-wan-base.md). gate_bias
+# fixed 4.0->0.0 + grad_accum_steps/linear_warmup_steps added to match the
+# AVID reference comparison run, per the AVID-vs-ours structural comparison
+# (thesis-vault why-adapter-underlearns-diagnosis.md). NOT yet run for real at
+# these settings -- see the ticket for the actual capacity experiment.
 #
 # PREREQUISITES: Wan2.2-TI2V-5B DiT + Wan2.2_VAE.pth in the ckpt dir.
 # Run with scripts/train_wan22_i2v_metaworld_EXTERNAL.py — NOT the plain
@@ -65,7 +69,9 @@ adapter:
   hidden_dim: 256            # cond_hidden_dim for the adapter's conditioning MLP
   feature_dim: 48            # Wan2.2 latent channel count
   composition: mask_mix      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
-  gate_bias: 4.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
+  gate_bias: 0.0             # σ(0)=0.5 -> balanced 50/50 at init (AVID-matched, fixed 2026-07-15;
+                              # was 4.0 -> σ(4)≈0.982, 98/2 saturated -- see thesis-vault
+                              # bug-adapter-gate-saturation-mask-mix.md)
   extra:
     backbone: unet           # DynamiCrafter 3D UNet delta (vs `wan` tiny DiT)
     unet_config_path: configs/base/act_cond_diffusion_wan48_11M.yaml
@@ -91,6 +97,8 @@ training:
   loss: flow_matching
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
+  grad_accum_steps: 4          # effective batch 8 (added 2026-07-15, matches the AVID reference comparison run)
+  linear_warmup_steps: 250     # matches AVID's active warmup
   shortcut_direction_weight: 1.0
   shortcut_target_method: distillation
   inference_every_n_steps: 300
