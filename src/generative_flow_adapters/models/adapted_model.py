@@ -59,6 +59,12 @@ class AdaptedModel(nn.Module):
         self.include_base_direction = include_base_direction
         self.normalize_base_direction = normalize_base_direction
         self.adapter.attach_base_model(base_model)
+        # Post-sigmoid gate tensor from the most recent `_compose` call, for
+        # gated compositions only (`mask_mix`/`avid_mask_mix`/`gated_residual`).
+        # None for `add`/`replace` (no gate) or before the first forward.
+        # Detached diagnostic snapshot only — read by Trainer for
+        # gate_mean/gate_std/gate histogram logging; not used in the loss.
+        self._last_gate: Tensor | None = None
 
     @property
     def model_type(self) -> str:
@@ -145,6 +151,7 @@ class AdaptedModel(nn.Module):
         return generate(conditioning, compose_fn=_compose_step, **kwargs)
 
     def _compose(self, base_output: Tensor, adapter_result: Tensor | OutputAdapterResult) -> Tensor:
+        self._last_gate = None
         if isinstance(adapter_result, Tensor):
             return base_output + adapter_result
 
@@ -166,6 +173,7 @@ class AdaptedModel(nn.Module):
             if adapter_result.gate is None:
                 raise ValueError("Mask-mix composition requires an adapter gate output.")
             gate = torch.sigmoid(adapter_result.gate + self.gate_bias)
+            self._last_gate = gate.detach()
             return base_output * gate + adapter_result.adapter_output * (1.0 - gate)
         elif composition in {"gated_residual", "gated_add", "residual_mask"}:
             # Gated residual: the adapter output is a *contribution* added to the
@@ -176,6 +184,7 @@ class AdaptedModel(nn.Module):
             if adapter_result.gate is None:
                 raise ValueError("gated_residual composition requires an adapter gate output.")
             gate = torch.sigmoid(adapter_result.gate + self.gate_bias)
+            self._last_gate = gate.detach()
             return base_output + gate * adapter_result.adapter_output
 
         raise ValueError(f"Unsupported output composition: {self.output_composition}")

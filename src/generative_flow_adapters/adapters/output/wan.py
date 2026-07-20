@@ -54,6 +54,9 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         self.step_level_key = step_level_key
         self.action_token_key = action_token_key
         self.action_fallback_key = action_fallback_key
+        # Cross-attention modes consume per-frame action tokens; used to reject
+        # the aggregated-action fallback loudly (see forward).
+        self.uses_action_tokens = action_injection in {"cross_attention", "both"}
         self.output_mask = output_mask
         self.predict_full = predict_full
         self.module = ActionWanModel(
@@ -99,16 +102,24 @@ class Wan21OutputAdapter(OutputAdapterInterface):
         # condition dropout / CFG is applied upstream by the encoder's null path.
         cond_embedding = resolve_condition_embedding(cond)
         step_level = cond.get(self.step_level_key) if isinstance(cond, Mapping) else None
-        # Per-frame action tokens for the cross-attention path. Prefer the
-        # per-frame `action_seq`; fall back to the aggregated `action` [B,A] as a
-        # single token (e.g. at inference when only one action vector is passed).
-        # Ignored unless the tiny DiT is in a cross-attention injection mode.
-        action_tokens = None #TODO: remove fallback. if we traaned on action_seq then we shouldnt be able to pass aggregated actions during inference
+        # Per-frame action tokens for the cross-attention path. Training always
+        # sees the preprocessor's per-frame `action_seq`; silently falling back
+        # to the aggregated `action` (one summed token, values ~sum over the
+        # clip) is exactly the train/inference mismatch that collapsed the
+        # replace-run rollouts (cos vs base 0.997 -> 0.63; 2026-07-20). In a
+        # cross-attention mode a present-but-aggregated action therefore raises
+        # instead of degrading silently. Truly action-free conds stay allowed.
+        action_tokens = None
         if isinstance(cond, Mapping):
             at = cond.get(self.action_token_key)
-            if not isinstance(at, Tensor):
-                at = cond.get(self.action_fallback_key)
-            action_tokens = at if isinstance(at, Tensor) else None
+            if isinstance(at, Tensor):
+                action_tokens = at
+            elif self.uses_action_tokens and isinstance(cond.get(self.action_fallback_key), Tensor):
+                raise ValueError(
+                    f"Cross-attention action injection needs per-frame '{self.action_token_key}' tokens "
+                    f"(trained on them), but cond only has the aggregated '{self.action_fallback_key}'. "
+                    "Pass the preprocessor's action_seq through to generation instead of the summed action."
+                )
         result = self.module(
             x_t,
             t,
