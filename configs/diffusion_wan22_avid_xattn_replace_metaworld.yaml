@@ -55,7 +55,7 @@ model:
     allow_missing_checkpoint: true
     dtype: bf16
     latent_channels: 48
-    temporal_length: 41     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
+    temporal_length: 97     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
     max_area: 589824         # 704 * 1280
     latent_height: 16
     latent_width: 16
@@ -70,7 +70,7 @@ adapter:
     backbone: wan            # AVID-style: a small action-conditioned Wan DiT
     wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
     condition_on_base_outputs: true   # base_output still concatenated as INPUT
-    use_step_level_conditioning: true
+    use_step_level_conditioning: false
     step_level_key: step_level
     step_level_transform: log2
     action_dropout_prob: 0.0
@@ -90,15 +90,18 @@ training:
   loss: flow_matching
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
+  output_dir: outputs/replace-metaworld-run   # checkpoints land in outputs/replace-metaworld-run/checkpoints/
+  checkpoint_every_n_steps: 500               # step-tagged saves
+  keep_last_checkpoints: 3
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
   inference_every_n_steps: 300
-  eval_every_n_steps: 5
+  eval_every_n_steps: 300
   quality_metrics: [psnr, ssim, lpips, mse]
   quality_eval_num_batches: 4
-  quality_eval_num_steps: 1
+  quality_eval_num_steps: 10
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 5
+  quality_dist_every_n_steps: 300
   quality_dist_num_batches: 4
 
   extra:
@@ -108,7 +111,7 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_use_prompt: true
-    inference_frame_num: 41
+    inference_frame_num: 97
     inference_seed: 0
     inference_max_area: 589824
     cond_frames: 1

@@ -31,4 +31,4 @@ mkdir -p logs
 source .venv/bin/activate
 
 
-python scripts/precompute_latents.py --hdf5 ../scratch-shared/metaworld/three_task.hdf5 --ckpt-dir ckpts/Wan2.2-TI2V-5B --num-windows 8 --max-area 589824
+python scripts/precompute_latents.py --hdf5 ../scratch-shared/metaworld/five_task_diverse.hdf5 --ckpt-dir ckpts/Wan2.2-TI2V-5B --num-windows 8 --max-area 589824

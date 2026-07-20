@@ -44,7 +44,7 @@ adapter:
   hidden_dim: 256
   feature_dim: 48            # Wan2.2 latent channel count
   composition: mask_mix      # AVID prediction-blend: base*σ(gate) + pred*(1-σ(gate))
-  gate_bias: 4.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
+  gate_bias: 0.0             # σ(0+4)≈0.982 -> mask starts ≈1 (keep base) for identity-at-init
   extra:
     backbone: wan            # AVID-style: a small action-conditioned Wan DiT
     wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
@@ -68,15 +68,18 @@ training:
   loss: flow_matching
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
+  output_dir: runs/overfit-single-clip        # checkpoints land in runs/overfit-single-clip/checkpoints/
+  checkpoint_every_n_steps: 500               # step-tagged saves
+  keep_last_checkpoints: 3
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
-  inference_every_n_steps: 300
-  eval_every_n_steps: 300
+  inference_every_n_steps: 75
+  eval_every_n_steps: 75
   quality_metrics: [psnr, ssim, lpips, mse]
   quality_eval_num_batches: 4
   quality_eval_num_steps: 1
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 300
+  quality_dist_every_n_steps: 75
   quality_dist_num_batches: 4
 
   extra:
@@ -86,13 +89,13 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_use_prompt: true
-    inference_frame_num: 97
+    inference_frame_num: null
     inference_seed: 0
     inference_max_area: 589824
     cond_frames: 1
     cond_frames_dist:
       1: 1
-    shortcut_anchor_prob: 0.6
+    shortcut_anchor_prob: 1.0
     shortcut_step_schedule:
       units: normalized
       mode: log2
@@ -112,4 +115,4 @@ training:
       require_vae: false
       project: Wan2.2-avid-xattn-i2v-metaworld
       num_samples: 3
-      fps: 3
+      fps: 5

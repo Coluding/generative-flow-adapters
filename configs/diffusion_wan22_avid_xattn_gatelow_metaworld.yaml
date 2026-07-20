@@ -54,7 +54,7 @@ model:
     allow_missing_checkpoint: true
     dtype: bf16
     latent_channels: 48
-    temporal_length: 41     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
+    temporal_length: 97     # pixel-frame window -> 11 latent frames (t_lat = 1 + (41-1)/4)
     max_area: 589824         # 704 * 1280
     latent_height: 16
     latent_width: 16
@@ -76,7 +76,7 @@ adapter:
     action_dropout_prob: 0.0
     # --- action-conditioning injection ---
     action_injection: cross_attention   # adaln | cross_attention | both
-    action_max_len: 64                  # positional-embedding capacity for action tokens
+    action_max_len: 128                  # positional-embedding capacity for action tokens
     # action_token_key: action_seq      # (default) per-frame tokens from the preprocessor
 
 conditioning:
@@ -89,13 +89,16 @@ training:
   loss: flow_matching
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
+  output_dir: outputs/gatelow-metaworld-run   # checkpoints land in outputs/gatelow-metaworld-run/checkpoints/
+  checkpoint_every_n_steps: 500               # step-tagged saves
+  keep_last_checkpoints: 3
   shortcut_direction_weight: 1.0       # shortcut self-consistency supervision (masked to predicted frames)
   shortcut_target_method: distillation
   inference_every_n_steps: 300
   eval_every_n_steps: 300
   quality_metrics: [psnr, ssim, lpips, mse]
   quality_eval_num_batches: 4
-  quality_eval_num_steps: 1
+  quality_eval_num_steps: 10
   quality_dist_metrics: [fvd, fid]
   quality_dist_every_n_steps: 300
   quality_dist_num_batches: 4
@@ -107,7 +110,7 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_use_prompt: true
-    inference_frame_num: 41
+    inference_frame_num: null
     inference_seed: 0
     inference_max_area: 589824
     cond_frames: 1
@@ -125,8 +128,8 @@ training:
       base: 2
     eval_step_schedule:
       - {num_steps: 1,  step_level: 1.0}
-      - {num_steps: 2,  step_level: 0.5}
-      - {num_steps: 4,  step_level: 0.25}
+      #- {num_steps: 2,  step_level: 0.5}
+      #- {num_steps: 4,  step_level: 0.25}
       - {num_steps: 8,  step_level: 0.125}
       - {num_steps: 25, step_level: 0.04}
       - {num_steps: 50, step_level: 0.02}
@@ -134,6 +137,6 @@ training:
     wandb:
       enable: true
       require_vae: false
-      project: Wan2.2-avid-xattn-gatelow-i2v-metaworld
+      project: Wan2.2-avid-xattn-i2v-metaworld
       num_samples: 3
       fps: 5
