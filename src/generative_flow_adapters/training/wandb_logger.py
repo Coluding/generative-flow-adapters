@@ -95,6 +95,21 @@ class WandbLogger:
         if payload:
             self._wandb.log(payload, step=int(step))
 
+    def log_histogram(
+        self, key: str, values: Tensor, step: int, *, max_samples: int = 100_000
+    ) -> None:
+        """Log a wandb Histogram from a (possibly large) tensor, e.g. the
+        per-pixel gate values from a mask_mix/gated_residual composition.
+        Randomly subsampled to `max_samples` to keep this cheap on big tensors
+        (per-pixel gates can be millions of elements)."""
+        flat = values.detach().float().flatten()
+        if flat.numel() == 0:
+            return
+        if flat.numel() > max_samples:
+            idx = torch.randperm(flat.numel(), device=flat.device)[:max_samples]
+            flat = flat[idx]
+        self._wandb.log({key: self._wandb.Histogram(flat.cpu().numpy())}, step=int(step))
+
     # ------------------------------------------------ modality prediction vs gt
 
     def log_prediction_vs_gt(

@@ -192,6 +192,23 @@ class Trainer:
         masked = self._frame_masked_mse(prediction, target, batch)
         return masked if masked is not None else self.loss_fn(prediction, target)
 
+    def _adapter_grad_norm(self) -> float | None:
+        """L2 norm of gradients on `model.adapter` parameters only (excludes the
+        frozen base and, deliberately, the condition encoder — scoped tight to
+        "is the adapter itself receiving a healthy gradient"). Call after all
+        accumulation micro-steps' backward() calls, before zero_grad(). None if
+        there's no `.adapter` submodule or none of its params have a grad yet."""
+        adapter = getattr(self.model, "adapter", None)
+        if adapter is None:
+            return None
+        total_sq = 0.0
+        found = False
+        for p in adapter.parameters():
+            if p.grad is not None:
+                found = True
+                total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
+        return total_sq**0.5 if found else None
+
     def _forward_and_loss(
         self, batch: Mapping[str, Tensor | object]
     ) -> tuple[Tensor, dict[str, float], Tensor, Tensor, object, Tensor, dict]:
@@ -214,6 +231,9 @@ class Trainer:
         # Frozen-base denoising loss on this batch (flow path only); stays None
         # when the model can't return its base prediction (see the flow branch).
         base_only_loss_val: float | None = None
+        # Frozen-base prediction tensor (flow path only, and only when the model
+        # supports `return_base=True`); stays None for diffusion.
+        base_output: Tensor | None = None
 
         if model_type == "diffusion":
             batch_size = target.shape[0]
@@ -293,6 +313,20 @@ class Trainer:
         if base_only_loss_val is not None:
             loss_components["denoise_base_only"] = base_only_loss_val
             loss_components["denoise_adapter_delta"] = base_only_loss_val - loss_components["base_loss"]
+        if base_output is not None:
+            # Composition-agnostic "how much did the adapter move the output
+            # relative to base" — works for add/mask_mix/gated_residual/replace
+            # alike, unlike a gate value (which only exists for gated modes).
+            with torch.no_grad():
+                base_norm = base_output.float().norm().clamp_min(1e-8)
+                loss_components["adapter_rel_contribution"] = float(
+                    ((prediction - base_output.float()).norm() / base_norm).detach().cpu()
+                )
+            gate_tensor = getattr(self.model, "_last_gate", None)
+            if isinstance(gate_tensor, Tensor) and gate_tensor.numel() > 0:
+                gate_flat = gate_tensor.detach().float().flatten()
+                loss_components["adapter_gate_mean"] = float(gate_flat.mean().cpu())
+                loss_components["adapter_gate_std"] = float(gate_flat.std().cpu())
 
         batch = dict(batch)
         if shortcut_target is not None:
@@ -343,7 +377,12 @@ class Trainer:
             (loss / accum_steps).backward()
         self._accum_micro_step += 1
         did_step = self._accum_micro_step >= accum_steps
+        adapter_grad_norm: float | None = None
         if did_step:
+            # Adapter-only grad norm, captured post-accumulation (all
+            # micro-steps' backward() calls have summed into .grad by now) but
+            # pre-zero_grad — the true norm the optimizer is about to apply.
+            adapter_grad_norm = self._adapter_grad_norm()
             if self.config.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
             with self._prof("  optimizer.step"):
@@ -357,6 +396,8 @@ class Trainer:
         metrics: dict[str, object] = {"loss": float(loss.detach().cpu()), "optimizer_stepped": did_step}
         if self.lr_scheduler is not None:
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+        if adapter_grad_norm is not None:
+            metrics["adapter_grad_norm"] = adapter_grad_norm
         metrics.update(loss_components)
         shortcut_s = self._last_shortcut_step_level
         if shortcut_s is not None and "shortcut_direction_loss" in loss_components:
@@ -367,6 +408,9 @@ class Trainer:
             if generated_samples is not None:
                 metrics["generated_samples"] = generated_samples.detach().cpu()
             if self.wandb_logger is not None:
+                gate_tensor = getattr(self.model, "_last_gate", None)
+                if isinstance(gate_tensor, Tensor) and gate_tensor.numel() > 0:
+                    self.wandb_logger.log_histogram("adapter/gate_hist", gate_tensor, step=self.global_step)
                 self.wandb_logger.log_metrics(metrics, step=self.global_step)
         return metrics
 
@@ -912,16 +956,26 @@ class Trainer:
 
     def _native_batch_conditions(self, raw_batch: Mapping[str, object], preprocessor, use_prompt: bool):
         """Resolve per-clip conditioning for a raw eval batch: the observation
-        video, the adapter action tensor, and the positive text contexts (when
-        text conditioning is on). Returns ``(video, actions, contexts, negative)``."""
+        video, the adapter action tensor, the per-frame ``action_seq`` tokens,
+        and the positive text contexts (when text conditioning is on). Returns
+        ``(video, actions, action_seqs, contexts, negative)``.
+
+        ``action_seqs`` MUST reach the adapter cond at generation: the xattn
+        adapter trains on per-frame action tokens (the preprocessor emits
+        ``action_seq`` unconditionally), and omitting it at rollout triggered the
+        aggregated-action fallback — one summed token, values ~25 — which
+        collapsed the adapter output (cos vs base 0.997 -> 0.63 measured on the
+        replace run, 2026-07-20). That single omission produced the
+        pure-noise `replace` rollouts."""
         batch = _call_preprocessor(preprocessor, raw_batch, train=False) if preprocessor is not None else raw_batch
         cond = batch.get("cond") if isinstance(batch.get("cond"), Mapping) else {}
         actions = cond.get("action")
+        action_seqs = cond.get("action_seq")
         contexts = cond.get("context") if use_prompt else None
         negative = self._eval_negative_ctx() if contexts is not None else None
         # The observation frames are the RAW pixels — the preprocessed batch keeps
         # only latents (x_t/x0/...), so read `video` from the raw batch.
-        return raw_batch.get("video"), actions, contexts, negative
+        return raw_batch.get("video"), actions, action_seqs, contexts, negative
 
     @torch.no_grad()
     def _native_eval_grid(self, eval_loader: Iterable, preprocessor) -> None:
@@ -944,12 +998,15 @@ class Trainer:
         frames: list[Tensor] = []           # observation frame [H,W,3] per sample
         clips: list[Tensor] = []            # full raw clip [T,H,W,3] for the GT panel
         acts: list[Tensor | None] = []      # [1, A] adapter action per sample
+        aseqs: list[Tensor | None] = []     # [1, L, A] per-frame action tokens per sample
         ctxs: list[Tensor | None] = []      # positive text embedding per sample (or None)
         neg: Tensor | None = None
         for raw_batch in eval_loader:
             if len(frames) >= want:
                 break
-            video, actions, contexts, neg = self._native_batch_conditions(raw_batch, preprocessor, use_prompt)
+            video, actions, action_seqs, contexts, neg = self._native_batch_conditions(
+                raw_batch, preprocessor, use_prompt
+            )
             if not isinstance(video, Tensor):
                 continue
             for i in range(video.shape[0]):
@@ -958,6 +1015,7 @@ class Trainer:
                 frames.append(video[i, 0])
                 clips.append(video[i])
                 acts.append(actions[i : i + 1] if isinstance(actions, Tensor) else None)
+                aseqs.append(action_seqs[i : i + 1] if isinstance(action_seqs, Tensor) else None)
                 ctxs.append(contexts[i] if contexts is not None else None)
         if not frames:
             return
@@ -978,6 +1036,8 @@ class Trainer:
                     adapted_cond = None
                     if acts[j] is not None:
                         adapted_cond = {"action": acts[j].to(device)}
+                        if aseqs[j] is not None:
+                            adapted_cond["action_seq"] = aseqs[j].to(device)
                         if step_level is not None:
                             adapted_cond[step_level_key] = torch.full((1,), float(step_level), device=device)
                     adapted_px, base_px = self._native_clip_rollout(
@@ -1037,7 +1097,7 @@ class Trainer:
             for raw_batch in eval_loader:
                 if count >= num_batches:
                     break
-                video, actions, contexts, neg = self._native_batch_conditions(
+                video, actions, action_seqs, contexts, neg = self._native_batch_conditions(
                     raw_batch, preprocessor, bool(params["use_prompt"])
                 )
                 if not isinstance(video, Tensor):
@@ -1045,6 +1105,8 @@ class Trainer:
                 ad_list, bs_list, gt_list = [], [], []
                 for i in range(video.shape[0]):
                     adapted_cond = {"action": actions[i : i + 1].to(device)} if isinstance(actions, Tensor) else None
+                    if adapted_cond is not None and isinstance(action_seqs, Tensor):
+                        adapted_cond["action_seq"] = action_seqs[i : i + 1].to(device)
                     ctx = contexts[i] if contexts is not None else None
                     adapted_px, base_px = self._native_clip_rollout(
                         video[i, 0], adapted_cond, ctx, neg, num_steps, params, device
