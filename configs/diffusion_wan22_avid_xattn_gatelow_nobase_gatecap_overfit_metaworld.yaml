@@ -47,7 +47,7 @@ model:
     allow_missing_checkpoint: true
     dtype: bf16
     latent_channels: 48
-    temporal_length: 41     # pixel-frame window -> 11 latent frames
+    temporal_length: 97     # unified with the replace-nobase arm and uxrst2k5 (comparable losses)
     max_area: 589824
     latent_height: 16
     latent_width: 16
@@ -104,7 +104,7 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_use_prompt: true
-    inference_frame_num: 41
+    inference_frame_num: 97
     inference_seed: 0
     inference_max_area: 589824
     cond_frames: 1
