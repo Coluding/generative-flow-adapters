@@ -108,6 +108,13 @@ training:
     amp_dtype: bf16
     use_batch_timesteps_for_flow: true
     flow_timestep_scale: 1000
+    # Timestep shift (SD3/Wan convention, sigma' = s*sigma/(1+(s-1)*sigma)):
+    # concentrates training noise levels toward high sigma, where the future is
+    # least determined by x_t and action information actually carries loss
+    # signal. Matches Wan's own pretraining shift (5.0) and the ACWM-DiT recipe.
+    # Motivated by the 2026-07-21 per-sigma sweep (base-parity at every sigma
+    # under unshifted U(0,1) training). Train-time only; eval stays U(0,1).
+    sigma_shift: 5.0
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_use_prompt: true

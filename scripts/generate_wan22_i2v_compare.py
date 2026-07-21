@@ -128,6 +128,151 @@ def _print_gen_calls(records: list[dict]) -> None:
               f"{r['out_norm']:>9.2f} {r['cos_out_base']:>7.3f} {r['rel_diff']:>7.3f}")
 
 
+def _masked_mse(pred: Tensor, target: Tensor, frame_mask: Tensor) -> float:
+    """Trainer._frame_masked_mse, standalone: MSE over predicted frames only."""
+    m = frame_mask.to(device=pred.device, dtype=pred.dtype)
+    m = m.view(m.shape[0], 1, m.shape[1], 1, 1).expand_as(pred)
+    sq = (pred.float() - target.float()) ** 2
+    return float(((sq * m).sum() / m.sum().clamp_min(1.0)).cpu())
+
+
+def _sigma_sweep(model, preprocessor, dataset, args, config, timestep_scale: float, out_dir: Path) -> None:
+    """Per-σ loss breakdown: adapted vs frozen-base denoise loss at fixed noise
+    levels, on the same clips/noise. The training objective samples σ~U(0,1), so
+    the scalar eval loss averages over noise levels; this sweep un-averages it.
+    Reads ``x0``/``frame_mask``/``cond`` from preprocessed eval batches and
+    rebuilds ``x_t``/``t`` at each σ exactly as the Wan2.2 diffusion-forcing
+    preprocessor does (obs frames clean at t=0, future frames at σ·scale)."""
+    sigmas = [float(s) for s in args.sweep_sigmas.split(",")]
+    amp = str(config.training.extra.get("amp_dtype", "")).lower()
+    autocast = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if amp in ("bf16", "bfloat16")
+        else torch.amp.autocast(device_type="cuda", enabled=False)
+    )
+
+    loader = DataLoader(dataset, batch_size=args.loss_batch_size, shuffle=False,
+                        num_workers=args.num_workers, drop_last=True)
+    batches: list[dict] = []
+    for raw in loader:
+        b = _call_preprocessor(preprocessor, raw, train=False)
+        x0, fm, cond = b["x0"], b["frame_mask"], b["cond"]
+        if not (isinstance(x0, Tensor) and isinstance(fm, Tensor)):
+            raise RuntimeError("sigma sweep needs the Wan2.2 preprocessor's x0/frame_mask outputs.")
+        batches.append({"x0": x0, "frame_mask": fm, "cond": cond})
+        if len(batches) >= args.sweep_batches:
+            break
+    print(f"\n=== σ sweep: {len(sigmas)} levels x {len(batches)} batches x {args.sweep_draws} noise draws ===")
+
+    # Action-override variants. "true" = the clip's own actions; "shuffle" =
+    # actions from a DIFFERENT clip (realistic but mismatched — the cleanest
+    # test of whether the model *uses* actions); "zero" = null actions. The
+    # frozen base ignores actions, so its loss is identical across variants —
+    # any adapted-loss gap between variants is pure action sensitivity.
+    _ACTION_KEYS = ("action", "action_seq")
+    variants = ["true", "shuffle", "zero"] if args.action_probe else ["true"]
+
+    def _variant_cond(cond: object, idx: int, variant: str) -> object:
+        if variant == "true" or not isinstance(cond, dict):
+            return cond
+        out = dict(cond)
+        for key in _ACTION_KEYS:
+            v = out.get(key)
+            if not isinstance(v, Tensor):
+                continue
+            if variant == "zero":
+                out[key] = torch.zeros_like(v)
+            else:  # shuffle: take the same key from the next clip in the pool
+                donor = batches[(idx + 1) % len(batches)]["cond"]
+                out[key] = donor[key] if isinstance(donor, dict) and isinstance(donor.get(key), Tensor) else torch.zeros_like(v)
+        return out
+
+    rows: list[dict] = []
+    gen = torch.Generator(device=x0.device).manual_seed(int(args.seed))
+    for sigma in sigmas:
+        vals: dict[str, list[float]] = {}
+        for i, b in enumerate(batches):
+            x0, fm, cond = b["x0"], b["frame_mask"], b["cond"]
+            fm5 = fm.view(fm.shape[0], 1, fm.shape[1], 1, 1).to(x0.dtype)
+            for _ in range(args.sweep_draws):
+                # One noise draw shared by all variants -> paired comparison.
+                noise = torch.randn(x0.shape, generator=gen, device=x0.device, dtype=x0.dtype)
+                target = noise - x0
+                x_noised = (1.0 - sigma) * x0 + sigma * noise
+                x_t = (1.0 - fm5) * x0 + fm5 * x_noised
+                t = (fm * (sigma * timestep_scale)).to(dtype=x_t.dtype)
+                for variant in variants:
+                    with torch.no_grad(), autocast:
+                        pred, base = model(x_t, t, _variant_cond(cond, i, variant), return_base=True)
+                    pred, base = pred.float(), base.float()
+                    p = "" if variant == "true" else f"{variant}_"
+                    vals.setdefault(f"{p}adapted", []).append(_masked_mse(pred, target, fm))
+                    if variant == "true":
+                        vals.setdefault("base", []).append(_masked_mse(base, target, fm))
+                        m = fm5.expand_as(pred).bool()
+                        pm, bm = pred[m], base[m]
+                        vals.setdefault("rel", []).append(float(((pm - bm).norm() / bm.norm().clamp_min(1e-8)).cpu()))
+                        vals.setdefault("cos", []).append(float(F.cosine_similarity(pm.flatten(), bm.flatten(), dim=0).cpu()))
+        row = {"sigma": sigma}
+        for k, v in vals.items():
+            tv = torch.tensor(v)
+            row[k] = float(tv.mean())
+            row[f"{k}_std"] = float(tv.std()) if len(v) > 1 else 0.0
+        row["delta"] = row["base"] - row["adapted"]
+        rows.append(row)
+        line = (f"  σ={sigma:0.2f}  adapted {row['adapted']:8.5f} ±{row['adapted_std']:0.5f}"
+                f"   base {row['base']:8.5f} ±{row['base_std']:0.5f}"
+                f"   Δ(base-adapted) {row['delta']:+8.5f}"
+                f"   rel {row['rel']:0.4f}   cos {row['cos']:0.4f}")
+        if args.action_probe:
+            row["shuffle_gap"] = row["shuffle_adapted"] - row["adapted"]
+            row["zero_gap"] = row["zero_adapted"] - row["adapted"]
+            line += (f"   | shuffle {row['shuffle_adapted']:8.5f} (gap {row['shuffle_gap']:+.5f})"
+                     f"   zero {row['zero_adapted']:8.5f} (gap {row['zero_gap']:+.5f})")
+        print(line)
+
+    csv_path = out_dir / "sigma_sweep.csv"
+    keys = list(rows[0].keys())
+    with csv_path.open("w") as f:
+        f.write(",".join(keys) + "\n")
+        for row in rows:
+            f.write(",".join(f"{row[k]:.6g}" for k in keys) + "\n")
+    print(f"  wrote {csv_path}")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  (matplotlib not available — skipped plot)")
+        return
+    xs = [r["sigma"] for r in rows]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].errorbar(xs, [r["adapted"] for r in rows], yerr=[r["adapted_std"] for r in rows],
+                     label="adapted", marker="o")
+    axes[0].errorbar(xs, [r["base"] for r in rows], yerr=[r["base_std"] for r in rows],
+                     label="frozen base", marker="s")
+    axes[0].set(xlabel="σ", ylabel="masked denoise MSE", title="loss vs noise level")
+    axes[0].legend()
+    axes[1].axhline(0.0, color="gray", lw=0.8)
+    axes[1].errorbar(xs, [r["delta"] for r in rows], marker="o", color="tab:green", label="base − adapted")
+    if "shuffle_gap" in rows[0]:
+        axes[1].plot(xs, [r["shuffle_gap"] for r in rows], marker="^", color="tab:red",
+                     label="action gap (shuffled − true)")
+        axes[1].plot(xs, [r["zero_gap"] for r in rows], marker="v", color="tab:orange",
+                     label="action gap (zeroed − true)")
+    axes[1].legend()
+    axes[1].set(xlabel="σ", ylabel="loss difference", title="adapter advantage & action sensitivity")
+    axes[2].plot(xs, [r["rel"] for r in rows], marker="o", label="rel |pred−base|/|base|")
+    axes[2].plot(xs, [r["cos"] for r in rows], marker="s", label="cos(pred, base)")
+    axes[2].set(xlabel="σ", title="how far from a base-copy")
+    axes[2].legend()
+    fig.tight_layout()
+    png_path = out_dir / "sigma_sweep.png"
+    fig.savefig(png_path, dpi=140)
+    print(f"  wrote {png_path}")
+
+
 def _to_uint8_frames(px: Tensor) -> "list":
     """``[3, N, H, W]`` in [-1,1] -> list of ``[H, W, 3]`` uint8 frames."""
     v = px.detach().float().clamp(-1, 1).add(1).mul(127.5).round().to(torch.uint8)
@@ -196,6 +341,15 @@ def main() -> None:
                         "auto-enabled on <32 GB cards at max_area >= 400k. Slow (minutes) but keeps "
                         "the solver at the trained resolution instead of degrading it.")
     parser.add_argument("--out-dir", default="outputs/replace_debug")
+    parser.add_argument("--sigma-sweep", action="store_true",
+                        help="Per-σ loss breakdown (adapted vs base at fixed noise levels), then exit — no rollout.")
+    parser.add_argument("--sweep-sigmas", default="0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95,0.99")
+    parser.add_argument("--sweep-batches", type=int, default=6)
+    parser.add_argument("--sweep-draws", type=int, default=2, help="Fresh noise draws per (σ, batch).")
+    parser.add_argument("--action-probe", action="store_true",
+                        help="With --sigma-sweep: also evaluate adapted loss under shuffled (other-clip) "
+                             "and zeroed actions, same noise. Gap ≈ 0 at every σ ⇒ the model ignores actions "
+                             "(or the data makes them redundant).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -315,6 +469,12 @@ def main() -> None:
         total = stats.get("eval_loss")
         if total is not None:
             print(f"  total eval loss (incl. shortcut terms): {total:.5f}")
+
+    # ---- 1b) per-σ loss breakdown (exits before the rollout machinery) ----
+    if args.sigma_sweep:
+        phase["name"] = "sweep"
+        _sigma_sweep(model, preprocessor, dataset, args, config, timestep_scale, out_dir)
+        return
 
     # ---- 2) native i2v rollout: base vs adapted ---------------------------
     # Preprocess the rollout clip FIRST (a latent-cache miss needs the GPU encode)…

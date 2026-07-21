@@ -35,6 +35,7 @@ def build_experiment(config: ExperimentConfig) -> ExperimentComponents:
         condition_drop_prob=config.conditioning.drop_condition_prob,
         output_composition=config.adapter.composition,
         gate_bias=config.adapter.gate_bias,
+        gate_cap=config.adapter.gate_cap,
         include_base_direction=bool(config.conditioning.extra.get("include_base_direction", False)),
         normalize_base_direction=bool(config.conditioning.extra.get("normalize_base_direction", True)),
     )

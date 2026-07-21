@@ -3,6 +3,8 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/generative-flow-adapters.iml" filepath="$PROJECT_DIR$/.idea/generative-flow-adapters.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/wan.iml" filepath="$PROJECT_DIR$/.idea/wan.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/wan@1.iml" filepath="$PROJECT_DIR$/.idea/wan@1.iml" />
     </modules>
   </component>
 </project>

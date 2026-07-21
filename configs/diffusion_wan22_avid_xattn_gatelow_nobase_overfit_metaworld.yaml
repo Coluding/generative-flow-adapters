@@ -1,0 +1,128 @@
+# EXPERIMENT: single-clip overfit, mask_mix gatelow (gate_bias 0.0), and —
+# the one change vs the uxrst2k5 overfit — condition_on_base_outputs: FALSE.
+# The adapter keeps the thesis composition (base*σ(g) + pred*(1-σ(g))) but no
+# longer SEES the base's velocity as an input, so the identity-on-input copy
+# path is gone; pred must learn to denoise from (x_t, t, action tokens) alone.
+#
+# Readout (see thesis-vault exp-adapter-gatelow-nobase-overfit):
+#   - pred improves AND gate stays mixed  -> concat-input was the crutch; the
+#     full composition can learn once it's removed.
+#   - gate saturates 0.5 -> ~0.99 in ~70 steps again (uxrst2k5 pattern) with
+#     grad-norm collapse -> the gate trap alone is sufficient; needs a gate
+#     cap / penalty / staged warmup before any input-conditioning conclusion
+#     can be drawn. Watch adapter/gate_hist + adapter_grad_norm from step 1.
+# Sibling control: ..._replace_nobase_overfit_... (no gate at all) separates
+# the two traps.
+#
+# Pure denoise objective (shortcut terms off), sigma ~ U(0,1) unshifted —
+# both deliberately, to stay comparable with uxrst2k5 and the replace-nobase
+# sibling. DIAGNOSTIC ONLY — don't report as D2/D4 evidence.
+#
+# Launch (remote):
+#   python scripts/train_wan22_i2v_metaworld_external.py \
+#     --config configs/diffusion_wan22_avid_xattn_gatelow_nobase_overfit_metaworld.yaml \
+#     --overfit-index 0 --num-windows 1 --steps 2000 \
+#     --wandb-run-name overfit-single-clip-gatelow-nobase
+
+name: diffusion_wan22_avid_xattn_gatelow_nobase_overfit_metaworld
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  # pretrained_model_name_or_path: ckpts/Wan2.2-TI2V-5B
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    latent_channels: 48
+    temporal_length: 41     # pixel-frame window -> 11 latent frames
+    max_area: 589824
+    latent_height: 16
+    latent_width: 16
+    text_prompts_file: configs/prompts/metaworld_tasks.yaml
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 48
+  composition: mask_mix      # thesis composition kept: base*σ(gate) + pred*(1-σ(gate))
+  gate_bias: 0.0             # balanced 50/50 at init (AVID-matched)
+  extra:
+    backbone: wan
+    wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
+    condition_on_base_outputs: false  # THE change: no base velocity as input
+    use_step_level_conditioning: false
+    step_level_key: step_level
+    step_level_transform: log2
+    action_dropout_prob: 0.0
+    action_injection: cross_attention
+    action_max_len: 128
+
+conditioning:
+  type: action
+  input_dim: 4
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  output_dir: outputs/gatelow-nobase-overfit-run
+  checkpoint_every_n_steps: 500
+  keep_last_checkpoints: 3
+  shortcut_direction_weight: 0.0       # pure denoise MSE
+  shortcut_target_method: distillation
+  inference_every_n_steps: 300
+  eval_every_n_steps: 75               # match the uxrst2k5 overfit cadence
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 10
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 300
+  quality_dist_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    # sigma_shift deliberately NOT set — comparability with uxrst2k5 and the
+    # replace-nobase sibling; sigma_shift is its own controlled change.
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_use_prompt: true
+    inference_frame_num: 41
+    inference_seed: 0
+    inference_max_area: 589824
+    cond_frames: 1
+    cond_frames_dist:
+      1: 1
+    action_per_frame: false
+    shortcut_anchor_prob: 1.0
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
+
+    wandb:
+      enable: true
+      require_vae: false
+      project: Wan2.2-avid-xattn-gatelow-i2v-metaworld
+      num_samples: 3
+      fps: 5

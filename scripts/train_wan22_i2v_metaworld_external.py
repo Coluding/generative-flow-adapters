@@ -243,6 +243,8 @@ def main() -> None:
 
     condition_keys = tuple(spec.key for spec in config.conditioning.conditions if spec.key != "step_level")
     timestep_scale = float(config.training.extra.get("flow_timestep_scale", 1000.0))
+    raw_sigma_shift = config.training.extra.get("sigma_shift")
+    sigma_shift = float(raw_sigma_shift) if raw_sigma_shift is not None else None
     cond_frames = int(config.training.extra.get("cond_frames", 1))
     cond_frames_dist = config.training.extra.get("cond_frames_dist")
     # AVID-style per-frame action conditioning: feed the adapter's action encoder a
@@ -266,6 +268,7 @@ def main() -> None:
             latent_cache_dir=latent_cache_dir,
             action_per_frame=action_per_frame,
             action_seq_len=(latent_frames if action_per_frame else None),
+            sigma_shift=sigma_shift,
         ),
         condition_keys=condition_keys or ("act",),
         cond_frames=cond_frames,
@@ -277,6 +280,11 @@ def main() -> None:
               f"({n_tasks} tasks) from {prompt_contexts_path}")
     else:
         print("text conditioning: OFF — frame-only (base uses its unconditional context)")
+    if sigma_shift is not None and sigma_shift != 1.0:
+        print(f"sigma shift: {sigma_shift} — training noise levels concentrated toward high sigma "
+              f"(median sigma {sigma_shift * 0.5 / (1 + (sigma_shift - 1) * 0.5):.3f}); eval stays U(0,1)")
+    else:
+        print("sigma shift: OFF — training sigma ~ U(0,1)")
 
     num_windows = args.num_windows or None  # 0 -> None (unbounded random, cache can't hit)
     translator, dataset = build_metaworld_clip_dataset(

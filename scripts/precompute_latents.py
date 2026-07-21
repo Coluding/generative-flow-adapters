@@ -39,6 +39,7 @@ from generative_flow_adapters.config import load_config
 from generative_flow_adapters.data import (
     Wan22DiffusionForcingPreprocessor,
     WanBatchPreprocessConfig,
+    build_acwmphys_clip_dataset,
     build_metaworld_clip_dataset,
 )
 from generative_flow_adapters.models.base.wan_ti2v import _ensure_wan_importable
@@ -71,6 +72,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default="configs/diffusion_wan22_avid_i2v_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="MetaWorld HDF5 to encode.")
+    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
+                        help="Dataset family. acwm_phys reads a split dir of the HF t1an/ACWM-Phys release.")
+    parser.add_argument("--data-dir", default=None,
+                        help="acwm_phys only: split directory (contains metadata.pt + episode_*.mp4), "
+                             "e.g. /scratch-shared/$USER/acwm-phys/rigid_dynamics/push_block/ind_train")
     parser.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B", help="Dir holding Wan2.2_VAE.pth.")
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
@@ -101,7 +107,13 @@ def main() -> None:
     max_area = int(max_area) if max_area is not None else None
     align = 2 * _WAN22_VAE_SPATIAL_STRIDE  # = 32
     num_windows = args.num_windows or None  # 0 -> None
-    cache_dir = args.latent_cache_dir or (str(Path(args.hdf5).with_suffix("")) + ".latents")
+    if args.dataset == "acwm_phys":
+        if not args.data_dir:
+            raise SystemExit("--dataset acwm_phys requires --data-dir (see --help).")
+        default_cache = str(Path(args.data_dir)) + ".latents"
+    else:
+        default_cache = str(Path(args.hdf5).with_suffix("")) + ".latents"
+    cache_dir = args.latent_cache_dir or default_cache
 
     # VAE only — no DiT, no adapter, no trainer.
     vae = _load_vae_only(Path(args.ckpt_dir), device)
@@ -119,14 +131,24 @@ def main() -> None:
         condition_keys=("act",),
     )
 
-    _, dataset = build_metaworld_clip_dataset(
-        config.data,
-        default_window_width=temporal_length,
-        hdf5=args.hdf5,
-        frame_stride=args.frame_stride,
-        sampling=args.sampling,
-        num_windows=num_windows,
-    )
+    if args.dataset == "acwm_phys":
+        _, dataset = build_acwmphys_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            data_dir=args.data_dir,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+            num_windows=num_windows,
+        )
+    else:
+        _, dataset = build_metaworld_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            hdf5=args.hdf5,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+            num_windows=num_windows,
+        )
 
     # Enumerate exactly the windows training will sample.
     if num_windows is not None and dataset.sampling == "random":

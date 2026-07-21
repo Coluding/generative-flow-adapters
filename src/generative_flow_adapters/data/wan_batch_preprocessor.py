@@ -210,6 +210,19 @@ class WanBatchPreprocessConfig:
     # sigma in [0, 1] is scaled up before the DiT sees it. Feeding raw sigma
     # (scale=1) puts the frozen base off-distribution — see the fix ticket.
     timestep_scale: float = 1000.0
+    # Training-time timestep shift (SD3/Wan convention):
+    #     sigma' = s*sigma / (1 + (s-1)*sigma)
+    # s > 1 concentrates the sampled noise levels toward sigma=1 (high noise),
+    # where the future frames are least determined by x_t — i.e. where action /
+    # dynamics information actually carries loss signal. This matches both Wan's
+    # own pretraining regime (shift 5.0) and the ACWM-DiT training recipe
+    # (shift 5.0 + mid/high-noise weighting); our previous adapter runs trained
+    # on unshifted U(0,1), spending most supervision at low/mid sigma where the
+    # frozen base is already near-optimal (see the 2026-07-21 per-sigma sweep:
+    # flat base-parity at every sigma). Applied by the Wan2.2 diffusion-forcing
+    # preprocessor during TRAINING only — eval batches stay U(0,1) so eval
+    # losses remain comparable across runs. None or 1.0 -> no shift.
+    sigma_shift: float | None = None
 
 
 class WanBatchPreprocessor:

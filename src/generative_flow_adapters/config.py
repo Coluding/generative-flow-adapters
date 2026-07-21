@@ -33,6 +33,11 @@ class AdapterConfig:
     hidden_dim: int = 128
     composition: str = "add"
     gate_bias: float = 0.0
+    # Upper clamp on the post-sigmoid mask_mix gate (None = uncapped). Caps
+    # the keep-base fraction so the adapter branch retains >= (1-cap) of the
+    # gradient — counters the measured gate-saturation trap (uxrst2k5:
+    # gate 0.5 -> 0.99 in ~70 steps, adapter grad norm -> 0.003).
+    gate_cap: float | None = None
     rank: int = 4
     alpha: float = 1.0
     target_modules: list[str] = field(default_factory=lambda: ["to_q", "to_k", "to_v", "to_out", "ff", "proj"])

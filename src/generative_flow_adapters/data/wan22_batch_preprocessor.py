@@ -126,7 +126,13 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         ks = self._sample_cond_frames(batch_size, t_lat, train, z0.device)  # [B] long
 
         noise = torch.randn_like(z0)
-        sigma = torch.rand(batch_size, device=z0.device, dtype=z0.dtype).clamp_min(self.config.sigma_min)
+        sigma = torch.rand(batch_size, device=z0.device, dtype=z0.dtype)
+        # Timestep shift toward high noise (train only — eval stays U(0,1) so
+        # eval losses are comparable across runs). See WanBatchPreprocessConfig.
+        shift = self.config.sigma_shift
+        if train and shift is not None and shift != 1.0:
+            sigma = shift * sigma / (1.0 + (shift - 1.0) * sigma)
+        sigma = sigma.clamp_min(self.config.sigma_min)
         sigma_b = sigma.view(batch_size, *([1] * (z0.dim() - 1)))
 
         # frame_mask: 1 = predicted (noised) future frame, 0 = clean observation
