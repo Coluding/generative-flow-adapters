@@ -1,0 +1,128 @@
+# ACWM-Phys Push Cube (HF t1an/ACWM-Phys, rigid_dynamics/push_block) —
+# the ACTION-INFORMATIVE benchmark for D2 claim (a): the pusher's commanded
+# 2D target decides the future, so the anchor frame alone cannot predict it
+# (unlike MetaWorld scripted demos — thesis-vault
+# 50_Decisions/open/second-dataset-action-informativeness.md).
+#
+# Carries both base-parity countermeasures from the MetaWorld campaign:
+#   gate_cap: 0.9      anti-saturation clamp (uxrst2k5 trap)
+#   sigma_shift: 5.0   supervision concentrated at high sigma (train-only)
+#
+# Data facts (verified against the release 2026-07-22): 1500 ind_train
+# episodes, fixed 66 frames @ 10 fps, videos released at 1024x1024 (the
+# paper trains at 240x240 — we DOWNSCALE 1024 -> max_area 589824 = Wan's
+# native regime; no upscaling involved). Actions [66, 2] in [-1, 1].
+# temporal_length 41 <= 66 (97 would NOT fit these episodes).
+# Reference numbers (paper Table 1, ACWM-DiT-S from scratch, 50 steps):
+# InD MSE 2.919e-3 / PSNR 25.35 / SSIM 0.955 — comparison target, but note
+# their eval is 240x240 full-episode; ours differs (41-frame windows,
+# 768x768) until we match protocols. Don't put their numbers next to ours
+# on a slide without that caveat.
+#
+# Precompute latents first (see jobs/submit_precompute_acwmphys.sh), then:
+#   python scripts/train_wan22_i2v_metaworld_external.py \
+#     --config configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
+#     ... (needs the --dataset acwm_phys switch in the train script — pending)
+
+name: diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  # pretrained_model_name_or_path: ckpts/Wan2.2-TI2V-5B
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    latent_channels: 48
+    temporal_length: 41      # 66-frame episodes: 41-frame windows, 25 valid starts
+    max_area: 589824         # 1024^2 source downscaled to Wan-native ~768^2
+    latent_height: 16
+    latent_width: 16
+    text_prompts_file: null  # frame-only (no task-prompt table for ACWM yet)
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 48
+  composition: mask_mix
+  gate_bias: 0.0
+  gate_cap: 0.9
+  extra:
+    backbone: wan
+    wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
+    condition_on_base_outputs: true
+    use_step_level_conditioning: false
+    step_level_key: step_level
+    step_level_transform: log2
+    action_dropout_prob: 0.0
+    action_injection: cross_attention
+    action_max_len: 128
+
+conditioning:
+  type: action
+  input_dim: 2             # ACWM-Phys push_block: 2D pusher-target action
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  output_dir: outputs/acwm-pushblock-gatelow-capshift-run
+  checkpoint_every_n_steps: 500
+  keep_last_checkpoints: 3
+  shortcut_direction_weight: 0.0
+  shortcut_target_method: distillation
+  inference_every_n_steps: 300
+  eval_every_n_steps: 300
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 10
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 300
+  quality_dist_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    sigma_shift: 5.0          # train-only; eval stays U(0,1)
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_use_prompt: false
+    inference_frame_num: 41
+    inference_seed: 0
+    inference_max_area: 589824
+    cond_frames: 1
+    cond_frames_dist:
+      1: 1
+    action_per_frame: false
+    shortcut_anchor_prob: 1.0
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
+
+    wandb:
+      enable: true
+      require_vae: false
+      project: Wan2.2-avid-xattn-acwm-pushblock
+      num_samples: 3
+      fps: 5

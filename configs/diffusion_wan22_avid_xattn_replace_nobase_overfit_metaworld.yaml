@@ -1,0 +1,136 @@
+# EXPERIMENT: can the 34M adapter beat the frozen base at ALL, absent the
+# copy shortcut? Single-clip overfit, composition: replace, and — the one
+# change that defines this run — condition_on_base_outputs: FALSE.
+#
+# Motivation (thesis-vault, 2026-07-21 base-parity investigation): every
+# composition so far converges to base-parity loss and base-copy predictions.
+#   - mask_mix: gate saturates to keep-base (0.5 -> 0.99 in ~70 steps, adapter
+#     grad norm 4.4 -> 0.003; run uxrst2k5) — gradient trap closes.
+#   - replace: adapter receives base_output as an INPUT, so identity-on-that-
+#     input is a near-optimal low-effort function; run y1jrgxqp asymptotes at
+#     parity from below (delta -1.78 -> -0.016 over 600 steps).
+# This run removes the identity shortcut entirely: the adapter sees only
+# (x_t, t, action tokens) and must denoise on its own. On ONE memorizable clip:
+#   - If mid/high-σ loss drops well below the frozen base  -> the base_output
+#     pass-through input is confirmed as the trap (optimization, not capacity).
+#   - If loss still parks at base level -> the 34M DiT itself can't do better
+#     (capacity/optimization limit of the adapter architecture).
+# Pure denoise objective: shortcut/consistency terms OFF so the loss curve is
+# exactly the masked velocity MSE being interrogated.
+#
+# Launch (remote, matches the earlier overfit-single-clip run):
+#   python scripts/train_wan22_i2v_metaworld_external.py \
+#     --config configs/diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld.yaml \
+#     --overfit-index 0 --num-windows 1 --steps 2000 \
+#     --wandb-run-name overfit-single-clip-replace-nobase
+#
+# DIAGNOSTIC ONLY — replace composition + no base input abandons the thesis
+# composition rule f = f_base + g*Δ. Don't report as D2/D4 evidence (vault
+# hard rules; same caveat as diffusion_wan22_avid_xattn_replace_metaworld.yaml).
+
+name: diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+  # eval_hdf5: ds/metaworld_corner2_val.hdf5
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  # pretrained_model_name_or_path: ckpts/Wan2.2-TI2V-5B
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    latent_channels: 48
+    temporal_length: 97     # pixel-frame window -> latent frames t_lat = 1 + (97-1)/4
+    max_area: 589824         # 704 * 1280
+    latent_height: 16
+    latent_width: 16
+    text_prompts_file: configs/prompts/metaworld_tasks.yaml   # null -> frame-only (no text)
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 48            # Wan2.2 latent channel count
+  composition: replace       # f = Δ_φ only — base bypassed at output
+  extra:
+    backbone: wan            # AVID-style: a small action-conditioned Wan DiT
+    wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
+    condition_on_base_outputs: false  # THE experiment: no identity shortcut input
+    use_step_level_conditioning: false
+    step_level_key: step_level
+    step_level_transform: log2
+    action_dropout_prob: 0.0
+    # --- action-conditioning injection ---
+    action_injection: cross_attention   # adaln | cross_attention | both
+    action_max_len: 128                  # positional-embedding capacity for action tokens
+    # action_token_key: action_seq      # (default) per-frame tokens from the preprocessor
+
+conditioning:
+  type: action
+  input_dim: 4             # MetaWorld action dimension (also the per-token width)
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  output_dir: outputs/replace-nobase-overfit-run
+  checkpoint_every_n_steps: 500
+  keep_last_checkpoints: 3
+  shortcut_direction_weight: 0.0       # pure denoise MSE — nothing else in the loss
+  shortcut_target_method: distillation
+  inference_every_n_steps: 300
+  eval_every_n_steps: 75               # match the earlier overfit run's cadence
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 10
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 300
+  quality_dist_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    # sigma_shift deliberately NOT set here: this run isolates the
+    # condition_on_base_outputs variable; keep sigma ~ U(0,1) like all prior
+    # runs so the loss curves are directly comparable. Enable sigma_shift: 5.0
+    # (see the replace config) only as its own controlled change.
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_use_prompt: true
+    inference_frame_num: 97
+    inference_seed: 0
+    inference_max_area: 589824
+    cond_frames: 1
+    cond_frames_dist:
+      1: 1
+    action_per_frame: false
+    shortcut_anchor_prob: 1.0
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
+
+    wandb:
+      enable: true
+      require_vae: false
+      project: Wan2.2-avid-xattn-replace-i2v-metaworld
+      num_samples: 3
+      fps: 5

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from generative_flow_adapters.data.dataset import TranslatedClipDataset
+from generative_flow_adapters.data.translators.acwm_phys import ACWMPhysTranslator
 from generative_flow_adapters.data.translators.metaworld import MetaWorldTranslator
 
 if TYPE_CHECKING:
@@ -52,6 +53,38 @@ def build_metaworld_clip_dataset(
         envs=data.env,
         cameras=data.camera,
     )
+    dataset = TranslatedClipDataset(
+        translator,
+        window_width=resolved_window,
+        frame_stride=resolved_stride,
+        sampling=resolved_sampling,
+        num_windows=resolved_num_windows,
+    )
+    return translator, dataset
+
+
+def build_acwmphys_clip_dataset(
+    data: "DataConfig",
+    *,
+    default_window_width: int,
+    data_dir: str,
+    env_name: str | None = None,
+    frame_stride: int | None = None,
+    sampling: str | None = None,
+    num_windows: int | None = None,
+) -> tuple[ACWMPhysTranslator, TranslatedClipDataset]:
+    """ACWM-Phys twin of :func:`build_metaworld_clip_dataset`. ``data_dir`` is
+    one split directory of the HF release (contains ``metadata.pt`` +
+    ``episode_*.mp4``); everything else mirrors the MetaWorld builder so the
+    training/precompute scripts can switch datasets with one flag."""
+    if not data_dir:
+        raise ValueError("ACWM-Phys dataset needs --data-dir (a split directory of the HF release).")
+    resolved_stride = data.frame_stride if frame_stride is None else int(frame_stride)
+    resolved_sampling = sampling or data.sampling
+    resolved_window = int(data.window_width) if data.window_width else int(default_window_width)
+    resolved_num_windows = num_windows if num_windows is not None else getattr(data, "num_windows", None)
+
+    translator = ACWMPhysTranslator(data_dir, env_name=env_name, fs_value=data.fs_value)
     dataset = TranslatedClipDataset(
         translator,
         window_width=resolved_window,

@@ -45,6 +45,7 @@ class AdaptedModel(nn.Module):
         condition_drop_prob: float = 0.0,
         output_composition: str = "add",
         gate_bias: float = 0.0,
+        gate_cap: float | None = None,
         include_base_direction: bool = False,
         normalize_base_direction: bool = True,
     ) -> None:
@@ -56,6 +57,14 @@ class AdaptedModel(nn.Module):
         self.condition_drop_prob = condition_drop_prob
         self.output_composition = output_composition
         self.gate_bias = gate_bias
+        # Upper clamp on the post-sigmoid gate for gated compositions. In
+        # mask_mix, gate -> 1 means "all base": the single-clip overfit run
+        # uxrst2k5 showed the gate saturating 0.5 -> 0.99 within ~70 steps,
+        # after which the adapter branch's gradient (scaled by 1-gate) and the
+        # gate's own gradient (sigmoid slope) both die together. Capping at
+        # e.g. 0.9 guarantees the adapter prediction keeps >= (1-cap) of the
+        # gradient forever. None = no cap (original behaviour).
+        self.gate_cap = gate_cap
         self.include_base_direction = include_base_direction
         self.normalize_base_direction = normalize_base_direction
         self.adapter.attach_base_model(base_model)
@@ -173,6 +182,8 @@ class AdaptedModel(nn.Module):
             if adapter_result.gate is None:
                 raise ValueError("Mask-mix composition requires an adapter gate output.")
             gate = torch.sigmoid(adapter_result.gate + self.gate_bias)
+            if self.gate_cap is not None:
+                gate = gate.clamp(max=self.gate_cap)
             self._last_gate = gate.detach()
             return base_output * gate + adapter_result.adapter_output * (1.0 - gate)
         elif composition in {"gated_residual", "gated_add", "residual_mask"}:
