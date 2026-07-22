@@ -56,78 +56,29 @@ python scripts/generate_wan22_i2v_compare.py \
   --temporal-length 41   # local only: hit the 41-frame cache; on cluster use the trained length
 ```
 
-## 3. Optional local runs during/before (3090)
+## 3. Local 3090 runs — one script per experiment (jobs/experiments/)
 
-The overfit arms also run locally at 41-frame windows (latent-cache hits;
-generation eval off — the 768² decode OOMs 24 GB):
-
-```bash
-python scripts/train_wan22_i2v_metaworld_external.py \
-  --config configs/diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld.yaml \
-  --hdf5 ds/metaworld_corner2.hdf5 --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-  --overfit-index 0 --num-windows 1 --temporal-length 41 \
-  --steps 800 --batch-size 2 --no-eval-gen \
-  --wandb-run-name local-overfit-replace-nobase-41f
-# same pattern with ..._gatelow_nobase_overfit_... and ..._gatelow_nobase_gatecap_overfit_...
-```
-
-Caveat: 41f/batch-2/single-task-corner2 vs the cluster's 97f/batch-12/
-five-task — trends (gate saturation, delta sign) transfer; absolute numbers
-don't.
-
-## 4. Local 3090: ACWM Push Cube single-episode overfit
-
-Prerequisite (once): `bash jobs/download_acwmphys.sh` (~120 MB into
-`ds/acwm-phys/`). First step VAE-encodes the one clip on cache miss (~4 s,
-measured), then it's cached.
+Each is a plain bash script (no sbatch): 41-frame windows where applicable
+(local latent-cache hits), generation eval off (the 768² decode OOMs 24 GB),
+batch 2, 800 steps. Extra CLI args pass through (`"$@"`).
 
 ```bash
-python scripts/train_wan22_i2v_metaworld_external.py \
-  --config configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
-  --dataset acwm_phys --data-dir ds/acwm-phys/rigid_dynamics/push_block/ind_train \
-  --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-  --overfit-index 0 --num-windows 1 \
-  --steps 800 --batch-size 2 --no-eval-gen \
-  --wandb-run-name local-overfit-acwm-pushblock
-```
-
-What it gives: (a) end-to-end validation of the ACWM *training* path before
-any cluster time is spent, (b) a capacity data point on the new domain —
-can the capped gatelow adapter overfit one Push Cube episode (watch
-`denoise_adapter_delta` go positive and `adapter_gate_mean` stay < 0.9-pin)?
-Notes: the ACWM config is natively 41-frame (66-frame episodes), so no
---temporal-length override needed; `sigma_shift: 5.0` and `gate_cap: 0.9`
-are ON here (the intended full-run settings) — so this arm is NOT
-σ-comparable to the MetaWorld triangle, it's the pipeline+capacity check for
-the ACWM line. Single-episode overfit says nothing about action usage
-(memorizable without actions) — that's the full ind_train run's job.
-
-## 4. Local 3090 ACWM-Phys overfit (added 2026-07-22)
-
-Single-episode overfit on Push Cube — validates the full ACWM training path
-end-to-end on real released data AND gives the first capacity signal on the
-action-informative domain, before the cluster returns. Prereq: the data
-downloaded locally (`bash jobs/download_acwmphys.sh` — DEST is the repo's
-`ds/acwm-phys`).
-
-```bash
-python scripts/train_wan22_i2v_metaworld_external.py \
-  --config configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
-  --dataset acwm_phys --data-dir ds/acwm-phys/rigid_dynamics/push_block/ind_train \
-  --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-  --overfit-index 0 --num-windows 1 --temporal-length 41 \
-  --steps 800 --batch-size 2 --no-eval-gen \
-  --wandb-run-name local-overfit-acwm-pushblock-41f
+bash jobs/experiments/local_overfit_replace_nobase.sh          # triangle arm 1: no gate, no base input
+bash jobs/experiments/local_overfit_gatelow_nobase.sh          # triangle arm 2: gate (uncapped), no base input
+bash jobs/experiments/local_overfit_gatelow_nobase_cap09.sh    # triangle arm 3: gate capped 0.9, no base input
+bash jobs/experiments/local_overfit_acwm_pushblock.sh          # ACWM Push Cube single-episode overfit
 ```
 
 Notes:
-- First step VAE-encodes the one clip on cache miss (~4 s, measured), then
-  every step reads the cached latent — no precompute needed for one episode.
-- This uses the full intended run settings (mask_mix + gate_cap 0.9 +
-  sigma_shift 5.0, base input ON) — it is the "uxrst2k5 + countermeasures on
-  new data" arm, NOT a nobase arm. Watch the same signals: gate_mean pinned
-  at 0.9 = the pull still exists and the cap is load-bearing;
-  adapter_grad_norm alive past step 150 = the trap is defused.
-- Single-episode overfit still cannot test action USAGE (one trajectory is
-  memorizable without actions) — that's the full-data run's probe. This run
-  answers "does the pipeline + optimization work on ACWM at all."
+- MetaWorld arms: 41f/batch-2/single-task-corner2 vs the cluster's
+  97f/batch-12/five-task — trends (gate saturation, delta sign) transfer;
+  absolute numbers don't.
+- ACWM arm: prereq `bash jobs/download_acwmphys.sh` (~120 MB into
+  `ds/acwm-phys/`); first step VAE-encodes the clip on cache miss (~4 s,
+  measured), then it's cached — no precompute needed for one episode. Runs
+  the full intended settings (mask_mix + gate_cap 0.9 + sigma_shift 5.0,
+  base input ON) — the "uxrst2k5 + countermeasures on new data" arm, NOT
+  σ-comparable to the MetaWorld triangle. Watch: gate_mean pinned at 0.9 =
+  the saturation pull still exists and the cap is load-bearing;
+  adapter_grad_norm alive past step 150 = trap defused. Single-episode
+  overfit cannot test action USAGE — that's the full-data run's probe.
