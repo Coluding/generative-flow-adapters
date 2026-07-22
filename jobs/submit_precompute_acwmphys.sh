@@ -20,18 +20,18 @@
 
 set -euo pipefail
 
-module purge
-module load 2024
+#module purge
+#module load 2024
 
-export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
-export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
-export PATH="$HOME/.local/bin:$PATH"
+#export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
+#export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
+#export PATH="$HOME/.local/bin:$PATH"
 
-cd "$HOME/generative-flow-adapters"
+cd "$HOME/projects/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="/scratch-shared/$USER/acwm-phys/rigid_dynamics/push_block"
+ROOT="$(pwd)/ds/acwm-phys/rigid_dynamics/push_block"
 CONFIG="configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml"
 NUM_WINDOWS=8   # must match training's --num-windows
 # ONE shared cache for all splits: cache keys embed the split via env_name
@@ -55,7 +55,7 @@ for split in ind_train ind_test ood_test; do
         --latent-cache-dir "$CACHE" \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
         --num-windows $NUM_WINDOWS --max-area 589824 \
-        --batch-size 2 --num-workers 8
+        --batch-size 8 --num-workers 8
 done
 
 echo "All splits done ($(date)). Shared cache at $CACHE"

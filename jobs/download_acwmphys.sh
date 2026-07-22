@@ -9,10 +9,10 @@
 
 set -euo pipefail
 
-DEST="/scratch-shared/$USER/acwm-phys"
+DEST="$HOME/projects/generative-flow-adapters/ds/acwm-phys"
 mkdir -p "$DEST"
 
-cd "$HOME/generative-flow-adapters"
+cd "$HOME/projects/generative-flow-adapters"
 source .venv/bin/activate
 
 huggingface-cli download t1an/ACWM-Phys \
