@@ -75,6 +75,33 @@ Caveat: 41f/batch-2/single-task-corner2 vs the cluster's 97f/batch-12/
 five-task — trends (gate saturation, delta sign) transfer; absolute numbers
 don't.
 
+## 4. Local 3090: ACWM Push Cube single-episode overfit
+
+Prerequisite (once): `bash jobs/download_acwmphys.sh` (~120 MB into
+`ds/acwm-phys/`). First step VAE-encodes the one clip on cache miss (~4 s,
+measured), then it's cached.
+
+```bash
+python scripts/train_wan22_i2v_metaworld_external.py \
+  --config configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
+  --dataset acwm_phys --data-dir ds/acwm-phys/rigid_dynamics/push_block/ind_train \
+  --ckpt-dir ckpts/Wan2.2-TI2V-5B \
+  --overfit-index 0 --num-windows 1 \
+  --steps 800 --batch-size 2 --no-eval-gen \
+  --wandb-run-name local-overfit-acwm-pushblock
+```
+
+What it gives: (a) end-to-end validation of the ACWM *training* path before
+any cluster time is spent, (b) a capacity data point on the new domain —
+can the capped gatelow adapter overfit one Push Cube episode (watch
+`denoise_adapter_delta` go positive and `adapter_gate_mean` stay < 0.9-pin)?
+Notes: the ACWM config is natively 41-frame (66-frame episodes), so no
+--temporal-length override needed; `sigma_shift: 5.0` and `gate_cap: 0.9`
+are ON here (the intended full-run settings) — so this arm is NOT
+σ-comparable to the MetaWorld triangle, it's the pipeline+capacity check for
+the ACWM line. Single-episode overfit says nothing about action usage
+(memorizable without actions) — that's the full ind_train run's job.
+
 ## 4. Local 3090 ACWM-Phys overfit (added 2026-07-22)
 
 Single-episode overfit on Push Cube — validates the full ACWM training path
