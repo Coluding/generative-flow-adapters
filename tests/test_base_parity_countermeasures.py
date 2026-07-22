@@ -124,6 +124,41 @@ class TestGateCap:
         assert AdapterConfig(type="output").gate_cap is None
 
 
+class TestBaseCosineDiagnostics:
+    def test_masked_cosine_uses_predicted_frames_only(self):
+        from generative_flow_adapters.training.trainer import Trainer
+
+        a = torch.zeros(1, 2, 3, 2, 2)
+        b = torch.zeros(1, 2, 3, 2, 2)
+        # frame 0 (obs): orthogonal junk that would drag the cosine down.
+        a[:, 0, 0], b[:, 1, 0] = 5.0, 5.0
+        # frames 1-2 (predicted): identical -> cosine 1.
+        a[:, :, 1:] = 1.0
+        b[:, :, 1:] = 1.0
+        batch = {"frame_mask": torch.tensor([[0.0, 1.0, 1.0]])}
+        assert Trainer._masked_cosine(a, b, batch) == pytest.approx(1.0)
+        assert Trainer._masked_cosine(a, b, {}) < 0.9  # unmasked includes the junk
+
+    def test_compose_captures_raw_adapter_branch(self):
+        from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
+        from generative_flow_adapters.models.adapted_model import AdaptedModel
+
+        m = AdaptedModel.__new__(AdaptedModel)
+        m.output_composition = "mask_mix"
+        m.gate_bias = 0.0
+        m.gate_cap = None
+        m._last_gate = None
+        m._last_adapter_out = None
+        pred = torch.randn(2, 3, 4)
+        res = OutputAdapterResult(adapter_output=pred, output_kind="prediction",
+                                  gate=torch.full((2, 3, 4), 8.0))
+        composed = m._compose(base_output=torch.zeros(2, 3, 4), adapter_result=res)
+        # Gate ~1 -> composed ≈ base (zeros), but the captured branch is the raw pred.
+        assert composed.abs().max() < 0.05 * pred.abs().max()
+        assert torch.equal(m._last_adapter_out, pred)
+        assert not m._last_adapter_out.requires_grad
+
+
 class TestACWMPhysTranslator:
     @pytest.fixture()
     def split_dir(self, tmp_path):

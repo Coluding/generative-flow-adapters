@@ -74,6 +74,10 @@ class AdaptedModel(nn.Module):
         # Detached diagnostic snapshot only — read by Trainer for
         # gate_mean/gate_std/gate histogram logging; not used in the loss.
         self._last_gate: Tensor | None = None
+        # Raw adapter-branch output (pre-composition) from the most recent
+        # `_compose` call, detached; None before the first forward. Read by the
+        # Trainer for the pred-vs-base cosine diagnostic.
+        self._last_adapter_out: Tensor | None = None
 
     @property
     def model_type(self) -> str:
@@ -161,6 +165,15 @@ class AdaptedModel(nn.Module):
 
     def _compose(self, base_output: Tensor, adapter_result: Tensor | OutputAdapterResult) -> Tensor:
         self._last_gate = None
+        # Raw adapter-branch output from this call (pre-composition), detached —
+        # diagnostic only, read by the Trainer for the pred-vs-base cosine.
+        # Distinct from the composed output: under mask_mix a high gate makes
+        # the composed output ≈base regardless of what the pred head learned,
+        # so only the raw branch reveals base-cloning there.
+        self._last_adapter_out = (
+            adapter_result.detach() if isinstance(adapter_result, Tensor)
+            else adapter_result.adapter_output.detach()
+        )
         if isinstance(adapter_result, Tensor):
             return base_output + adapter_result
 
