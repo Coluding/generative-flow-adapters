@@ -34,6 +34,11 @@ source .venv/bin/activate
 ROOT="/scratch-shared/$USER/acwm-phys/rigid_dynamics/push_block"
 CONFIG="configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml"
 NUM_WINDOWS=8   # must match training's --num-windows
+# ONE shared cache for all splits: cache keys embed the split via env_name
+# ("push_block-ind_train" etc.), and training reads train + eval batches
+# through a single cache dir — pass this same path as training's
+# --latent-cache-dir.
+CACHE="$ROOT/latents.shared"
 
 for split in ind_train ind_test ood_test; do
     d="$ROOT/$split"
@@ -47,9 +52,10 @@ for split in ind_train ind_test ood_test; do
     python scripts/precompute_latents.py \
         --config "$CONFIG" \
         --dataset acwm_phys --data-dir "$d" \
+        --latent-cache-dir "$CACHE" \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
         --num-windows $NUM_WINDOWS --max-area 589824 \
         --batch-size 2 --num-workers 8
 done
 
-echo "All splits done ($(date)). Caches at $ROOT/<split>.latents/"
+echo "All splits done ($(date)). Shared cache at $CACHE"
