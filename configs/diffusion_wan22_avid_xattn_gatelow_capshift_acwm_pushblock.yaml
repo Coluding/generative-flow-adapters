@@ -46,7 +46,14 @@ model:
     max_area: 589824         # 1024^2 source downscaled to Wan-native ~768^2
     latent_height: 16
     latent_width: 16
-    text_prompts_file: null  # frame-only (no task-prompt table for ACWM yet)
+    # Prompt conditioning: prompt-free base rollouts on this domain are pure
+    # noise (latents ~2x off the VAE's natural range — see the prompt yaml's
+    # header). After running the one-off T5 precompute
+    # (external_repos/Wan2.2/precompute_prompt_contexts.py --prompts_file
+    # configs/prompts/acwm_pushblock.yaml), switch to:
+    #   text_prompts_file: configs/prompts/acwm_pushblock.yaml
+    # and set training.extra.inference_use_prompt: true below.
+    text_prompts_file: null  # frame-only until the probe validates prompting
 
 adapter:
   type: output

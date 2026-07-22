@@ -1,0 +1,34 @@
+# Text prompts for the frozen Wan2.2 base on ACWM-Phys push_block (Push Cube).
+#
+# WHY THESE PROMPTS (2026-07-22 base-probe finding): prompt-free base rollouts
+# on this domain are pure noise, and the domain's latents are ~2x outside the
+# VAE's natural-video range (z0 std 1.70 vs 0.89 on MetaWorld; zero-shot base
+# denoise loss 4.57 vs ~0.13). The scenes are flat 2D vector graphics — white
+# background, saturated colored squares, gray circular pusher. The prompts
+# therefore describe BOTH the content and, critically, the RENDERING STYLE
+# (flat 2D illustration / minimal vector animation), to pull the base into
+# the region of its prior where such frames are in-distribution.
+#
+# Pipeline (same as metaworld_tasks.yaml):
+#   1. Precompute embeddings once (needs the umt5 checkpoint, present in ckpt dir):
+#        python external_repos/Wan2.2/precompute_prompt_contexts.py \
+#          --ckpt_dir ckpts/Wan2.2-TI2V-5B \
+#          --prompts_file configs/prompts/acwm_pushblock.yaml
+#      -> writes configs/prompts/acwm_pushblock.contexts.pt
+#   2. Enable in the config: model.extra.text_prompts_file:
+#      configs/prompts/acwm_pushblock.yaml  (currently null = frame-only), and
+#      training.extra.inference_use_prompt: true for CFG at generation.
+#   Re-run step 1 after any prompt edit.
+#
+# `negative: null` -> the model's built-in sample_neg_prompt for the CFG branch.
+
+default: "Flat 2D animation on a plain white background: colored squares and a gray circle move on a white surface, minimal vector illustration style, crisp edges, smooth motion, static camera."
+
+negative: null
+
+# The sampling pool (one sampled at random per clip during training):
+prompts:
+  - "Minimalist 2D motion graphics: a gray circular pusher slides across a white plane and pushes colored square blocks, flat vector style, clean sharp edges, steady camera."
+  - "Top-down view of a simple physics simulation, flat-shaded colored cubes on a white background nudged by a gray round pusher, 2D illustration, smooth continuous motion."
+  - "A flat cartoon animation of geometric shapes: pink, green and yellow squares and a gray disc gliding on a pure white surface, vector art, no texture, stable camera."
+  - "Simple 2D simulation render, saturated colored squares pushed around a white field by a small gray circle, crisp flat colors, smooth motion, fixed viewpoint."
