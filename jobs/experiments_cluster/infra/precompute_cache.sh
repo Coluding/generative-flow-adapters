@@ -31,4 +31,17 @@ mkdir -p logs
 source .venv/bin/activate
 
 
-python scripts/precompute_latents.py --hdf5 ../scratch-shared/metaworld/three_task.hdf5 --ckpt-dir ckpts/Wan2.2-TI2V-5B --num-windows 8 --max-area 589824
+# Warm the latent cache for a MetaWorld dataset. Override the dataset with
+# DS_PATH, e.g. for the base-parity campaign:
+#   DS_PATH=../scratch-shared/metaworld/five_task_diverse.hdf5 sbatch jobs/experiments_cluster/infra/precompute_cache.sh
+# Run this BEFORE submitting training arms in parallel — they share this cache
+# and would otherwise race writing the same keys (see the cache guard in the
+# metaworld/wan/ scripts).
+export ds_path="${DS_PATH:-../scratch-shared/metaworld/three_task.hdf5}"
+echo "Precomputing latents for: $ds_path"
+if test ! -f "$ds_path"; then
+    echo "Error: Dataset file not found at $ds_path" >&2
+    exit 1
+fi
+
+python scripts/precompute_latents.py --hdf5 "$ds_path" --ckpt-dir ckpts/Wan2.2-TI2V-5B --num-windows 8 --max-area 589824

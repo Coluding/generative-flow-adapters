@@ -13,11 +13,14 @@
 # PREREQUISITE (login node): bash jobs/download_acwmphys.sh  AND  git pull
 # (needs the ACWMPhysTranslator commit).
 #
-# Geometry MUST match the training config
+# Geometry is read from the training config
 # (diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml):
-# temporal_length 41, max_area 901120 (NATIVE letterboxed — NOT 589824/768², which
-# gives noise rollouts), num-windows 8 — the latent-cache keys bake all of
-# these in. batch-size 1: the native-res encode transient is ~15 GiB/window.
+# temporal_length 65 (near-full episode), max_area 589824 (768^2 square, NO
+# letterbox — the frozen base is coherent there; the earlier square=noise was
+# a base-corruption bug, since fixed). The latent-cache keys bake all of these
+# in, so this job and training MUST use the same config + --num-windows.
+# At 65-frame windows on 66-frame episodes there are only 2 valid starts, so
+# --num-windows auto-clamps to 2 (~3000 windows total across 1500 episodes).
 
 set -euo pipefail
 
@@ -55,8 +58,8 @@ for split in ind_train ind_test ood_test; do
         --dataset acwm_phys --data-dir "$d" \
         --latent-cache-dir "$CACHE" \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-        --num-windows $NUM_WINDOWS --max-area 901120 \
-        --batch-size 1 --num-workers 8
+        --num-windows $NUM_WINDOWS --max-area 589824 \
+        --batch-size 4 --num-workers 8
 done
 
 echo "All splits done ($(date)). Shared cache at $CACHE"
