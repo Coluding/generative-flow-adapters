@@ -73,7 +73,7 @@ def _resolve_dit_checkpoint(ckpt_dir: Path) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_i2v_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml")
     parser.add_argument(
         "--hdf5",
         default="ds/metaworld_corner2.hdf5",

@@ -1,0 +1,115 @@
+name: diffusion_avid_shortcut_metaworld
+
+# AVID-style output adapter on DynamiCrafter, trained with shortcut
+# supervision on the MetaWorld HDF5 dataset.
+#
+# The frozen DynamiCrafter UNet provides the base velocity prediction. The
+# adapter is a small action-conditioned UNet (AVID 11M) that produces a
+# delta + a per-pixel gate ("avid_mask_mix" composition):
+#
+#     prediction = base * sigmoid(gate) + adapted * (1 - sigmoid(gate))
+#
+# The trainer samples a random ``step_level`` per batch, injects it into the
+# cond mapping, and supervises the *adapted* output toward
+# ``base(x_t, t, cond) * step_level``. The adapter's own step-level branch
+# consumes the same value so it learns which multi-step horizon is active.
+
+data:
+  frame_stride: 4
+  fs_value: 1
+  # env: reach-v3       # str or list of env names; omit = all environments
+  # camera: corner2     # str or list of cameras (camera-split layout); omit = all cameras
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: configs/base/dynamicrafter512.yaml
+    strict_checkpoint: true
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: false
+    allow_missing_checkpoint: true
+    load_first_stage_model: true
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  shortcut_consistency_target: endpoint_inversion
+  inference_every_n_steps: 2000
+  inference_num_steps: 50
+  # Run artifacts: metrics.jsonl + checkpoints/ are written under output_dir
+  # (CLI --output-dir overrides; defaults to outputs/<name> in the script).
+  output_dir: outputs/diffusion_avid_shortcut_metaworld
+  log_metrics_jsonl: true
+  # Periodic checkpointing of the trainable adapter/encoder weights + optimizer.
+  checkpoint_every_n_steps: 2000
+  keep_last_checkpoints: 3
+  # Eval cycle: every N steps, average the loss over `eval_num_batches` held-out
+  # batches and save best.pt when `eval_metric` improves. base_loss (the honest
+  # denoising loss) drives selection rather than the self-distilled total.
+  eval_every_n_steps: 2000
+  eval_num_batches: 8
+  eval_metric: base_loss
+  extra:
+    amp_dtype: bf16
+    shortcut_step_level_key: step_level
+    shortcut_anchor_prob: 0.55
+    eval_step_schedule:
+      - { num_steps: 1,  step_level: 1.0 }
+     # - { num_steps: 2,  step_level: 0.5 }
+     # - { num_steps: 4,  step_level: 0.25 }
+     # - { num_steps: 8,  step_level: 0.125 }
+     # - { num_steps: 25, step_level: 0.04 }
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128   # finest — grounded by the standard loss
+      max: 1       # one-step
+      base: 2
+    video_logging:
+      enable: true
+      num_samples: 1
+      fps: 2
+      wandb_project: avid-shortcut-metaworld-055

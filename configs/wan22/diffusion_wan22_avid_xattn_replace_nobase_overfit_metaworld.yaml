@@ -20,7 +20,7 @@
 #
 # Launch (remote, matches the earlier overfit-single-clip run):
 #   python scripts/train_wan22_i2v_metaworld_external.py \
-#     --config configs/diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld.yaml \
+#     --config configs/wan22/diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld.yaml \
 #     --overfit-index 0 --num-windows 1 --steps 2000 \
 #     --wandb-run-name overfit-single-clip-replace-nobase
 #

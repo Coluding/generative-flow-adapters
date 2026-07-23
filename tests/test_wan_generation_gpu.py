@@ -88,7 +88,7 @@ def test_wan_frame_conditioned_base_vs_adapter():
     os.makedirs("outputs", exist_ok=True)
 
     # One DiT copy: the AdaptedModel holds the base; reuse base_model for path (a).
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.pretrained_model_name_or_path = str(_CKPT_DIR)
     config.model.extra["allow_missing_checkpoint"] = False
     config.model.extra["dtype"] = "bf16"
@@ -177,7 +177,7 @@ def test_wan_base_sdedit_reconstructs_metaworld_clip():
     frames, height, width, steps = 17, 128, 128, 8
     os.makedirs("outputs", exist_ok=True)
 
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.pretrained_model_name_or_path = str(_CKPT_DIR)
     config.model.extra["allow_missing_checkpoint"] = False
     config.model.extra["dtype"] = "bf16"
@@ -254,7 +254,7 @@ def test_wan_metaworld_training_step():
     from generative_flow_adapters.training.trainer import Trainer
 
     device = "cuda"
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.pretrained_model_name_or_path = str(_CKPT_DIR)
     config.model.extra["allow_missing_checkpoint"] = False
     experiment = build_experiment(config)
@@ -298,7 +298,7 @@ def test_flow_inference_sampler_eval_rollout():
     from generative_flow_adapters.training.trainer import Trainer
 
     device = "cuda"
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.pretrained_model_name_or_path = str(_CKPT_DIR)
     config.model.extra["allow_missing_checkpoint"] = False
     experiment = build_experiment(config)

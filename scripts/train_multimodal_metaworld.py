@@ -19,7 +19,7 @@ Differences vs. the AVID shortcut trainer (the multimodal trainer is leaner):
     - ``fusion: compositional`` now works on the real backbone via context
       injection (modality tokens appended to the adapter's cross-attention +
       a pooled-video readout into the modality heads); ``fusion: trivial`` stays
-      available as the additive baseline (see configs/multimodal_dynamicrafter.yaml).
+      available as the additive baseline (see configs/dynamicrafter/multimodal_dynamicrafter.yaml).
 
 The clip dataset must actually emit the non-video modalities named in the
 config's ``output_modalities`` (``proprio`` / ``tactile`` are OPTIONAL MetaWorld
@@ -27,7 +27,7 @@ keys — see data/schema.py); trim the config to the streams your HDF5 provides.
 
 Run:
     python scripts/train_multimodal_metaworld.py \\
-        --config configs/multimodal_dynamicrafter.yaml \\
+        --config configs/dynamicrafter/multimodal_dynamicrafter.yaml \\
         --hdf5 ds/metaworld_corner2.hdf5 \\
         --steps 200 --batch-size 2
 """
@@ -97,7 +97,7 @@ def _build_run_io(config) -> tuple[object | None, object | None]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/multimodal_dynamicrafter.yaml")
+    parser.add_argument("--config", default="configs/dynamicrafter/multimodal_dynamicrafter.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2_large.hdf5")
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=2)

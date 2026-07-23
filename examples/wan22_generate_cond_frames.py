@@ -27,7 +27,7 @@ Requires a CUDA device (the upstream WanTI2V pins cuda).
 
 Example:
     python examples/wan22_generate_cond_frames.py \
-        --config configs/diffusion_wan22_avid_i2v_metaworld.yaml \
+        --config configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
         --image metaworld_frame0.png \
         --size 1280*704 --frame-num 41 --guide-scale 1.0 \
@@ -87,7 +87,7 @@ def _load_frame(image: str | None, hdf5: str, clip_idx: int) -> np.ndarray:
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_i2v_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml")
     parser.add_argument(
         "--ckpt-dir",
         default="ckpts/Wan2.2-TI2V-5B",

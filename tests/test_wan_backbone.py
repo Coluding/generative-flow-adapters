@@ -84,7 +84,7 @@ def test_adapted_model_composition():
     from generative_flow_adapters.config import load_config
     from generative_flow_adapters.training.builders import build_experiment
 
-    experiment = build_experiment(load_config("configs/wan_output_adapter.yaml"))
+    experiment = build_experiment(load_config("configs/wan21/wan_output_adapter.yaml"))
     model = experiment.model
 
     assert sum(p.numel() for p in model.base_model.parameters() if p.requires_grad) == 0
@@ -150,7 +150,7 @@ def test_wan_avid_adapter_tiers_and_composition():
         n = sum(p.numel() for p in a.parameters())
         assert lo < n < hi, f"{path}: {n/1e6:.1f}M outside ({lo/1e6}, {hi/1e6})"
 
-    config = load_config("configs/diffusion_wan_avid_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_avid_shortcut_metaworld.yaml")
     config.model.extra["wan_config_path"] = _TINY_CONFIG
     config.model.extra["dtype"] = "float32"
     config.model.extra["allow_missing_checkpoint"] = True
@@ -210,9 +210,9 @@ def test_trainer_selects_flow_inference_sampler():
     from generative_flow_adapters.training.builders import build_experiment
     from generative_flow_adapters.training.trainer import Trainer
 
-    experiment = build_experiment(load_config("configs/wan_output_adapter.yaml"))
+    experiment = build_experiment(load_config("configs/wan21/wan_output_adapter.yaml"))
     trainer = Trainer(experiment.model, experiment.optimizer, experiment.loss_fn,
-                      load_config("configs/wan_output_adapter.yaml").training)
+                      load_config("configs/wan21/wan_output_adapter.yaml").training)
     assert isinstance(trainer.inference_sampler, FlowInferenceSampler)
 
     # A short rollout from a fake batch is finite and shape-preserving.
@@ -229,7 +229,7 @@ def test_flow_shortcut_training_step_fires():
     from generative_flow_adapters.training.builders import build_experiment
     from generative_flow_adapters.training.trainer import Trainer
 
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.extra["wan_config_path"] = _TINY_CONFIG  # tiny base for CPU
     config.model.extra["allow_missing_checkpoint"] = True
     config.model.extra["dtype"] = "float32"  # CPU test runs fp32 base
@@ -268,7 +268,7 @@ def test_flow_shortcut_uses_step_schedule_like_dynamicrafter():
     from generative_flow_adapters.training.builders import build_experiment
     from generative_flow_adapters.training.trainer import Trainer
 
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.extra["wan_config_path"] = _TINY_CONFIG
     config.model.extra["allow_missing_checkpoint"] = True
     config.model.extra["dtype"] = "float32"

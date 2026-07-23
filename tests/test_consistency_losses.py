@@ -27,7 +27,7 @@ from generative_flow_adapters.testing import build_fake_dataloader
 from generative_flow_adapters.training import Trainer, build_experiment
 
 
-CONFIG_PATH = "configs/diffusion_output_shortcut_velocity.yaml"
+CONFIG_PATH = "configs/dev/diffusion_output_shortcut_velocity.yaml"
 
 
 def _build_trainer(*, heun_weight: float, learning_rate: float = 1e-2) -> tuple[Trainer, object]:

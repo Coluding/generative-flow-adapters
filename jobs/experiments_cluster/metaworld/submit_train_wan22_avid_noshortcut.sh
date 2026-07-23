@@ -60,6 +60,6 @@ trap 'kill "$GPU_MONITOR_PID" 2>/dev/null || true' EXIT
 # AVID output adapter, action-conditioned, NO shortcut self-consistency loss
 # (anchor_prob=1.0 in the config). Plain flow-matching world-model training.
 srun uv run python scripts/train_wan22_i2v_metaworld.py \
-    --config configs/diffusion_wan22_avid_i2v_metaworld_noshortcut.yaml \
+    --config configs/wan22/diffusion_wan22_avid_i2v_metaworld_noshortcut.yaml \
     --hdf5 "../scratch-shared/metaworld/mw_zoom13.hdf5" --ckpt-dir ckpts/Wan2.2-TI2V-5B \
     --batch-size $BATCH_SIZE "$@"

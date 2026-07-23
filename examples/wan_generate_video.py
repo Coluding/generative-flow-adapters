@@ -58,7 +58,7 @@ def build_adapted_model(ckpt_dir: str, device: str, dtype: torch.dtype):
     from generative_flow_adapters.config import load_config
     from generative_flow_adapters.training.builders import build_experiment
 
-    config = load_config("configs/diffusion_wan_shortcut_metaworld.yaml")
+    config = load_config("configs/wan21/diffusion_wan_shortcut_metaworld.yaml")
     config.model.pretrained_model_name_or_path = ckpt_dir
     config.model.extra["wan_config_path"] = "configs/base/wan2.1_t2v_1_3B.yaml"
     config.model.extra["allow_missing_checkpoint"] = False

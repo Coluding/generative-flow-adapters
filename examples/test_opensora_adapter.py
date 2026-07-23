@@ -11,7 +11,7 @@ from generative_flow_adapters.training.trainer import Trainer
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/opensora_output_adapter.yaml")
+    parser.add_argument("--config", default="configs/opensora/opensora_output_adapter.yaml")
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--dataset-length", type=int, default=8)

@@ -15,25 +15,31 @@
 #
 # Geometry MUST match the training config
 # (diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml):
-# temporal_length 41, max_area 589824, num-windows 8 — the latent-cache keys
-# bake all of these in. ~13.6k windows total; VAE-only, no 5B DiT loaded.
+# temporal_length 41, max_area 901120 (NATIVE letterboxed — NOT 589824/768², which
+# gives noise rollouts), num-windows 8 — the latent-cache keys bake all of
+# these in. batch-size 1: the native-res encode transient is ~15 GiB/window.
 
 set -euo pipefail
 
-module purge
-module load 2024
+#module purge
+#module load 2024
 
-export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
-export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
-export PATH="$HOME/.local/bin:$PATH"
+#export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
+#export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
+#export PATH="$HOME/.local/bin:$PATH"
 
-cd "$HOME/generative-flow-adapters"
+cd "$HOME/projects/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="/scratch-shared/$USER/acwm-phys/rigid_dynamics/push_block"
-CONFIG="configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml"
+ROOT="$(pwd)/ds/acwm-phys/rigid_dynamics/push_block"
+CONFIG="configs/wan22/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml"
 NUM_WINDOWS=8   # must match training's --num-windows
+# ONE shared cache for all splits: cache keys embed the split via env_name
+# ("push_block-ind_train" etc.), and training reads train + eval batches
+# through a single cache dir — pass this same path as training's
+# --latent-cache-dir.
+CACHE="$ROOT/latents.shared"
 
 for split in ind_train ind_test ood_test; do
     d="$ROOT/$split"
@@ -47,9 +53,10 @@ for split in ind_train ind_test ood_test; do
     python scripts/precompute_latents.py \
         --config "$CONFIG" \
         --dataset acwm_phys --data-dir "$d" \
+        --latent-cache-dir "$CACHE" \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-        --num-windows $NUM_WINDOWS --max-area 589824 \
-        --batch-size 2 --num-workers 8
+        --num-windows $NUM_WINDOWS --max-area 901120 \
+        --batch-size 1 --num-workers 8
 done
 
-echo "All splits done ($(date)). Caches at $ROOT/<split>.latents/"
+echo "All splits done ($(date)). Shared cache at $CACHE"

@@ -192,6 +192,22 @@ class Trainer:
         masked = self._frame_masked_mse(prediction, target, batch)
         return masked if masked is not None else self.loss_fn(prediction, target)
 
+    @staticmethod
+    def _masked_cosine(a: Tensor, b: Tensor, batch: Mapping[str, Tensor | object]) -> float:
+        """Cosine similarity between two [B, C, T', H, W] velocity tensors over
+        the *predicted* frames (``frame_mask == 1``), or over everything when
+        the batch carries no ``frame_mask``. Diagnostic only (no grad)."""
+        with torch.no_grad():
+            frame_mask = batch.get("frame_mask")
+            if isinstance(frame_mask, Tensor) and a.dim() == 5:
+                m = frame_mask.to(device=a.device, dtype=torch.bool)
+                m = m.view(m.shape[0], 1, m.shape[1], 1, 1).expand_as(a)
+                av, bv = a[m].flatten(), b[m].flatten()
+            else:
+                av, bv = a.flatten(), b.flatten()
+            denom = (av.norm() * bv.norm()).clamp_min(1e-12)
+            return float((torch.dot(av, bv) / denom).detach().cpu())
+
     def _adapter_grad_norm(self) -> float | None:
         """L2 norm of gradients on `model.adapter` parameters only (excludes the
         frozen base and, deliberately, the condition encoder — scoped tight to
@@ -322,6 +338,21 @@ class Trainer:
                 loss_components["adapter_rel_contribution"] = float(
                     ((prediction - base_output.float()).norm() / base_norm).detach().cpu()
                 )
+                # Base-clone diagnostics (2026-07-22): cosine similarity to the
+                # frozen base's velocity, masked to predicted frames. Two views:
+                #   adapter_base_cosine      — the COMPOSED output vs base
+                #     (replace: the adapter velocity itself; cos→1 = clone).
+                #   adapter_pred_base_cosine — the RAW adapter branch vs base
+                #     (gated modes: the only view that reveals cloning, since a
+                #     high gate makes the composed output ≈base regardless).
+                loss_components["adapter_base_cosine"] = self._masked_cosine(
+                    prediction, base_output.float(), batch
+                )
+                pred_branch = getattr(self.model, "_last_adapter_out", None)
+                if isinstance(pred_branch, Tensor) and pred_branch.shape == base_output.shape:
+                    loss_components["adapter_pred_base_cosine"] = self._masked_cosine(
+                        pred_branch.float(), base_output.float(), batch
+                    )
             gate_tensor = getattr(self.model, "_last_gate", None)
             if isinstance(gate_tensor, Tensor) and gate_tensor.numel() > 0:
                 gate_flat = gate_tensor.detach().float().flatten()

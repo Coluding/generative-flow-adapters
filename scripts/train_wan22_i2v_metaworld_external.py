@@ -2,7 +2,7 @@
 plug-and-play building approach** (``BaseVideoModel`` + ``AdaptedModel``).
 
 Same experiment as ``scripts/train_wan22_i2v_metaworld.py`` (same
-``configs/diffusion_wan22_avid_i2v_metaworld.yaml``, same AVID adapter, same
+``configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml``, same AVID adapter, same
 diffusion-forcing preprocessor and loss). The ONLY difference is how the frozen
 base is built:
 
@@ -25,7 +25,7 @@ Requires a CUDA device (the upstream WanTI2V pins ``cuda``).
 Smoke run:
 
     python scripts/train_wan22_i2v_metaworld_external.py \
-        --config configs/diffusion_wan22_avid_i2v_metaworld.yaml \
+        --config configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml \
         --hdf5 ds/metaworld_corner2.hdf5 \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
         --steps 5 --batch-size 1
@@ -43,6 +43,7 @@ from generative_flow_adapters.config import load_config
 from generative_flow_adapters.data import (
     Wan22DiffusionForcingPreprocessor,
     WanBatchPreprocessConfig,
+    build_acwmphys_clip_dataset,
     build_metaworld_clip_dataset,
 )
 from generative_flow_adapters.training import build_experiment
@@ -54,8 +55,14 @@ _WAN22_VAE_SPATIAL_STRIDE = 16
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="Path to MetaWorld HDF5 file")
+    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
+                        help="Dataset family. acwm_phys reads a split dir of the HF t1an/ACWM-Phys release "
+                             "(--data-dir) instead of --hdf5.")
+    parser.add_argument("--data-dir", default=None,
+                        help="acwm_phys only: split directory (metadata.pt + episode_*.mp4), e.g. "
+                             "/scratch-shared/$USER/acwm-phys/rigid_dynamics/push_block/ind_train")
     parser.add_argument(
         "--ckpt-dir",
         default="ckpts/Wan2.2-TI2V-5B",
@@ -70,6 +77,9 @@ def main() -> None:
         help="Batch size for the eval loader. Defaults to --batch-size when unset.",
     )
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--temporal-length", type=int, default=None,
+                        help="Override model.extra.temporal_length (pixel-frame window). Must match "
+                             "the latent cache's window length to hit it (local cache: 41).")
     parser.add_argument(
         "--max-area",
         type=int,
@@ -100,6 +110,8 @@ def main() -> None:
         "held-out loss eval always runs.",
     )
     parser.add_argument("--eval-hdf5", default=None, help="Separate held-out MetaWorld HDF5 for loss eval.")
+    parser.add_argument("--eval-data-dir", default=None,
+                        help="acwm_phys only: held-out split dir for loss eval (ind_test or ood_test).")
     parser.add_argument(
         "--val-fraction",
         type=float,
@@ -158,6 +170,11 @@ def main() -> None:
         config.training.quality_dist_metrics = []
 
     # Latent geometry from the config drives both the VAE resize and the model.
+    # --temporal-length overrides the config (e.g. local 3090 runs at 41-frame
+    # windows to hit the 41-frame latent cache, while the cluster configs say 97).
+    if args.temporal_length is not None:
+        config.model.extra["temporal_length"] = int(args.temporal_length)
+        config.training.extra["inference_frame_num"] = int(args.temporal_length)
     temporal_length = int(config.model.extra.get("temporal_length", 17))
     latent_height = int(config.model.extra.get("latent_height", 16))
     latent_width = int(config.model.extra.get("latent_width", 16))
@@ -256,9 +273,12 @@ def main() -> None:
     # Latent cache: skip the frozen-VAE encode (per-step bottleneck) by caching z0
     # per clip. Default dir derives from the hdf5 (resolution is in each key, so one
     # dir is safe across max_area). Disabled with --no-latent-cache.
-    latent_cache_dir = None if args.no_latent_cache else (
-        args.latent_cache_dir or str(Path(args.hdf5).with_suffix("")) + ".latents"
+    default_cache = (
+        str(Path(args.data_dir)) + ".latents"
+        if args.dataset == "acwm_phys" and args.data_dir
+        else str(Path(args.hdf5).with_suffix("")) + ".latents"
     )
+    latent_cache_dir = None if args.no_latent_cache else (args.latent_cache_dir or default_cache)
     preprocessor = Wan22DiffusionForcingPreprocessor(
         vae=vae,
         config=WanBatchPreprocessConfig(
@@ -287,14 +307,27 @@ def main() -> None:
         print("sigma shift: OFF — training sigma ~ U(0,1)")
 
     num_windows = args.num_windows or None  # 0 -> None (unbounded random, cache can't hit)
-    translator, dataset = build_metaworld_clip_dataset(
-        config.data,
-        default_window_width=temporal_length,
-        hdf5=args.hdf5,
-        frame_stride=args.frame_stride,
-        sampling=args.sampling,
-        num_windows=num_windows,
-    )
+    if args.dataset == "acwm_phys":
+        if not args.data_dir:
+            raise SystemExit("--dataset acwm_phys requires --data-dir (a split dir of the HF release).")
+        translator, dataset = build_acwmphys_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            data_dir=args.data_dir,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+            num_windows=num_windows,
+        )
+        print(f"dataset: ACWM-Phys {translator.env_name} ({len(translator.list_episodes())} episodes) from {args.data_dir}")
+    else:
+        translator, dataset = build_metaworld_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            hdf5=args.hdf5,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+            num_windows=num_windows,
+        )
 
     eval_dataset = None
     train_dataset = dataset
@@ -329,7 +362,18 @@ def main() -> None:
         print(f"OVERFIT MODE: training on dataset[{args.overfit_index}] repeated "
               f"{repeat}x (single-clip). Eval/generation targets the same clip; "
               f"pass --eval-gen (default) to see the inference grid regenerate it.")
-    if want_eval and eval_hdf5 is not None:
+    if want_eval and args.eval_data_dir is not None:
+        # ACWM-Phys: eval on a real held-out split dir (ind_test / ood_test).
+        _, eval_dataset = build_acwmphys_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            data_dir=args.eval_data_dir,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+            num_windows=num_windows,
+        )
+        print(f"eval dataset: ACWM-Phys split {args.eval_data_dir}")
+    elif want_eval and eval_hdf5 is not None:
         _, eval_dataset = build_metaworld_clip_dataset(
             config.data,
             default_window_width=temporal_length,
@@ -349,12 +393,17 @@ def main() -> None:
         else:
             print("  warning: dataset too small for the requested val split; eval disabled.")
 
+    # decord/FFmpeg (and h5py) handles are not fork-safe: the geometry probe below
+    # touches the translator in the parent, and fork-after-decord deadlocks the
+    # first worker get_batch(). Spawn workers re-open their readers lazily.
+    _mp_ctx = "spawn" if args.num_workers > 0 else None
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=(dataset.sampling == "exhaustive"),
         num_workers=args.num_workers,
         drop_last=True,
+        multiprocessing_context=_mp_ctx,
     )
     eval_loader = None
     if eval_dataset is not None:
@@ -364,6 +413,7 @@ def main() -> None:
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=True,
+            multiprocessing_context=_mp_ctx,
         )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -376,6 +426,7 @@ def main() -> None:
         from generative_flow_adapters.data.wan_batch_preprocessor import best_output_size
 
         vid = dataset[0]["video"]  # [T, H, W, C]
+        dataset.translator.close()  # probe opened a parent-process reader; workers open their own
         src_h, src_w = int(vid.shape[1]), int(vid.shape[2])
         ow, oh = best_output_size(src_w, src_h, align, align, max_area)
         lat_f = 1 + (temporal_length - 1) // 4
@@ -409,7 +460,8 @@ def main() -> None:
                       "random draw per episode; training will still miss most windows. Use K>0.")
             precompute_set = dataset
         full_loader = DataLoader(precompute_set, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, drop_last=False)
+                                 num_workers=args.num_workers, drop_last=False,
+                                 multiprocessing_context=_mp_ctx)
         print(f"precomputing latents -> {latent_cache_dir}  ({len(precompute_set)} windows)")
         total = len(precompute_set)
         done, encoded, t0 = 0, 0, _time.time()
