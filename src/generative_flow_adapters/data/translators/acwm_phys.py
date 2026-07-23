@@ -44,7 +44,7 @@ class ACWMPhysTranslator(Translator):
         fs_value: int = 1,
         fps: int = 10,
         caption_template: str = "a robot pushing objects on a table, {env_name}",
-        letterbox_aspect: tuple[int, int] | None = (1280, 704),
+        letterbox_aspect: tuple[int, int] | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         meta_path = self.data_dir / "metadata.pt"
@@ -59,14 +59,13 @@ class ACWMPhysTranslator(Translator):
         self.env_name = env_name or f"{self.data_dir.parent.name}-{self.data_dir.name}"
         self.fs_value = int(fs_value)
         self.fps = int(fps)
-        # Letterbox the square source frames onto a white canvas of Wan's
-        # native aspect (default 1280:704). MEASURED 2026-07-23: the frozen
-        # TI2V-5B produces pure noise on this domain at square 768x768, but
-        # coherent in-domain video with the same frame letterboxed at native
-        # 1280x704 (stock upstream generate.py, one variable flipped). The
-        # downstream aspect-preserving resize (best_output_size, max_area
-        # 901120) then lands exactly on 1280x704. White matches the scene
-        # background. None disables (raw square frames).
+        # Optional letterbox onto Wan's native aspect. DEFAULT OFF (2026-07-23):
+        # square 768x768 was thought to break the base, but that finding was
+        # confounded by a base-corruption bug (--random-init aliased the frozen
+        # 5B's weights via the adapter). With that fixed, the frozen TI2V-5B
+        # generates coherent video at plain square 768x768 — so we train at
+        # max_area 589824 like MetaWorld, no letterbox. Set (1280, 704) to
+        # re-enable native-aspect padding if a quality benefit is ever shown.
         self.letterbox_aspect = letterbox_aspect
         self.caption = caption_template.format(env_name=self.data_dir.parent.name)
         # metadata.pt is a plain list[dict] of tensors/ints/strs (torch>=2.6

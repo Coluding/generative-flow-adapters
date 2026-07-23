@@ -46,6 +46,9 @@ import torch  # noqa: E402
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Subset
+import warnings
+warnings.filterwarnings("ignore")
+torch.set_warn_always(False)
 
 from generative_flow_adapters.config import load_config
 from generative_flow_adapters.data import (
@@ -274,16 +277,57 @@ def _sigma_sweep(model, preprocessor, dataset, args, config, timestep_scale: flo
     print(f"  wrote {png_path}")
 
 
-def _pre_encode_windows(dataset, args, pre_cfg: WanBatchPreprocessConfig) -> None:
+def _fingerprint_generate_inputs(frame: object, kw: dict, base_model) -> None:
+    """Print an exact fingerprint of everything handed to ``generate()`` plus
+    the base model's live state. Diff this against the probe's identical block
+    (jobs/experiments/local_probe_acwm_wrapper.py) to find which ingredient
+    differs when one path produces video and the other noise."""
+    print("--- generate() input fingerprint ---")
+    f = frame
+    if isinstance(f, Tensor):
+        arr = f.detach().cpu()
+        print(f"  frame: Tensor {tuple(arr.shape)} {arr.dtype} "
+              f"min={float(arr.float().min()):.1f} max={float(arr.float().max()):.1f} "
+              f"mean={float(arr.float().mean()):.3f}")
+    else:
+        import numpy as _np  # noqa: PLC0415
+
+        a = _np.asarray(f)
+        print(f"  frame: {type(f).__name__} {a.shape} {a.dtype} "
+              f"min={a.min()} max={a.max()} mean={a.mean():.3f}")
+    for k in ("max_area", "frame_num", "sampling_steps", "shift", "guide_scale", "seed", "offload_model"):
+        print(f"  {k}: {kw.get(k)}")
+    for k in ("context", "context_null"):
+        v = kw.get(k)
+        if isinstance(v, Tensor):
+            print(f"  {k}: {tuple(v.shape)} {v.dtype} {v.device} "
+                  f"norm={float(v.float().norm()):.3f} sum={float(v.float().sum()):.4f}")
+        else:
+            print(f"  {k}: {v}")
+    wan = getattr(base_model, "wan", None)
+    if wan is not None:
+        dit_p = next(wan.model.parameters())
+        vae_p = next(wan.vae.model.parameters())
+        print(f"  DiT: {dit_p.dtype} {dit_p.device} training={wan.model.training}")
+        print(f"  VAE: weights {vae_p.dtype} {vae_p.device} | autocast attr {wan.vae.dtype} "
+              f"| device attr {wan.vae.device}")
+    print("--- end fingerprint ---", flush=True)
+
+
+def _pre_encode_windows(dataset, args, pre_cfg: WanBatchPreprocessConfig) -> bool:
     """GPU-encode the windows this run will read into the latent cache BEFORE
     the 5B is built: a native-res (1280x704) window encode needs ~15 GiB —
     trivial on an empty GPU, impossible next to the resident DiT. Loads a
     standalone VAE (~seconds), encodes only the needed windows (already-cached
     ones are skipped by the cache layer), frees it. Requires the fixed window
     pool (--num-windows K>0); unbounded random sampling can't be pre-encoded
-    (the CPU phase-1 shim at rollout time remains the fallback there)."""
+    (the CPU phase-1 shim at rollout time remains the fallback there).
+
+    Returns True when every needed window is cached — the caller then leaves
+    the model's VAE COMPLETELY untouched during preprocessing, which is what
+    the working upstream/probe configuration does."""
     if dataset.num_windows is None or not torch.cuda.is_available():
-        return
+        return False
     needed = {args.clip_index}
     if args.loss_batches > 0:
         needed |= set(range(min(len(dataset), args.loss_batches * args.loss_batch_size)))
@@ -295,17 +339,18 @@ def _pre_encode_windows(dataset, args, pre_cfg: WanBatchPreprocessConfig) -> Non
     order = {id(ep): i for i, ep in enumerate(dataset.episodes)}
     idxs = [i for i, (ep, _s) in enumerate(enum._pairs) if order[id(ep)] in needed]
     if not idxs:
-        return
+        return False
     from precompute_latents import _load_vae_only  # noqa: PLC0415 — sibling script, heavy import
 
     vae0 = _load_vae_only(Path(args.ckpt_dir), "cuda")
     vae0.dtype = torch.bfloat16
     pre0 = Wan22DiffusionForcingPreprocessor(vae=vae0, config=pre_cfg, condition_keys=("act",), cond_frames=1)
-    newly = 0
+    newly, ok = 0, False
     try:
         for raw in DataLoader(Subset(enum, idxs), batch_size=1):
             _bs, enc = pre0.precompute(raw)
             newly += enc
+        ok = True
         print(f"pre-encode (GPU, before the 5B build): {len(idxs)} windows ready "
               f"({newly} newly encoded) -> {pre_cfg.latent_cache_dir}")
     except torch.OutOfMemoryError:
@@ -313,6 +358,7 @@ def _pre_encode_windows(dataset, args, pre_cfg: WanBatchPreprocessConfig) -> Non
     finally:
         del pre0, vae0
         torch.cuda.empty_cache()
+    return ok
 
 
 def _to_uint8_frames(px: Tensor) -> "list":
@@ -380,6 +426,10 @@ def main() -> None:
     parser.add_argument("--loss-batches", type=int, default=4, help="Batches for the loss comparison (0 skips).")
     parser.add_argument("--loss-batch-size", type=int, default=1)
     parser.add_argument("--num-windows", type=int, default=16)
+    parser.add_argument("--letterbox", action="store_true",
+                        help="ACWM only: pad frames to Wan's native 1280:704 aspect. OFF by default — "
+                             "square 768^2 works fine on the frozen base (the earlier 'square = noise' "
+                             "was a base-corruption bug, since fixed). Kept as an opt-in.")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="DataLoader workers for loss/sweep loaders. Default 0: worker processes "
                              "deadlock with decord after CUDA init (known ACWM issue) and buy nothing "
@@ -479,6 +529,7 @@ def main() -> None:
             frame_stride=int(config.data.frame_stride or 1),
             sampling="random",
             num_windows=args.num_windows or None,
+            letterbox_aspect=(1280, 704) if args.letterbox else None,
         )
     else:
         _, dataset = build_metaworld_clip_dataset(
@@ -491,7 +542,7 @@ def main() -> None:
         )
     if not (0 <= args.clip_index < len(dataset)):
         raise ValueError(f"--clip-index {args.clip_index} out of range (dataset len {len(dataset)}).")
-    _pre_encode_windows(dataset, args, preprocess_cfg)
+    pre_encoded = _pre_encode_windows(dataset, args, preprocess_cfg)
 
     experiment = build_experiment(config)
     model = experiment.model.to(device)
@@ -505,13 +556,31 @@ def main() -> None:
         if unexpected:
             raise RuntimeError(f"checkpoint has {len(unexpected)} keys the model doesn't: {unexpected[:5]} ...")
     else:
+        # CRITICAL (2026-07-23): model.adapter.parameters() ALIASES the frozen
+        # base's params — the ActionWan adapter with condition_on_base_outputs
+        # holds references to base DiT layers, so ~825/1119 of its "parameters"
+        # ARE the 5B base's. Perturbing all of them corrupts the frozen base and
+        # every rollout collapses to noise (this masqueraded as the ACWM
+        # generation bug for days). Perturb ONLY params NOT shared with the base.
         with torch.no_grad():
-            for p in model.adapter.parameters():
+            base_ptrs = {p.data_ptr() for p in model.base_model.parameters()}
+            adapter_only = [p for p in model.adapter.parameters() if p.data_ptr() not in base_ptrs]
+            for p in adapter_only:
                 p.add_(0.02 * torch.randn_like(p))
-        print("RANDOM-INIT MODE: no checkpoint loaded; adapter perturbed (outputs non-zero but untrained).")
+        print(f"RANDOM-INIT MODE: perturbed {len(adapter_only)} adapter-only params "
+              f"(excluded base-aliased params to avoid corrupting the frozen 5B).")
 
     vae = model.base_model.wan.vae
-    vae.dtype = torch.bfloat16  # match training (speeds encode/decode; latents return fp32)
+    # Upstream builds this VAE with dtype=torch.float (fp32) and that attr drives
+    # `amp.autocast(dtype=self.dtype)` around every encode/decode. Training sets
+    # bf16 for speed, so PREPROCESSING matches training with bf16 — but the
+    # rollouts must run with the native fp32 attr restored: with bf16 autocast
+    # the i2v conditioning-frame encode of a flat, saturated ACWM frame
+    # quantises enough to break the anchor latent, and the base rollout comes
+    # out as pure noise (2026-07-23; MetaWorld's content tolerated it, which is
+    # why this hid for so long). The probe/upstream never touch this attr.
+    native_vae_dtype = vae.dtype
+    vae.dtype = torch.bfloat16  # preprocessing only; restored before the rollouts
 
     # Same geometry/cache config as the pre-encode pass -> guaranteed key hits.
     preprocessor = Wan22DiffusionForcingPreprocessor(
@@ -566,7 +635,13 @@ def main() -> None:
     # So: phase 1 CPU-encode (preprocessing only, then FULLY restore), phase 2
     # lazy decode-only shim that flips state after sampling finishes.
     wan_vae = model.base_model.wan.vae
-    if decode_cpu:
+    # Phase 1 runs ONLY as a fallback: when the GPU pre-encode pass above
+    # succeeded, every window is cached, preprocessing never calls the VAE,
+    # and we leave it BIT-IDENTICAL to what upstream built (the configuration
+    # the working probe uses). Touching it gratuitously on a cache hit is
+    # what kept the ACWM rollouts noisy (2026-07-23).
+    phase1_cpu = decode_cpu and not pre_encoded
+    if phase1_cpu:
         # Phase 1 — preprocessing under a temporary CPU VAE: a latent-cache
         # MISS at native res needs ~15 GiB transient, impossible next to the
         # resident 5B; on CPU it's fp32 and slow (minutes/window) but fits.
@@ -586,36 +661,65 @@ def main() -> None:
     raw_batch = next(iter(DataLoader(Subset(dataset, [args.clip_index]), batch_size=1)))
     batch = _call_preprocessor(preprocessor, raw_batch, train=False)
 
-    if decode_cpu:
-        # Restore the native GPU/bf16 VAE state for the rollouts — the
-        # conditioning-frame encode (1 frame) fits on GPU, and generation
-        # must see the VAE exactly as upstream built it.
-        wan_vae.model = saved[0].to(device).to(saved[2])
+    if phase1_cpu:
+        # Restore the native VAE state for the rollouts — generation must see
+        # the VAE exactly as upstream built it. CRITICAL: weights keep their
+        # OWN dtype; `saved[2]` is only the AUTOCAST dtype attr — converting
+        # the weights to it corrupts the anchor latent on this domain.
+        wan_vae.model = saved[0].to(device)
         wan_vae.scale = [s.to(device) if isinstance(s, Tensor) else s for s in saved[1]]
         wan_vae.dtype = saved[2]
         wan_vae.device = saved[3]
         wan_vae.decode, wan_vae.encode = saved[4], saved[5]
+        print("preprocessing done: VAE restored to its native state")
 
-        # Phase 2 — decode-only CPU shim (probe-validated): per decode call,
-        # flip to CPU fp32, decode, then RESTORE GPU/bf16 — the script runs
-        # TWO rollouts (base, adapted) and the second one's conditioning
-        # encode + generation need the native GPU state back.
+    # Restore the VAE's NATIVE autocast dtype for the rollouts (see the comment
+    # at its assignment): generation must run the conditioning encode exactly
+    # as upstream does, or the anchor latent is corrupted on this domain.
+    if vae.dtype != native_vae_dtype:
+        vae.dtype = native_vae_dtype
+        print(f"rollouts: VAE autocast dtype restored to native {native_vae_dtype}")
+
+    if decode_cpu:
+        # Phase 2 — decode-only shim (exactly what the working probe does):
+        # per decode call flip to CPU fp32, decode, then restore, since the
+        # script runs TWO rollouts and the second needs the native state back.
+        # Weight dtype is captured here, NOT assumed to equal .dtype (which is
+        # the autocast attr, bf16, while the weights are fp32 as loaded).
         _gpu_decode = wan_vae.decode
+        _native_dev = wan_vae.device
+        _native_attr_dtype = wan_vae.dtype
+        _native_wt_dtype = next(wan_vae.model.parameters()).dtype
 
         def _cpu_roundtrip_decode(zs):
-            print("decode: CPU fp32 (VAE restored to GPU/bf16 afterwards)", flush=True)
+            print("decode: CPU fp32 (VAE restored afterwards)", flush=True)
             wan_vae.model = wan_vae.model.to("cpu").float()
             wan_vae.scale = [s.cpu() if isinstance(s, Tensor) else s for s in wan_vae.scale]
             wan_vae.dtype = torch.float32
             try:
                 return _gpu_decode([z.detach().float().cpu() for z in zs])
             finally:
-                wan_vae.model = wan_vae.model.to(device).to(saved[2])
-                wan_vae.scale = [s.to(device) if isinstance(s, Tensor) else s for s in wan_vae.scale]
-                wan_vae.dtype = saved[2]
+                wan_vae.model = wan_vae.model.to(_native_dev).to(_native_wt_dtype)
+                wan_vae.scale = [s.to(_native_dev) if isinstance(s, Tensor) else s for s in wan_vae.scale]
+                wan_vae.dtype = _native_attr_dtype
 
         wan_vae.decode = _cpu_roundtrip_decode
-        print("rollouts: VAE on GPU/bf16; each final decode round-trips through CPU")
+        print(f"rollouts: VAE untouched (weights {_native_wt_dtype}, autocast {_native_attr_dtype}); "
+              "only the final decode round-trips through CPU")
+
+    # Dump the anchor latent `z` from upstream i2v's vae.encode([img]) — the
+    # single tensor that decides the rollout. Diff against the probe's.
+    _cmp_encode = wan_vae.encode
+
+    def _encode_dump(vs):
+        out = _cmp_encode(vs)
+        z = out[0].float()
+        print(f"ANCHOR z: {tuple(z.shape)} mean={float(z.mean()):.4f} std={float(z.std()):.4f} "
+              f"absmax={float(z.abs().max()):.3f}", flush=True)
+        return out
+
+    wan_vae.encode = _encode_dump
+
     cond = batch.get("cond") if isinstance(batch.get("cond"), dict) else {}
     actions = cond.get("action")
     e = config.training.extra
@@ -673,6 +777,7 @@ def main() -> None:
         kw["context_null"] = context_null.to(device) if context_null is not None else None
     print(f"\n=== Rollout: clip {args.clip_index}, {args.num_steps} steps, {frame_num} frames, "
           f"guide_scale={kw['guide_scale']}, prompt={'on' if context is not None else 'off'} ===")
+    _fingerprint_generate_inputs(frame, kw, model.base_model)
 
     with torch.no_grad():
         base_px = model.base_model.generate(frame, **kw).cpu()

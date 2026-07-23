@@ -29,8 +29,11 @@ Then train normally (latent cache is on by default):
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
 
 import torch
 from torch.utils.data import DataLoader
@@ -52,6 +55,23 @@ _DTYPES = {
     "fp16": torch.float16, "float16": torch.float16,
     "fp32": torch.float32, "float32": torch.float32,
 }
+
+
+def _make_bar(total: int, mode: str):
+    """A tqdm bar over *windows* (not batches), or ``None`` to use plain periodic
+    prints. ``auto`` picks the bar only on a TTY: under Slurm/nohup the output is a
+    file, where a bar's carriage returns turn the log into one unreadable line."""
+    if mode == "plain":
+        return None
+    if mode == "auto" and not sys.stderr.isatty():
+        return None
+    try:
+        from tqdm.auto import tqdm  # noqa: PLC0415 — optional dependency
+    except ImportError:
+        if mode == "bar":
+            print("warning: --progress bar requested but tqdm is not installed; using plain prints.")
+        return None
+    return tqdm(total=total, unit="win", desc="encoding", dynamic_ncols=True, smoothing=0.05)
 
 
 def _load_vae_only(ckpt_dir: Path, device: str):
@@ -94,6 +114,8 @@ def main() -> None:
                         help="Where to write latents. Default: <hdf5>.latents/ (same default as training).")
     parser.add_argument("--limit", type=int, default=None,
                         help="Encode only the first N windows then stop (partial cache; safe to resume later).")
+    parser.add_argument("--progress", choices=["auto", "bar", "plain"], default="auto",
+                        help="auto: tqdm bar on a TTY, periodic lines when redirected to a log (default).")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -180,16 +202,29 @@ def main() -> None:
     print(f"precomputing latents -> {cache_dir}  ({total} windows"
           + (f", capped from {len(precompute_set)} by --limit" if args.limit is not None else "") + ")")
 
-    done, encoded, t0 = 0, 0, time.time()
+    bar = _make_bar(total, args.progress)
+    done, encoded, t0, last_report = 0, 0, time.time(), 0
     for raw_batch in loader:
         bs, enc = preprocessor.precompute(raw_batch)
         done += bs
         encoded += enc
-        if done % 25 == 0 or done >= total:
+        if bar is not None:
+            bar.update(bs)
+            bar.set_postfix(encoded=encoded, cached=done - encoded, refresh=False)
+        # Plain fallback (log files / non-tty): report every ~25 windows *since the
+        # last report*, not on `done % 25` — with --batch-size 4 the latter only
+        # aligns every 100 windows (and never at all for batch sizes coprime with
+        # 25), which reads as a hang.
+        elif done - last_report >= 25 or done >= total:
+            last_report = done
+            rate = (time.time() - t0) / max(done, 1)
+            eta = rate * (total - done) / 60.0
             print(f"  {done}/{total} windows  (encoded {encoded}, cached {done - encoded}) "
-                  f"{(time.time() - t0) / max(done, 1):.2f}s/clip", flush=True)
+                  f"{rate:.2f}s/clip  eta {eta:.0f}min", flush=True)
         if done >= total:
             break
+    if bar is not None:
+        bar.close()
     print(f"done: encoded {encoded} new, {done - encoded} already cached "
           f"-> {preprocessor.latent_cache.num_files()} files in {cache_dir}")
 
