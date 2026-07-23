@@ -45,11 +45,11 @@ done
 test -d "$CACHE" || echo "WARNING: no shared latent cache at $CACHE — run jobs/submit_precompute_acwmphys.sh first (training will encode on the fly, slow)"
 
 python scripts/train_wan22_i2v_metaworld_external.py \
-    --config configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
+    --config configs/wan22/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
     --dataset acwm_phys \
     --data-dir "$ROOT/ind_train" \
     --eval-data-dir "$ROOT/ind_test" \
     --latent-cache-dir "$CACHE" \
     --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-    --batch-size $BATCH_SIZE --num-windows 8 --max-area 589824 --steps 5000000 \
+    --batch-size $BATCH_SIZE --num-windows 8 --max-area 901120 --steps 5000000 \
     --wandb-run-name acwm-pushblock-gatelow-cap09-shift5 "$@"

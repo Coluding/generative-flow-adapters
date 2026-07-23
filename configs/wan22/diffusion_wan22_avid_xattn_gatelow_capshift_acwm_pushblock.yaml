@@ -10,7 +10,7 @@
 #
 # Data facts (verified against the release 2026-07-22): 1500 ind_train
 # episodes, fixed 66 frames @ 10 fps, videos released at 1024x1024 (the
-# paper trains at 240x240 — we DOWNSCALE 1024 -> max_area 589824 = Wan's
+# paper trains at 240x240 — we letterbox to 1280:704 and downscale to native = Wan's
 # native regime; no upscaling involved). Actions [66, 2] in [-1, 1].
 # temporal_length 41 <= 66 (97 would NOT fit these episodes).
 # Reference numbers (paper Table 1, ACWM-DiT-S from scratch, 50 steps):
@@ -19,9 +19,9 @@
 # 768x768) until we match protocols. Don't put their numbers next to ours
 # on a slide without that caveat.
 #
-# Precompute latents first (see jobs/submit_precompute_acwmphys.sh), then:
+# Precompute latents first (see jobs/experiments_cluster/infra/submit_precompute_acwmphys.sh), then:
 #   python scripts/train_wan22_i2v_metaworld_external.py \
-#     --config configs/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
+#     --config configs/wan22/diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml \
 #     ... (needs the --dataset acwm_phys switch in the train script — pending)
 
 name: diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock
@@ -43,7 +43,7 @@ model:
     dtype: bf16
     latent_channels: 48
     temporal_length: 41      # 66-frame episodes: 41-frame windows, 25 valid starts
-    max_area: 589824         # 1024^2 source downscaled to Wan-native ~768^2
+    max_area: 901120         # NATIVE 1280x704 (letterboxed source) — square 768^2 gives pure-noise base rollouts (2026-07-23 finding)
     latent_height: 16
     latent_width: 16
     # Prompt conditioning: prompt-free base rollouts on this domain are pure
@@ -53,7 +53,7 @@ model:
     # configs/prompts/acwm_pushblock.yaml), switch to:
     #   text_prompts_file: configs/prompts/acwm_pushblock.yaml
     # and set training.extra.inference_use_prompt: true below.
-    text_prompts_file: null  # frame-only until the probe validates prompting
+    text_prompts_file: configs/prompts/acwm_pushblock.yaml
 
 adapter:
   type: output
@@ -104,10 +104,10 @@ training:
     sigma_shift: 5.0          # train-only; eval stays U(0,1)
     inference_guide_scale: 5.0
     inference_shift: 5.0
-    inference_use_prompt: false
+    inference_use_prompt: true
     inference_frame_num: 41
     inference_seed: 0
-    inference_max_area: 589824
+    inference_max_area: 901120
     cond_frames: 1
     cond_frames_dist:
       1: 1

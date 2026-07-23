@@ -58,6 +58,6 @@ trap 'kill "$GPU_MONITOR_PID" 2>/dev/null || true' EXIT
 
 # ---- run --------------------------------------------------------------------
 srun uv run python scripts/train_wan22_i2v_metaworld.py \
-    --config configs/diffusion_avid_shortcut_metaworld.yaml \
+    --config configs/dynamicrafter/diffusion_avid_shortcut_metaworld.yaml \
     --hdf5 "../scratch-shared/metaworld/mw_zoom13.hdf5" \
     --batch-size $BATCH_SIZE "$@"

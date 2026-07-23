@@ -1,7 +1,7 @@
 # DynamiCrafter-style 3D-UNet output adapter, sized for the Wan2.2 base.
 #
 # This is act_cond_diffusion_145M.yaml adapted to sit as Δ_φ on the FROZEN
-# Wan2.2-TI2V-5B flow base (see configs/diffusion_wan22_dcunet_output_metaworld.yaml).
+# Wan2.2-TI2V-5B flow base (see configs/wan22/diffusion_wan22_dcunet_output_metaworld.yaml).
 # Only `model.params.unet_config.params` is consumed by the output-adapter
 # factory (DynamicCrafterOutputAdapter._load_unet_params) — the AVID
 # autoencoder / CLIP / lightning blocks are NOT loaded here, so they are dropped.

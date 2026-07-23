@@ -5,7 +5,7 @@ but the adapter is the small action-conditioned DynamiCrafter UNet (AVID 11M)
 attached as an *output* adapter on top of the frozen base UNet (the
 ``avid_mask_mix`` composition: ``base * sigmoid(gate) + adapter * (1 - gate)``).
 
-Default config: ``configs/diffusion_avid_shortcut_metaworld.yaml``. The
+Default config: ``configs/dynamicrafter/diffusion_avid_shortcut_metaworld.yaml``. The
 trainer:
 
     1. samples ``step_level`` per batch (Uniform{min, max} from
@@ -19,7 +19,7 @@ trainer:
 
 Run:
     python scripts/train_avid_shortcut_metaworld.py \\
-        --config configs/diffusion_avid_shortcut_metaworld.yaml \\
+        --config configs/dynamicrafter/diffusion_avid_shortcut_metaworld.yaml \\
         --hdf5 ds/metaworld_corner2.hdf5 \\
         --steps 200 --batch-size 2
 """
@@ -60,7 +60,7 @@ def trainable_parameter_count(model: torch.nn.Module) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_avid_shortcut_metaworld.yaml")
+    parser.add_argument("--config", default="configs/dynamicrafter/diffusion_avid_shortcut_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2_large.hdf5")
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=6)

@@ -174,6 +174,13 @@ class MetaWorldTranslator(Translator):
             self._file.close()
             self._file = None
 
+    def __getstate__(self) -> dict:
+        # An open h5py.File handle is not picklable; spawn-based DataLoader
+        # workers re-open their own lazily via _open().
+        state = self.__dict__.copy()
+        state["_file"] = None
+        return state
+
     def __del__(self) -> None:
         try:
             self.close()

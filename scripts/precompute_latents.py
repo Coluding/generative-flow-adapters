@@ -70,7 +70,7 @@ def _load_vae_only(ckpt_dir: Path, device: str):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_i2v_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="MetaWorld HDF5 to encode.")
     parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
                         help="Dataset family. acwm_phys reads a split dir of the HF t1an/ACWM-Phys release.")
@@ -79,6 +79,8 @@ def main() -> None:
                              "e.g. /scratch-shared/$USER/acwm-phys/rigid_dynamics/push_block/ind_train")
     parser.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B", help="Dir holding Wan2.2_VAE.pth.")
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--temporal-length", type=int, default=None,
+                        help="Override config model.extra.temporal_length (must match the consumer's window).")
     parser.add_argument("--sampling", choices=["random", "exhaustive"], default="random")
     parser.add_argument("--num-windows", type=int, default=16,
                         help="K deterministic windows/episode to cache (must match training's --num-windows). "
@@ -98,6 +100,8 @@ def main() -> None:
     config = load_config(args.config)
 
     # Geometry, exactly as train_wan22_i2v_metaworld_external.py derives it.
+    if args.temporal_length is not None:
+        config.model.extra["temporal_length"] = int(args.temporal_length)
     temporal_length = int(config.model.extra.get("temporal_length", 17))
     latent_height = int(config.model.extra.get("latent_height", 16))
     latent_width = int(config.model.extra.get("latent_width", 16))
@@ -162,12 +166,17 @@ def main() -> None:
         )
 
     total = len(precompute_set) if args.limit is None else min(args.limit, len(precompute_set))
-    loader = DataLoader(precompute_set, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, drop_last=False)
     if max_area is not None:
         vid = dataset[0]["video"]
         print(f"resize budget max_area={max_area} (align {align}) | source {int(vid.shape[2])}x{int(vid.shape[1])}px"
               f" | {temporal_length}f windows")
+    # The probe above opened a video/HDF5 reader in the parent; drop it and use
+    # spawn workers — decord/FFmpeg (and h5py) handles are not fork-safe, and
+    # fork-after-decord deadlocks the first worker get_batch().
+    dataset.translator.close()
+    loader = DataLoader(precompute_set, batch_size=args.batch_size, shuffle=False,
+                        num_workers=args.num_workers, drop_last=False,
+                        multiprocessing_context="spawn" if args.num_workers > 0 else None)
     print(f"precomputing latents -> {cache_dir}  ({total} windows"
           + (f", capped from {len(precompute_set)} by --limit" if args.limit is not None else "") + ")")
 

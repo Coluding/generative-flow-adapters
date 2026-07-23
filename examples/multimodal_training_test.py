@@ -11,7 +11,7 @@ synthetic batch for a real MetaWorld loader (+ a real checkpoint) to turn this
 into an actual training run.
 
     python examples/multimodal_training_test.py \
-        --config configs/multimodal_dynamicrafter.yaml --steps 3
+        --config configs/dynamicrafter/multimodal_dynamicrafter.yaml --steps 3
 """
 
 from __future__ import annotations

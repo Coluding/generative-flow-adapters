@@ -11,7 +11,7 @@ Everything below is staged in this repo. Thesis-vault context:
 cd ~/generative-flow-adapters
 git status          # check for drifted local edits (e.g. wan22_replace_no_shortcut.yaml) — stash/commit them first
 git pull
-bash jobs/download_acwmphys.sh          # ~120 MB, minutes; verifies all 3 splits
+bash jobs/experiments_cluster/infra/download_acwmphys.sh   # ~120 MB, minutes; verifies all 3 splits
 ```
 
 What the pull brings: eval `action_seq` fix + fail-loud adapter guard (the
@@ -28,10 +28,10 @@ comparable to them. Revisit only as its own controlled change.
 ## 1. Submit (in this order)
 
 ```bash
-sbatch jobs/submit_overfit_triangle_capshift.sh   # MetaWorld: 3 overfit arms (1000 steps each) + full-data cap+shift until walltime
-sbatch jobs/submit_precompute_acwmphys.sh         # ACWM Push Cube latents, all 3 splits -> shared cache (~13.6k windows)
+sbatch jobs/experiments_cluster/metaworld/submit_overfit_triangle_capshift.sh   # MetaWorld: 3 overfit arms (1000 steps each) + full-data cap+shift until walltime
+sbatch jobs/experiments_cluster/infra/submit_precompute_acwmphys.sh             # ACWM Push Cube latents, all 3 splits -> shared cache (~13.6k windows)
 # after the precompute job finishes:
-sbatch jobs/submit_train_acwm_pushblock.sh        # first ACWM training run (gatelow + cap 0.9 + shift 5.0)
+sbatch jobs/experiments_cluster/acwm_phys/submit_train_acwm_pushblock.sh        # first ACWM training run (gatelow + cap 0.9 + shift 5.0)
 ```
 
 The two first jobs are independent — they can run concurrently if two GPUs
@@ -73,7 +73,7 @@ Notes:
 - MetaWorld arms: 41f/batch-2/single-task-corner2 vs the cluster's
   97f/batch-12/five-task — trends (gate saturation, delta sign) transfer;
   absolute numbers don't.
-- ACWM arm: prereq `bash jobs/download_acwmphys.sh` (~120 MB into
+- ACWM arm: prereq `bash jobs/experiments_cluster/infra/download_acwmphys.sh` (~120 MB into
   `ds/acwm-phys/`); first step VAE-encodes the clip on cache miss (~4 s,
   measured), then it's cached — no precompute needed for one episode. Runs
   the full intended settings (mask_mix + gate_cap 0.9 + sigma_shift 5.0,

@@ -44,6 +44,7 @@ class ACWMPhysTranslator(Translator):
         fs_value: int = 1,
         fps: int = 10,
         caption_template: str = "a robot pushing objects on a table, {env_name}",
+        letterbox_aspect: tuple[int, int] | None = (1280, 704),
     ) -> None:
         self.data_dir = Path(data_dir)
         meta_path = self.data_dir / "metadata.pt"
@@ -58,10 +59,28 @@ class ACWMPhysTranslator(Translator):
         self.env_name = env_name or f"{self.data_dir.parent.name}-{self.data_dir.name}"
         self.fs_value = int(fs_value)
         self.fps = int(fps)
+        # Letterbox the square source frames onto a white canvas of Wan's
+        # native aspect (default 1280:704). MEASURED 2026-07-23: the frozen
+        # TI2V-5B produces pure noise on this domain at square 768x768, but
+        # coherent in-domain video with the same frame letterboxed at native
+        # 1280x704 (stock upstream generate.py, one variable flipped). The
+        # downstream aspect-preserving resize (best_output_size, max_area
+        # 901120) then lands exactly on 1280x704. White matches the scene
+        # background. None disables (raw square frames).
+        self.letterbox_aspect = letterbox_aspect
         self.caption = caption_template.format(env_name=self.data_dir.parent.name)
         # metadata.pt is a plain list[dict] of tensors/ints/strs (torch>=2.6
         # defaults weights_only=True which rejects it).
         self._meta: list[dict] = torch.load(meta_path, map_location="cpu", weights_only=False)
+        # Convert per-episode action tensors to numpy ONCE: spawn-based
+        # DataLoader workers pickle the dataset, and torch shares each tensor
+        # through its own file descriptor — 1500 episodes blow the fd ulimit
+        # ("unable to open shared memory object ... Too many open files").
+        # Numpy arrays pickle by value (~1 MB total for an env) — no fds.
+        for entry in self._meta:
+            actions = entry.get("actions")
+            if isinstance(actions, torch.Tensor):
+                entry["actions"] = actions.to(torch.float32).numpy()
         # Lazily opened per process (DataLoader workers fork before first
         # __getitem__, so each worker builds its own readers).
         self._readers: dict[int, object] = {}
@@ -105,8 +124,10 @@ class ACWMPhysTranslator(Translator):
 
         frame_indices = list(range(start, start + pixel_span, stride))
         video = self._reader(episode_idx).get_batch(frame_indices).asnumpy()  # uint8 [T, H, W, C]
+        if self.letterbox_aspect is not None:
+            video = self._letterbox(video)
 
-        actions = entry["actions"][start : start + action_span].to(torch.float32)
+        actions = torch.as_tensor(entry["actions"][start : start + action_span], dtype=torch.float32)
         if stride > 1:
             actions = actions.reshape(length, stride, -1).sum(dim=1)
 
@@ -123,5 +144,28 @@ class ACWMPhysTranslator(Translator):
             "episode_idx": episode_idx,
         }
 
+    def _letterbox(self, video: np.ndarray) -> np.ndarray:
+        """Pad uint8 [T, H, W, C] frames onto a white canvas of
+        ``letterbox_aspect`` (content centered, no scaling here — the
+        preprocessor's aspect-preserving resize handles the final size)."""
+        t, h, w, c = video.shape
+        aw, ah = self.letterbox_aspect
+        target_w = max(w, int(round(h * aw / ah)))
+        target_h = max(h, int(round(w * ah / aw)))
+        if target_w == w and target_h == h:
+            return video
+        canvas = np.full((t, target_h, target_w, c), 255, dtype=video.dtype)
+        y0 = (target_h - h) // 2
+        x0 = (target_w - w) // 2
+        canvas[:, y0 : y0 + h, x0 : x0 + w] = video
+        return canvas
+
     def close(self) -> None:
         self._readers.clear()
+
+    def __getstate__(self) -> dict:
+        # decord VideoReaders are neither picklable nor fork-safe; spawn-based
+        # DataLoader workers re-open their own lazily via _reader().
+        state = self.__dict__.copy()
+        state["_readers"] = {}
+        return state

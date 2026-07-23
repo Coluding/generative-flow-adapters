@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../.."
 source .venv/bin/activate
 
 python scripts/train_wan22_i2v_metaworld_external.py \
-    --config configs/diffusion_wan22_avid_xattn_gatelow_nobase_gatecap_overfit_metaworld.yaml \
+    --config configs/wan22/diffusion_wan22_avid_xattn_gatelow_nobase_gatecap_overfit_metaworld.yaml \
     --hdf5 ds/metaworld_corner2.hdf5 --ckpt-dir ckpts/Wan2.2-TI2V-5B \
     --overfit-index 0 --num-windows 1 --temporal-length 41 \
     --steps 800 --batch-size 2 --no-eval-gen \

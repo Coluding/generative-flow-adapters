@@ -2,7 +2,7 @@
 plug-and-play building approach** (``BaseVideoModel`` + ``AdaptedModel``).
 
 Same experiment as ``scripts/train_wan22_i2v_metaworld.py`` (same
-``configs/diffusion_wan22_avid_i2v_metaworld.yaml``, same AVID adapter, same
+``configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml``, same AVID adapter, same
 diffusion-forcing preprocessor and loss). The ONLY difference is how the frozen
 base is built:
 
@@ -25,7 +25,7 @@ Requires a CUDA device (the upstream WanTI2V pins ``cuda``).
 Smoke run:
 
     python scripts/train_wan22_i2v_metaworld_external.py \
-        --config configs/diffusion_wan22_avid_i2v_metaworld.yaml \
+        --config configs/wan22/diffusion_wan22_avid_i2v_metaworld.yaml \
         --hdf5 ds/metaworld_corner2.hdf5 \
         --ckpt-dir ckpts/Wan2.2-TI2V-5B \
         --steps 5 --batch-size 1
@@ -55,7 +55,7 @@ _WAN22_VAE_SPATIAL_STRIDE = 16
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="Path to MetaWorld HDF5 file")
     parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
                         help="Dataset family. acwm_phys reads a split dir of the HF t1an/ACWM-Phys release "
@@ -393,12 +393,17 @@ def main() -> None:
         else:
             print("  warning: dataset too small for the requested val split; eval disabled.")
 
+    # decord/FFmpeg (and h5py) handles are not fork-safe: the geometry probe below
+    # touches the translator in the parent, and fork-after-decord deadlocks the
+    # first worker get_batch(). Spawn workers re-open their readers lazily.
+    _mp_ctx = "spawn" if args.num_workers > 0 else None
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=(dataset.sampling == "exhaustive"),
         num_workers=args.num_workers,
         drop_last=True,
+        multiprocessing_context=_mp_ctx,
     )
     eval_loader = None
     if eval_dataset is not None:
@@ -408,6 +413,7 @@ def main() -> None:
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=True,
+            multiprocessing_context=_mp_ctx,
         )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -420,6 +426,7 @@ def main() -> None:
         from generative_flow_adapters.data.wan_batch_preprocessor import best_output_size
 
         vid = dataset[0]["video"]  # [T, H, W, C]
+        dataset.translator.close()  # probe opened a parent-process reader; workers open their own
         src_h, src_w = int(vid.shape[1]), int(vid.shape[2])
         ow, oh = best_output_size(src_w, src_h, align, align, max_area)
         lat_f = 1 + (temporal_length - 1) // 4
@@ -453,7 +460,8 @@ def main() -> None:
                       "random draw per episode; training will still miss most windows. Use K>0.")
             precompute_set = dataset
         full_loader = DataLoader(precompute_set, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, drop_last=False)
+                                 num_workers=args.num_workers, drop_last=False,
+                                 multiprocessing_context=_mp_ctx)
         print(f"precomputing latents -> {latent_cache_dir}  ({len(precompute_set)} windows)")
         total = len(precompute_set)
         done, encoded, t0 = 0, 0, _time.time()

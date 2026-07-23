@@ -11,7 +11,7 @@ the base velocity; only the adapter + condition encoder train.
 Smoke run (real Wan-VAE + DiT already downloaded):
 
     python scripts/train_wan_shortcut_metaworld.py \
-        --config configs/diffusion_wan_shortcut_metaworld.yaml \
+        --config configs/wan21/diffusion_wan_shortcut_metaworld.yaml \
         --hdf5 ds/metaworld_corner2.hdf5 \
         --ckpt-dir ckpts/Wan2.1-T2V-1.3B \
         --steps 5 --batch-size 1
@@ -37,7 +37,7 @@ from generative_flow_adapters.training.trainer import Trainer
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan_avid_shortcut_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan21/diffusion_wan_avid_shortcut_metaworld.yaml")
     parser.add_argument(
         "--hdf5",
         default="ds/metaworld_corner2.hdf5",

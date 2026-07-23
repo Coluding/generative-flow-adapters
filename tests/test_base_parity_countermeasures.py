@@ -199,7 +199,7 @@ class TestACWMPhysTranslator:
         tr = ACWMPhysTranslator(str(split_dir))
         ep = tr.list_episodes()[0]
         clip = tr.load_clip(ep, start=0, length=5, stride=2)
-        raw = tr._meta[0]["actions"][:10].to(torch.float32)
+        raw = torch.as_tensor(tr._meta[0]["actions"][:10], dtype=torch.float32)
         expected = raw.reshape(5, 2, -1).sum(dim=1)
         assert torch.allclose(clip["act"], expected)
 

@@ -5,7 +5,7 @@
 # latent (prediction = base + delta). Uses the tiny CPU Wan config and random
 # weights, so it runs without flash-attn or the real checkpoint:
 #
-#   python examples/training_test.py --config configs/wan_output_adapter.yaml --steps 3
+#   python examples/training_test.py --config configs/wan21/wan_output_adapter.yaml --steps 3
 name: wan_output_adapter
 
 model:

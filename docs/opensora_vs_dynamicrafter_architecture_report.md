@@ -258,7 +258,7 @@ When porting a DynamiCrafter-style adapter idea to OpenSora:
 ## 6) Configuration Anchors in This Repo
 
 - OpenSora example config:
-  - `configs/opensora_output_adapter.yaml:12-70`
+  - `configs/opensora/opensora_output_adapter.yaml:12-70`
 - DynamiCrafter example config:
   - `configs/diffusion_output_dynamicrafter.yaml:3-44`
 

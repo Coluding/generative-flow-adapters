@@ -80,25 +80,25 @@ run_arm () {
 
 # ---- 1) replace-nobase overfit ----------------------------------------------
 run_arm "replace-nobase-overfit" scripts/train_wan22_i2v_metaworld_external.py \
-    --config configs/diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld.yaml \
+    --config configs/wan22/diffusion_wan22_avid_xattn_replace_nobase_overfit_metaworld.yaml \
     $COMMON $OVERFIT \
     --wandb-run-name overfit-single-clip-replace-nobase
 
 # ---- 2) gatelow-nobase overfit, raw gate ------------------------------------
 run_arm "gatelow-nobase-overfit-raw" scripts/train_wan22_i2v_metaworld_external.py \
-    --config configs/diffusion_wan22_avid_xattn_gatelow_nobase_overfit_metaworld.yaml \
+    --config configs/wan22/diffusion_wan22_avid_xattn_gatelow_nobase_overfit_metaworld.yaml \
     $COMMON $OVERFIT \
     --wandb-run-name overfit-single-clip-gatelow-nobase
 
 # ---- 3) gatelow-nobase overfit, gate capped at 0.9 --------------------------
 run_arm "gatelow-nobase-overfit-cap09" scripts/train_wan22_i2v_metaworld_external.py \
-    --config configs/diffusion_wan22_avid_xattn_gatelow_nobase_gatecap_overfit_metaworld.yaml \
+    --config configs/wan22/diffusion_wan22_avid_xattn_gatelow_nobase_gatecap_overfit_metaworld.yaml \
     $COMMON $OVERFIT \
     --wandb-run-name overfit-single-clip-gatelow-nobase-cap09
 
 # ---- 4) full-data gatelow + gate_cap + sigma_shift (until walltime) ---------
 run_arm "gatelow-cap09-sigmashift5-fulldata" scripts/train_wan22_i2v_metaworld_external.py \
-    --config configs/diffusion_wan22_avid_xattn_gatelow_cap_sigmashift_metaworld.yaml \
+    --config configs/wan22/diffusion_wan22_avid_xattn_gatelow_cap_sigmashift_metaworld.yaml \
     $COMMON \
     --batch-size $BATCH_SIZE --num-windows 8 --steps 5000000 \
     --wandb-run-name gatelow-cap09-sigmashift5

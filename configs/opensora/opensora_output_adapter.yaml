@@ -5,7 +5,7 @@
 # Similar to AVID: combined_output = base_output + adapter_output
 #
 # Usage:
-#   python examples/opensora_fake_training.py --config configs/opensora_output_adapter.yaml
+#   python examples/opensora_fake_training.py --config configs/opensora/opensora_output_adapter.yaml
 
 name: opensora_output_adapter
 

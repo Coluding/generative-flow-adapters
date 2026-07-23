@@ -150,7 +150,12 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         # frame's patch tokens.
         t = frame_mask * (sigma.view(batch_size, 1) * self.config.timestep_scale)
 
-        cond = self._build_condition(batch, batch_size)
+        # Pass `train` through (fix 2026-07-23): omitting it defaulted to True,
+        # so EVAL batches drew a random, unseeded pool prompt instead of the
+        # deterministic pool[0] — nondeterministic eval, and the probable cause
+        # of the ACWM compare rollouts failing while the pinned-prompt probe
+        # succeeded (only pool[0] was ever validated against the base).
+        cond = self._build_condition(batch, batch_size, train=train)
         return {
             "x_t": x_t,
             "t": t,

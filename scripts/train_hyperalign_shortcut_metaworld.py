@@ -2,7 +2,7 @@
 
 Same pipeline as ``scripts/train_hyperalign_metaworld.py`` (HDF5 →
 MetaWorldTranslator → DynamiCrafterBatchPreprocessor → trainer) but pointed
-at ``configs/diffusion_hyperalign_shortcut_metaworld.yaml``. The trainer
+at ``configs/dynamicrafter/diffusion_hyperalign_shortcut_metaworld.yaml``. The trainer
 internally:
 
     1. samples a random ``step_level`` per batch (Uniform{min, max} configured
@@ -16,7 +16,7 @@ internally:
 
 Run:
     python scripts/train_hyperalign_shortcut_metaworld.py \\
-        --config configs/diffusion_hyperalign_shortcut_metaworld.yaml \\
+        --config configs/dynamicrafter/diffusion_hyperalign_shortcut_metaworld.yaml \\
         --hdf5 ds/metaworld_corner2.hdf5 \\
         --steps 200 --batch-size 2
 """
@@ -57,7 +57,7 @@ def trainable_parameter_count(model: torch.nn.Module) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_hyperalign_shortcut_metaworld.yaml")
+    parser.add_argument("--config", default="configs/dynamicrafter/diffusion_hyperalign_shortcut_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)

@@ -1,0 +1,117 @@
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/motioner.py:30: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/motioner.py:41: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/model_s2v.py:61: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/model_s2v.py:79: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+loaded Wan2.2 VAE (only) on cuda, encode dtype=bf16
+resize budget max_area=589824 (align 32) | source 1024x1024px | 41f windows
+precomputing latents -> ds/acwm-phys/rigid_dynamics/push_block/ind_train.latents  (24000 windows)
+Traceback (most recent call last):
+  File "/home/lukas/projects/generative-flow-adapters/scripts/precompute_latents.py", line 194, in <module>
+    main()
+    ~~~~^^
+  File "/home/lukas/projects/generative-flow-adapters/scripts/precompute_latents.py", line 180, in main
+    for raw_batch in loader:
+                     ^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/utils/data/dataloader.py", line 494, in __iter__
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/utils/data/dataloader.py", line 427, in _get_iterator
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/utils/data/dataloader.py", line 1170, in __init__
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/multiprocessing/process.py", line 121, in start
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/multiprocessing/context.py", line 295, in _Popen
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/multiprocessing/popen_spawn_posix.py", line 32, in __init__
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/multiprocessing/popen_fork.py", line 20, in __init__
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/multiprocessing/popen_spawn_posix.py", line 47, in _launch
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/multiprocessing/reduction.py", line 60, in dump
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/multiprocessing/reductions.py", line 618, in reduce_storage
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/storage.py", line 451, in wrapper
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/storage.py", line 526, in _share_fd_cpu_
+RuntimeError: unable to open shared memory object </torch_614318_506871989_972> in read-write mode: Too many open files (24)
+Exception ignored in atexit callback <bound method TemporaryDirectory.cleanup of <TemporaryDirectory '/tmp/tmp_6kmcpcq'>>:
+Traceback (most recent call last):
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/tempfile.py", line 955, in cleanup
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/tempfile.py", line 935, in _rmtree
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/shutil.py", line 763, in rmtree
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/shutil.py", line 707, in _rmtree_safe_fd
+  File "/home/lukas/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/shutil.py", line 670, in _rmtree_safe_fd
+OSError: [Errno 24] Too many open files: '/tmp/tmp_6kmcpcq'
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/motioner.py:30: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/motioner.py:41: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/model_s2v.py:61: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/s2v/model_s2v.py:79: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @amp.autocast(enabled=False)
+loaded Wan2.2 VAE (only) on cuda, encode dtype=bf16
+resize budget max_area=589824 (align 32) | source 1024x1024px | 41f windows
+precomputing latents -> ds/acwm-phys/rigid_dynamics/push_block/ind_train.latents  (24000 windows)
+/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py:1028: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with amp.autocast(dtype=self.dtype):
+Traceback (most recent call last):
+  File "/home/lukas/projects/generative-flow-adapters/scripts/precompute_latents.py", line 194, in <module>
+    main()
+    ~~~~^^
+  File "/home/lukas/projects/generative-flow-adapters/scripts/precompute_latents.py", line 181, in main
+    bs, enc = preprocessor.precompute(raw_batch)
+              ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/lukas/projects/generative-flow-adapters/src/generative_flow_adapters/data/wan_batch_preprocessor.py", line 378, in precompute
+    self._encode_z0(raw_video, batch, batch_size)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/src/generative_flow_adapters/data/wan_batch_preprocessor.py", line 326, in _encode_z0
+    encoded = self.vae.encode([miss_video[j] for j in range(len(miss_idx))])
+  File "/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py", line 1030, in encode
+    self.model.encode(u.unsqueeze(0),
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+                      self.scale).float().squeeze(0)
+                      ^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py", line 791, in encode
+    out = self.encoder(
+        x[:, :, :1, :, :],
+        feat_cache=self._enc_feat_map,
+        feat_idx=self._enc_conv_idx,
+    )
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py", line 582, in forward
+    x = layer(x, feat_cache, feat_idx)
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py", line 450, in forward
+    x = module(x, feat_cache, feat_idx)
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py", line 230, in forward
+    x = layer(x, feat_cache[idx])
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lukas/projects/generative-flow-adapters/external_repos/Wan2.2/wan/modules/vae2_2.py", line 42, in forward
+    return super().forward(x)
+           ~~~~~~~~~~~~~~~^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 717, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lukas/projects/generative-flow-adapters/.venv/lib/python3.13/site-packages/torch/nn/modules/conv.py", line 712, in _conv_forward
+    return F.conv3d(
+           ~~~~~~~~^
+        input, weight, bias, self.stride, self.padding, self.dilation, self.groups
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+KeyboardInterrupt

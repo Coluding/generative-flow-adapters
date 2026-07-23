@@ -22,7 +22,7 @@ Debugger-friendly: the first adapter call of each phase is dumped to
 Example (3090: 41 frames instead of the training 97 to fit VRAM):
 
     python scripts/generate_wan22_i2v_compare.py \
-        --config configs/diffusion_wan22_avid_xattn_replace_metaworld.yaml \
+        --config configs/wan22/diffusion_wan22_avid_xattn_replace_metaworld.yaml \
         --checkpoint outputs/replace-metaworld-run/checkpoints/step_00000500.pt \
         --frame-num 41 --num-steps 50
 
@@ -51,6 +51,7 @@ from generative_flow_adapters.config import load_config
 from generative_flow_adapters.data import (
     Wan22DiffusionForcingPreprocessor,
     WanBatchPreprocessConfig,
+    build_acwmphys_clip_dataset,
     build_metaworld_clip_dataset,
 )
 from generative_flow_adapters.training import build_experiment
@@ -273,6 +274,47 @@ def _sigma_sweep(model, preprocessor, dataset, args, config, timestep_scale: flo
     print(f"  wrote {png_path}")
 
 
+def _pre_encode_windows(dataset, args, pre_cfg: WanBatchPreprocessConfig) -> None:
+    """GPU-encode the windows this run will read into the latent cache BEFORE
+    the 5B is built: a native-res (1280x704) window encode needs ~15 GiB —
+    trivial on an empty GPU, impossible next to the resident DiT. Loads a
+    standalone VAE (~seconds), encodes only the needed windows (already-cached
+    ones are skipped by the cache layer), frees it. Requires the fixed window
+    pool (--num-windows K>0); unbounded random sampling can't be pre-encoded
+    (the CPU phase-1 shim at rollout time remains the fallback there)."""
+    if dataset.num_windows is None or not torch.cuda.is_available():
+        return
+    needed = {args.clip_index}
+    if args.loss_batches > 0:
+        needed |= set(range(min(len(dataset), args.loss_batches * args.loss_batch_size)))
+    if getattr(args, "sigma_sweep", False):
+        # The sweep draws a random window from each of the first sweep_batches
+        # episodes' pools — cover all their fixed starts.
+        needed |= set(range(min(len(dataset), args.sweep_batches * args.loss_batch_size)))
+    enum = dataset.fixed_window_enumeration()
+    order = {id(ep): i for i, ep in enumerate(dataset.episodes)}
+    idxs = [i for i, (ep, _s) in enumerate(enum._pairs) if order[id(ep)] in needed]
+    if not idxs:
+        return
+    from precompute_latents import _load_vae_only  # noqa: PLC0415 — sibling script, heavy import
+
+    vae0 = _load_vae_only(Path(args.ckpt_dir), "cuda")
+    vae0.dtype = torch.bfloat16
+    pre0 = Wan22DiffusionForcingPreprocessor(vae=vae0, config=pre_cfg, condition_keys=("act",), cond_frames=1)
+    newly = 0
+    try:
+        for raw in DataLoader(Subset(enum, idxs), batch_size=1):
+            _bs, enc = pre0.precompute(raw)
+            newly += enc
+        print(f"pre-encode (GPU, before the 5B build): {len(idxs)} windows ready "
+              f"({newly} newly encoded) -> {pre_cfg.latent_cache_dir}")
+    except torch.OutOfMemoryError:
+        print("pre-encode: GPU OOM — falling back to the CPU encode shim at rollout time")
+    finally:
+        del pre0, vae0
+        torch.cuda.empty_cache()
+
+
 def _to_uint8_frames(px: Tensor) -> "list":
     """``[3, N, H, W]`` in [-1,1] -> list of ``[H, W, 3]`` uint8 frames."""
     v = px.detach().float().clamp(-1, 1).add(1).mul(127.5).round().to(torch.uint8)
@@ -304,7 +346,7 @@ def _save_outputs(out_dir: Path, tag: str, gt: "list", base: "list", adapted: "l
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
+    parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
     parser.add_argument("--checkpoint", default=None,
                         help="Adapter checkpoint (.pt). Default: newest in <output_dir>/checkpoints/.")
     parser.add_argument("--random-init", action="store_true",
@@ -313,6 +355,13 @@ def main() -> None:
                         "construction — the perturbation makes outputs non-zero so the seam input dumps / "
                         "path plumbing can be exercised without trained weights.")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5")
+    parser.add_argument("--latent-cache-dir", default=None,
+                        help="Latent cache dir (default: <data-dir>.latents / <hdf5>.latents). Point at the "
+                             "shared training cache to reuse its latents; encodes+caches on miss either way.")
+    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
+                        help="Dataset family. acwm_phys reads a split dir of the HF t1an/ACWM-Phys release.")
+    parser.add_argument("--data-dir", default=None,
+                        help="acwm_phys only: split directory (metadata.pt + episode_*.mp4).")
     parser.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B")
     parser.add_argument("--clip-index", type=int, default=0, help="Dataset episode index for the rollout clip.")
     parser.add_argument("--num-steps", type=int, default=50, help="Solver steps for the rollout.")
@@ -331,7 +380,10 @@ def main() -> None:
     parser.add_argument("--loss-batches", type=int, default=4, help="Batches for the loss comparison (0 skips).")
     parser.add_argument("--loss-batch-size", type=int, default=1)
     parser.add_argument("--num-windows", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers for loss/sweep loaders. Default 0: worker processes "
+                             "deadlock with decord after CUDA init (known ACWM issue) and buy nothing "
+                             "for a diagnostic script.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--step-level", type=float, default=None,
                         help="Optional step_level injected into the adapter cond (matches the eval grid).")
@@ -394,6 +446,53 @@ def main() -> None:
             )
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+    # ---- dataset + GPU pre-encode BEFORE the 5B build ---------------------
+    # (order matters: window encodes need the GPU to themselves at native res)
+    condition_keys = tuple(spec.key for spec in config.conditioning.conditions if spec.key != "step_level")
+    timestep_scale = float(config.training.extra.get("flow_timestep_scale", 1000.0))
+    action_per_frame = bool(config.training.extra.get("action_per_frame", False))
+    latent_frames = 1 + (temporal_length - 1) // 4
+    default_cache = (
+        str(Path(args.data_dir)) + ".latents"
+        if args.dataset == "acwm_phys" and args.data_dir
+        else str(Path(args.hdf5).with_suffix("")) + ".latents"
+    )
+    latent_cache_dir = args.latent_cache_dir or default_cache
+    preprocess_cfg = WanBatchPreprocessConfig(
+        target_height=latent_height * _WAN22_VAE_SPATIAL_STRIDE,
+        target_width=latent_width * _WAN22_VAE_SPATIAL_STRIDE,
+        timestep_scale=timestep_scale,
+        max_area=max_area, align_h=align, align_w=align,
+        prompt_contexts_path=prompt_contexts_path,
+        latent_cache_dir=latent_cache_dir,
+        action_per_frame=action_per_frame,
+        action_seq_len=(latent_frames if action_per_frame else None),
+    )
+
+    if args.dataset == "acwm_phys":
+        if not args.data_dir:
+            raise SystemExit("--dataset acwm_phys requires --data-dir (a split dir of the HF release).")
+        _, dataset = build_acwmphys_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            data_dir=args.data_dir,
+            frame_stride=int(config.data.frame_stride or 1),
+            sampling="random",
+            num_windows=args.num_windows or None,
+        )
+    else:
+        _, dataset = build_metaworld_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            hdf5=args.hdf5,
+            frame_stride=int(config.data.frame_stride or 1),
+            sampling="random",
+            num_windows=args.num_windows or None,
+        )
+    if not (0 <= args.clip_index < len(dataset)):
+        raise ValueError(f"--clip-index {args.clip_index} out of range (dataset len {len(dataset)}).")
+    _pre_encode_windows(dataset, args, preprocess_cfg)
+
     experiment = build_experiment(config)
     model = experiment.model.to(device)
     model.eval()
@@ -414,38 +513,14 @@ def main() -> None:
     vae = model.base_model.wan.vae
     vae.dtype = torch.bfloat16  # match training (speeds encode/decode; latents return fp32)
 
-    condition_keys = tuple(spec.key for spec in config.conditioning.conditions if spec.key != "step_level")
-    timestep_scale = float(config.training.extra.get("flow_timestep_scale", 1000.0))
-    action_per_frame = bool(config.training.extra.get("action_per_frame", False))
-    latent_frames = 1 + (temporal_length - 1) // 4
-    latent_cache_dir = str(Path(args.hdf5).with_suffix("")) + ".latents"
+    # Same geometry/cache config as the pre-encode pass -> guaranteed key hits.
     preprocessor = Wan22DiffusionForcingPreprocessor(
         vae=vae,
-        config=WanBatchPreprocessConfig(
-            target_height=latent_height * _WAN22_VAE_SPATIAL_STRIDE,
-            target_width=latent_width * _WAN22_VAE_SPATIAL_STRIDE,
-            timestep_scale=timestep_scale,
-            max_area=max_area, align_h=align, align_w=align,
-            prompt_contexts_path=prompt_contexts_path,
-            latent_cache_dir=latent_cache_dir,
-            action_per_frame=action_per_frame,
-            action_seq_len=(latent_frames if action_per_frame else None),
-        ),
+        config=preprocess_cfg,
         condition_keys=condition_keys or ("act",),
         cond_frames=int(config.training.extra.get("cond_frames", 1)),
         cond_frames_dist=config.training.extra.get("cond_frames_dist"),
     )
-
-    _, dataset = build_metaworld_clip_dataset(
-        config.data,
-        default_window_width=temporal_length,
-        hdf5=args.hdf5,
-        frame_stride=int(config.data.frame_stride or 1),
-        sampling="random",
-        num_windows=args.num_windows or None,
-    )
-    if not (0 <= args.clip_index < len(dataset)):
-        raise ValueError(f"--clip-index {args.clip_index} out of range (dataset len {len(dataset)}).")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -477,31 +552,70 @@ def main() -> None:
         return
 
     # ---- 2) native i2v rollout: base vs adapted ---------------------------
-    # Preprocess the rollout clip FIRST (a latent-cache miss needs the GPU encode)…
-    raw_batch = next(iter(DataLoader(Subset(dataset, [args.clip_index]), batch_size=1)))
-    batch = _call_preprocessor(preprocessor, raw_batch, train=False)
-
-    # …then optionally move the VAE decode to CPU for the rollouts.
     gen_max_area = int(args.max_area or config.training.extra.get("inference_max_area") or max_area or 704 * 1280)
     decode_cpu = args.decode_cpu
     if decode_cpu is None:
         total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         decode_cpu = total_gb < 32 and gen_max_area >= 400_000
+    # SCOPED CPU-VAE handling (2026-07-23, bisection finding): the base
+    # generates coherent video only when the VAE is in its native GPU/bf16
+    # state DURING the rollout — a whole-run CPU shim (device/dtype attrs
+    # reassigned before generate) broke the i2v conditioning path and gave
+    # pure-noise rollouts at native ACWM geometry, while the identical call
+    # with an untouched VAE worked (jobs/experiments/local_probe_acwm_wrapper.py).
+    # So: phase 1 CPU-encode (preprocessing only, then FULLY restore), phase 2
+    # lazy decode-only shim that flips state after sampling finishes.
+    wan_vae = model.base_model.wan.vae
     if decode_cpu:
-        # Solver stays on GPU at the trained resolution; only the final VAE decode
-        # moves to CPU (the GPU decode at 768x768 x41f needs >24 GB on its own).
-        wan_vae = model.base_model.wan.vae
+        # Phase 1 — preprocessing under a temporary CPU VAE: a latent-cache
+        # MISS at native res needs ~15 GiB transient, impossible next to the
+        # resident 5B; on CPU it's fp32 and slow (minutes/window) but fits.
+        saved = (wan_vae.model, list(wan_vae.scale), wan_vae.dtype, wan_vae.device,
+                 wan_vae.decode, wan_vae.encode)
         wan_vae.model = wan_vae.model.to("cpu")
         wan_vae.scale = [s.cpu() if isinstance(s, Tensor) else s for s in wan_vae.scale]
-        wan_vae.dtype = torch.float32  # CPU path: no autocast, keep everything fp32
-        _cpu_decode, _cpu_encode = wan_vae.decode, wan_vae.encode
-        # The i2v loop also encodes the conditioning frame through this VAE, and its
-        # outputs feed the CUDA solver — so move inputs to CPU fp32 and results back.
-        wan_vae.decode = lambda zs: _cpu_decode([z.detach().float().cpu() for z in zs])
+        wan_vae.dtype = torch.float32
+        wan_vae.device = torch.device("cpu")
+        _enc = saved[5]
         wan_vae.encode = lambda vs: [
-            z.to(device) for z in _cpu_encode([v.detach().float().cpu() for v in vs])
+            z.to(device) for z in _enc([v.detach().float().cpu() for v in vs])
         ]
-        print("decode: CPU (slow, minutes per rollout — keeps the solver at trained resolution)")
+        print("preprocessing: VAE temporarily on CPU (cache miss encodes fp32, slow; hits skip)")
+
+    # Preprocess the rollout clip (cache hit -> instant).
+    raw_batch = next(iter(DataLoader(Subset(dataset, [args.clip_index]), batch_size=1)))
+    batch = _call_preprocessor(preprocessor, raw_batch, train=False)
+
+    if decode_cpu:
+        # Restore the native GPU/bf16 VAE state for the rollouts — the
+        # conditioning-frame encode (1 frame) fits on GPU, and generation
+        # must see the VAE exactly as upstream built it.
+        wan_vae.model = saved[0].to(device).to(saved[2])
+        wan_vae.scale = [s.to(device) if isinstance(s, Tensor) else s for s in saved[1]]
+        wan_vae.dtype = saved[2]
+        wan_vae.device = saved[3]
+        wan_vae.decode, wan_vae.encode = saved[4], saved[5]
+
+        # Phase 2 — decode-only CPU shim (probe-validated): per decode call,
+        # flip to CPU fp32, decode, then RESTORE GPU/bf16 — the script runs
+        # TWO rollouts (base, adapted) and the second one's conditioning
+        # encode + generation need the native GPU state back.
+        _gpu_decode = wan_vae.decode
+
+        def _cpu_roundtrip_decode(zs):
+            print("decode: CPU fp32 (VAE restored to GPU/bf16 afterwards)", flush=True)
+            wan_vae.model = wan_vae.model.to("cpu").float()
+            wan_vae.scale = [s.cpu() if isinstance(s, Tensor) else s for s in wan_vae.scale]
+            wan_vae.dtype = torch.float32
+            try:
+                return _gpu_decode([z.detach().float().cpu() for z in zs])
+            finally:
+                wan_vae.model = wan_vae.model.to(device).to(saved[2])
+                wan_vae.scale = [s.to(device) if isinstance(s, Tensor) else s for s in wan_vae.scale]
+                wan_vae.dtype = saved[2]
+
+        wan_vae.decode = _cpu_roundtrip_decode
+        print("rollouts: VAE on GPU/bf16; each final decode round-trips through CPU")
     cond = batch.get("cond") if isinstance(batch.get("cond"), dict) else {}
     actions = cond.get("action")
     e = config.training.extra
