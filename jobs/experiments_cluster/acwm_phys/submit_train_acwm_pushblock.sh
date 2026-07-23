@@ -51,5 +51,5 @@ python scripts/train_wan22_i2v_metaworld_external.py \
     --eval-data-dir "$ROOT/ind_test" \
     --latent-cache-dir "$CACHE" \
     --ckpt-dir ckpts/Wan2.2-TI2V-5B \
-    --batch-size $BATCH_SIZE --num-windows 8 --max-area 901120 --steps 5000000 \
+    --batch-size $BATCH_SIZE --num-windows 8 --max-area 589824 --steps 5000000 \
     --wandb-run-name acwm-pushblock-gatelow-cap09-shift5 "$@"

@@ -72,11 +72,15 @@ def build_acwmphys_clip_dataset(
     frame_stride: int | None = None,
     sampling: str | None = None,
     num_windows: int | None = None,
+    letterbox_aspect: tuple[int, int] | None = None,
 ) -> tuple[ACWMPhysTranslator, TranslatedClipDataset]:
     """ACWM-Phys twin of :func:`build_metaworld_clip_dataset`. ``data_dir`` is
     one split directory of the HF release (contains ``metadata.pt`` +
     ``episode_*.mp4``); everything else mirrors the MetaWorld builder so the
-    training/precompute scripts can switch datasets with one flag."""
+    training/precompute scripts can switch datasets with one flag.
+
+    ``letterbox_aspect`` pads frames to Wan's native aspect (default 1280:704);
+    None disables it (raw square frames — see the aspect-vs-random-init test)."""
     if not data_dir:
         raise ValueError("ACWM-Phys dataset needs --data-dir (a split directory of the HF release).")
     resolved_stride = data.frame_stride if frame_stride is None else int(frame_stride)
@@ -84,7 +88,8 @@ def build_acwmphys_clip_dataset(
     resolved_window = int(data.window_width) if data.window_width else int(default_window_width)
     resolved_num_windows = num_windows if num_windows is not None else getattr(data, "num_windows", None)
 
-    translator = ACWMPhysTranslator(data_dir, env_name=env_name, fs_value=data.fs_value)
+    translator = ACWMPhysTranslator(data_dir, env_name=env_name, fs_value=data.fs_value,
+                                    letterbox_aspect=letterbox_aspect)
     dataset = TranslatedClipDataset(
         translator,
         window_width=resolved_window,

@@ -24,7 +24,7 @@ cd "$(dirname "$0")/../.."
 source .venv/bin/activate
 
 DATA_DIR="ds/acwm-phys/rigid_dynamics/push_block/ind_train"
-CACHE="ds/acwm-phys/rigid_dynamics/push_block/native17.latents"
+CACHE="ds/acwm-phys/rigid_dynamics/push_block/square768.latents"
 test -f "$DATA_DIR/metadata.pt" || { echo "Error: $DATA_DIR/metadata.pt missing — run: bash jobs/experiments_cluster/infra/download_acwmphys.sh" >&2; exit 1; }
 
 EXTRA="--random-init"
@@ -35,6 +35,6 @@ PYTORCH_ALLOC_CONF=expandable_segments:True python -u scripts/generate_wan22_i2v
     $EXTRA \
     --dataset acwm_phys --data-dir "$DATA_DIR" \
     --latent-cache-dir "$CACHE" \
-    --temporal-length 17 --max-area 901120 --num-windows 1 \
+    --max-area 589824 --num-windows 1 \
     --loss-batches 1 --num-steps 50 \
     "$@"

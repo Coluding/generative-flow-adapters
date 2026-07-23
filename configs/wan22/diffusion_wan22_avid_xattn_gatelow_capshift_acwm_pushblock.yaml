@@ -10,13 +10,13 @@
 #
 # Data facts (verified against the release 2026-07-22): 1500 ind_train
 # episodes, fixed 66 frames @ 10 fps, videos released at 1024x1024 (the
-# paper trains at 240x240 — we letterbox to 1280:704 and downscale to native = Wan's
-# native regime; no upscaling involved). Actions [66, 2] in [-1, 1].
-# temporal_length 41 <= 66 (97 would NOT fit these episodes).
+# paper trains at 240x240; we train at 768^2 square (max_area 589824, no letterbox —
+# frozen base is coherent there). Actions [66, 2] in [-1, 1]. temporal_length 65
+# = near-full episode (4*16+1, 17 latent frames).
 # Reference numbers (paper Table 1, ACWM-DiT-S from scratch, 50 steps):
 # InD MSE 2.919e-3 / PSNR 25.35 / SSIM 0.955 — comparison target, but note
-# their eval is 240x240 full-episode; ours differs (41-frame windows,
-# 768x768) until we match protocols. Don't put their numbers next to ours
+# their eval is 240x240 full-episode; ours differs (65-frame windows,
+# 768x768) until we match protocols. Do not put their numbers next to ours
 # on a slide without that caveat.
 #
 # Precompute latents first (see jobs/experiments_cluster/infra/submit_precompute_acwmphys.sh), then:
@@ -42,8 +42,11 @@ model:
     allow_missing_checkpoint: true
     dtype: bf16
     latent_channels: 48
-    temporal_length: 41      # 66-frame episodes: 41-frame windows, 25 valid starts
-    max_area: 901120         # NATIVE 1280x704 (letterboxed source) — square 768^2 gives pure-noise base rollouts (2026-07-23 finding)
+    temporal_length: 65      # near-full 66-frame episode (65 = 4*16+1 -> 17 latent frames);
+                             # captures the whole push trajectory (ACWM's end-to-end horizon).
+                             # Only 2 valid starts/episode (augmentation via the 1500 episodes,
+                             # not within one). 41 is the shorter-window / more-augmentation option.
+    max_area: 589824         # 768^2 square — frozen base is coherent here (letterbox NOT needed; the earlier square=noise was the random-init base-corruption bug)
     latent_height: 16
     latent_width: 16
     # Prompt conditioning: prompt-free base rollouts on this domain are pure
@@ -105,9 +108,9 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_use_prompt: true
-    inference_frame_num: 41
+    inference_frame_num: 65
     inference_seed: 0
-    inference_max_area: 901120
+    inference_max_area: 589824
     cond_frames: 1
     cond_frames_dist:
       1: 1

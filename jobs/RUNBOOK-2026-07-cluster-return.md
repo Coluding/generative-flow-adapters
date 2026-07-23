@@ -27,15 +27,37 @@ comparable to them. Revisit only as its own controlled change.
 
 ## 1. Submit (in this order)
 
+First warm the two latent caches — everything below reads them, and the
+MetaWorld arms now run in PARALLEL, so a cold cache means concurrent jobs race
+writing the same cache keys (`LatentCache.put` stages through a fixed
+`<key>.tmp`). The MetaWorld arms refuse to start on a cold cache unless
+`ALLOW_COLD_CACHE=1`.
+
 ```bash
-sbatch jobs/experiments_cluster/metaworld/submit_overfit_triangle_capshift.sh   # MetaWorld: 3 overfit arms (1000 steps each) + full-data cap+shift until walltime
-sbatch jobs/experiments_cluster/infra/submit_precompute_acwmphys.sh             # ACWM Push Cube latents, all 3 splits -> shared cache (~13.6k windows)
-# after the precompute job finishes:
+DS_PATH=../scratch-shared/metaworld/five_task_diverse.hdf5 \
+  sbatch jobs/experiments_cluster/infra/precompute_cache.sh    # MetaWorld latents for the base-parity campaign
+sbatch jobs/experiments_cluster/infra/submit_precompute_acwmphys.sh  # ACWM Push Cube latents, all 3 splits -> shared cache (~13.6k windows)
+```
+
+Then, once the MetaWorld precompute finishes, the four base-parity arms are
+independent jobs and can all queue at once (arms 1-3 are 1000-step overfit
+probes, 12h ceiling; arm 4 is the full-data run and uses its 32h):
+
+```bash
+sbatch jobs/experiments_cluster/metaworld/wan/submit_overfit_replace_nobase.sh        # arm 1: no gate, no base input
+sbatch jobs/experiments_cluster/metaworld/wan/submit_overfit_gatelow_nobase.sh        # arm 2: raw gate, no base input
+sbatch jobs/experiments_cluster/metaworld/wan/submit_overfit_gatelow_nobase_cap09.sh  # arm 3: gate capped 0.9, no base input
+sbatch jobs/experiments_cluster/metaworld/wan/submit_train_gatelow_cap_sigmashift.sh  # arm 4: full-data cap 0.9 + sigma_shift 5.0
+```
+
+After the ACWM precompute finishes:
+
+```bash
 sbatch jobs/experiments_cluster/acwm_phys/submit_train_acwm_pushblock.sh        # first ACWM training run (gatelow + cap 0.9 + shift 5.0)
 ```
 
-The two first jobs are independent — they can run concurrently if two GPUs
-are free.
+The two precompute jobs are independent of each other and can run concurrently
+if two GPUs are free.
 
 ## 2. Readouts (what decides what)
 
