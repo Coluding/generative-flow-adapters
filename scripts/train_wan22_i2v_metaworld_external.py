@@ -52,6 +52,12 @@ from generative_flow_adapters.training.trainer import Trainer
 # Wan2.2-VAE spatial stride (vae_stride = (4, 16, 16)).
 _WAN22_VAE_SPATIAL_STRIDE = 16
 
+# Batches per epoch for --overfit-index runs. The clip is the same either way;
+# this only sets how often the trainer hits an epoch boundary (and so how often
+# any per-epoch loader cost is paid). Also keeps the printed epoch counter from
+# incrementing once per micro-step.
+EPOCH_BATCH_TARGET = 100
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -356,11 +362,21 @@ def main() -> None:
                   f"(not 1); window start will still jitter within episode "
                   f"{args.overfit_index}. Pass --num-windows 1 for a fixed clip.")
         repeat = max(args.batch_size, 8)
-        train_dataset = torch.utils.data.Subset(dataset, [args.overfit_index] * repeat)
-        eval_dataset = train_dataset      # eval/generate on the overfit clip itself
+        # Epoch length is a performance knob, not just bookkeeping: the trainer
+        # recreates the loader iterator once per epoch, so a subset of exactly
+        # one batch makes EVERY micro-step an epoch boundary and re-spawns the
+        # DataLoader workers each time (~26 s under the spawn context, measured
+        # 2026-07-23). Span many batches per epoch so that cost is amortized.
+        train_repeat = repeat * EPOCH_BATCH_TARGET
+        train_dataset = torch.utils.data.Subset(dataset, [args.overfit_index] * train_repeat)
+        # Eval stays at the small subset: config.eval_num_batches (default 8)
+        # bounds the loss eval, so sharing the enlarged subset would silently
+        # grow each eval cycle from 1 batch to 8.
+        eval_dataset = torch.utils.data.Subset(dataset, [args.overfit_index] * repeat)
         want_eval = False                 # skip the held-out split branches below
         print(f"OVERFIT MODE: training on dataset[{args.overfit_index}] repeated "
-              f"{repeat}x (single-clip). Eval/generation targets the same clip; "
+              f"{train_repeat}x (single-clip, {EPOCH_BATCH_TARGET} batches/epoch). "
+              f"Eval/generation targets the same clip; "
               f"pass --eval-gen (default) to see the inference grid regenerate it.")
     if want_eval and args.eval_data_dir is not None:
         # ACWM-Phys: eval on a real held-out split dir (ind_test / ood_test).
@@ -397,6 +413,11 @@ def main() -> None:
     # touches the translator in the parent, and fork-after-decord deadlocks the
     # first worker get_batch(). Spawn workers re-open their readers lazily.
     _mp_ctx = "spawn" if args.num_workers > 0 else None
+    # persistent_workers keeps the spawned workers alive across epoch boundaries.
+    # Without it, every epoch tears down and re-spawns all `num_workers`
+    # processes, each re-importing torch/decord/h5py under the spawn context —
+    # ~26 s per epoch, measured 2026-07-23. That is invisible on long epochs but
+    # dominated single-clip overfit runs, where an epoch is a handful of batches.
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -404,6 +425,7 @@ def main() -> None:
         num_workers=args.num_workers,
         drop_last=True,
         multiprocessing_context=_mp_ctx,
+        persistent_workers=args.num_workers > 0,
     )
     eval_loader = None
     if eval_dataset is not None:
