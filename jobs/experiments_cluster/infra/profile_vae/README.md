@@ -9,7 +9,8 @@ native-1280×704 OOM; at 768² the transient is much smaller.
 |---|---|---|
 | `submit_profile_vae_acwm.sh` | Encode cost + isolated transient on ACWM push_block at the real training geometry | 30 min |
 | `submit_profile_vae_metaworld.sh` | Same profile on MetaWorld — isolates dataset-loader overhead from the encode | 30 min |
-| `submit_profile_vae_coexist_dit.sh` | **Decisive:** encode transient *alongside the resident 5B* (`--with-dit`) | 45 min |
+| `submit_profile_vae_coexist_dit.sh` | Encode transient *alongside the resident 5B* (`--with-dit`) — memory coexistence | 45 min |
+| `submit_profile_train_step.sh` | **Closes the verdict:** real training step time vs online-encode cost, same loop | 45 min |
 
 ## Run
 
@@ -39,6 +40,29 @@ sbatch .../submit_profile_vae_acwm.sh --batch-size 1 2 4 8 --num-batches 20
   it sits on top of the resident 5B (`peak_alloc − resident ≈ added transient`).
   Job 3 is the one that decides coexistence — an isolated transient that fits
   the card means nothing if it OOMs next to the resident model.
+
+## The training-step profiler (`submit_profile_train_step.sh`)
+
+The first three jobs measure the *encode* in isolation; they can't say whether
+2 s/clip is cheap without the training step time to compare against. This job
+provides that comparison **from the real training loop** — no reimplementation.
+It sets `GFA_PROFILE=1`, which enables the trainer's per-phase CUDA-synced
+timers, and runs ~15 steps at the real geometry with eval off. Per step it
+prints `data(load+wait)`, `preprocess (VAE encode + cond)`, `forward`,
+`backward`, `optimizer.step`, and `training_step (fwd+bwd+opt) TOTAL`.
+
+It runs two variants back to back:
+
+- **A — online encode** (`--no-latent-cache`): `preprocess` shows the full
+  encode+resize tax.
+- **B — cached latents** (`--latent-cache-dir`): `preprocess` drops to
+  cache-load only. Skipped automatically unless the shared cache is warm (run
+  `submit_precompute_acwmphys.sh` first).
+
+**Decision rule:** `A_preprocess − B_preprocess` is the per-step online-encode
+tax. If `training_step TOTAL` ≫ that tax → drop precompute (online encode is a
+small % overhead and memory already fits). If they're comparable, or you train
+many epochs, keep the cache.
 
 ## Notes
 

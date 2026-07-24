@@ -401,7 +401,8 @@ class Trainer:
 
     def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
         self.model.train()
-        loss, loss_components, _x_t, _t, _cond, _prediction, batch = self._forward_and_loss(batch)
+        with self._prof("  forward"):
+            loss, loss_components, _x_t, _t, _cond, _prediction, batch = self._forward_and_loss(batch)
         model_type = getattr(self.model, "model_type", None)
         accum_steps = max(2, int(self.config.grad_accum_steps))
         with self._prof("  backward"):
