@@ -83,6 +83,8 @@ class TestGateCap:
         m.output_composition = "mask_mix"
         m.gate_bias = 0.0
         m.gate_cap = gate_cap
+        m.pretrain_steps = 0
+        m._train_step = 0
         m._last_gate = None
         return m
 
@@ -124,6 +126,58 @@ class TestGateCap:
         assert AdapterConfig(type="output").gate_cap is None
 
 
+class TestAvidWarmup:
+    def _model(self, pretrain_steps):
+        from generative_flow_adapters.models.adapted_model import AdaptedModel
+
+        m = AdaptedModel.__new__(AdaptedModel)
+        m.output_composition = "mask_mix"
+        m.gate_bias = 0.0
+        m.gate_cap = None
+        m.pretrain_steps = pretrain_steps
+        m._train_step = 0
+        m._last_gate = None
+        m._last_adapter_out = None
+        return m
+
+    def _res(self, pred_val, gate_logit):
+        from generative_flow_adapters.adapters.output.interface import OutputAdapterResult
+
+        return OutputAdapterResult(
+            adapter_output=torch.full((2, 3, 4), pred_val),
+            output_kind="prediction",
+            gate=torch.full((2, 3, 4), gate_logit),
+        )
+
+    def test_warmup_returns_pure_adapter_and_ignores_gate(self):
+        m = self._model(pretrain_steps=100)
+        m._train_step = 0  # in warmup
+        # gate logit 8 => sigmoid ~1 => normal mask_mix would return ~base(0).
+        out = m._compose(base_output=torch.zeros(2, 3, 4), adapter_result=self._res(7.0, 8.0))
+        assert torch.allclose(out, torch.full((2, 3, 4), 7.0))  # pure adapter, gate bypassed
+        assert m._last_gate.abs().max() == 0.0  # gate logged as 0 during warmup
+
+    def test_post_warmup_uses_normal_composition(self):
+        m = self._model(pretrain_steps=100)
+        m._train_step = 150  # past warmup
+        out = m._compose(base_output=torch.zeros(2, 3, 4), adapter_result=self._res(7.0, 8.0))
+        assert out.abs().max() < 0.05  # gate ~1 -> ~base(0)
+        assert m._last_gate.mean() > 0.99
+
+    def test_disabled_by_default(self):
+        from generative_flow_adapters.config import AdapterConfig
+
+        assert AdapterConfig(type="output").pretrain_steps == 0
+        m = self._model(pretrain_steps=0)  # off
+        out = m._compose(base_output=torch.zeros(2, 3, 4), adapter_result=self._res(7.0, 8.0))
+        assert out.abs().max() < 0.05  # normal composition from step 0
+
+    def test_set_train_step(self):
+        m = self._model(pretrain_steps=100)
+        m.set_train_step(42)
+        assert m._train_step == 42
+
+
 class TestBaseCosineDiagnostics:
     def test_masked_cosine_uses_predicted_frames_only(self):
         from generative_flow_adapters.training.trainer import Trainer
@@ -147,6 +201,8 @@ class TestBaseCosineDiagnostics:
         m.output_composition = "mask_mix"
         m.gate_bias = 0.0
         m.gate_cap = None
+        m.pretrain_steps = 0
+        m._train_step = 0
         m._last_gate = None
         m._last_adapter_out = None
         pred = torch.randn(2, 3, 4)
