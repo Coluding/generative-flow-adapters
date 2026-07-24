@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=12:00:00
+#SBATCH --time=22:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -36,7 +36,7 @@ set -euo pipefail
 module purge
 module load 2024
 
-export GFA_PROFILE=0
+export GFA_PROFILE=1
 export GFA_DEBUG_CACHE=0
 export BATCH_SIZE=${BATCH_SIZE:-12}
 
@@ -58,7 +58,7 @@ print('cuda available:', torch.cuda.is_available())
 print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')
 "
 
-export ds_path="${DS_PATH:-../scratch-shared/metaworld/five_task_diverse.hdf5}"
+export ds_path="${DS_PATH:-../scratch-shared/metaworld/three_task.hdf5}"
 echo "Running with dataset: $ds_path"
 if test ! -f "$ds_path"; then
     echo "Error: Dataset file not found at $ds_path" >&2

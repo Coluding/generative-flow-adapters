@@ -44,7 +44,7 @@ print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else
 "
 
 
-export ds_path="../scratch-shared/metaworld/five_task_diverse.hdf5"
+export ds_path="../scratch-shared/metaworld/three_task.hdf5"
 
 echo "Running training with dataset: $ds_path"
 

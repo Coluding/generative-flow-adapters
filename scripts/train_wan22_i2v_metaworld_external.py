@@ -425,7 +425,7 @@ def main() -> None:
         num_workers=args.num_workers,
         drop_last=True,
         multiprocessing_context=_mp_ctx,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=True if args.num_workers > 0 else False,
     )
     eval_loader = None
     if eval_dataset is not None:
@@ -436,6 +436,7 @@ def main() -> None:
             num_workers=args.num_workers,
             drop_last=True,
             multiprocessing_context=_mp_ctx,
+            persistent_workers=True if args.num_workers > 0 else False
         )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -483,7 +484,7 @@ def main() -> None:
             precompute_set = dataset
         full_loader = DataLoader(precompute_set, batch_size=args.batch_size, shuffle=False,
                                  num_workers=args.num_workers, drop_last=False,
-                                 multiprocessing_context=_mp_ctx)
+                                 multiprocessing_context=_mp_ctx, persistent_workers=True if args.num_workers > 0 else False)
         print(f"precomputing latents -> {latent_cache_dir}  ({len(precompute_set)} windows)")
         total = len(precompute_set)
         done, encoded, t0 = 0, 0, _time.time()

@@ -28,7 +28,7 @@ rename, so two jobs encoding the **same** key concurrently can publish a corrupt
 latent. Jobs that share a dataset therefore need a warm cache first:
 
 ```bash
-DS_PATH=../scratch-shared/metaworld/five_task_diverse.hdf5 \
+DS_PATH=../scratch-shared/metaworld/three_task.hdf5 \
   sbatch jobs/experiments_cluster/infra/precompute_cache.sh
 ```
 

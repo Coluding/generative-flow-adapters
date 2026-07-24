@@ -44,7 +44,7 @@ print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else
 "
 
 
-export ds_path="../scratch-shared/metaworld/five_task_diverse.hdf5"
+export ds_path="../scratch-shared/metaworld/three_task.hdf5"
 
 echo "Running training with dataset: $ds_path"
 
@@ -70,3 +70,4 @@ python scripts/train_wan22_i2v_metaworld_external.py \
     --hdf5 "$ds_path" --ckpt-dir ckpts/Wan2.2-TI2V-5B \
     --batch-size $BATCH_SIZE "$@" --num-windows 8 --max-area 589824 --steps 5000000 \
     --wandb-run-name no-sc-replace-metaworld-run
+    

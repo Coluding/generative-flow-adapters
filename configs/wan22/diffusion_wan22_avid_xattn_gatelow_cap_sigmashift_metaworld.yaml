@@ -76,7 +76,7 @@ model:
     allow_missing_checkpoint: true
     dtype: bf16
     latent_channels: 48
-    temporal_length: 97     # match y1jrgxqp + the remote five_task_diverse latent cache
+    temporal_length: 97     # match y1jrgxqp + the remote three_task latent cache
     max_area: 589824         # 704 * 1280
     latent_height: 16
     latent_width: 16
@@ -151,9 +151,9 @@ training:
       max: 1
       base: 2
     eval_step_schedule:
-      - {num_steps: 1,  step_level: 1.0}
-      - {num_steps: 2,  step_level: 0.5}
-      - {num_steps: 4,  step_level: 0.25}
+      #- {num_steps: 1,  step_level: 1.0}
+      #- {num_steps: 2,  step_level: 0.5}
+      #- {num_steps: 4,  step_level: 0.25}
       - {num_steps: 8,  step_level: 0.125}
       - {num_steps: 25, step_level: 0.04}
       - {num_steps: 50, step_level: 0.02}

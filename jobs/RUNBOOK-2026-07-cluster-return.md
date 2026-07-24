@@ -34,7 +34,7 @@ writing the same cache keys (`LatentCache.put` stages through a fixed
 `ALLOW_COLD_CACHE=1`.
 
 ```bash
-DS_PATH=../scratch-shared/metaworld/five_task_diverse.hdf5 \
+DS_PATH=../scratch-shared/metaworld/three_task.hdf5 \
   sbatch jobs/experiments_cluster/infra/precompute_cache.sh    # MetaWorld latents for the base-parity campaign
 sbatch jobs/experiments_cluster/infra/submit_precompute_acwmphys.sh  # ACWM Push Cube latents, all 3 splits -> shared cache (~13.6k windows)
 ```
