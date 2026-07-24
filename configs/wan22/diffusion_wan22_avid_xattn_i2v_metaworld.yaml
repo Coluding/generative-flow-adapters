@@ -78,6 +78,12 @@ training:
   quality_dist_metrics: [fvd, fid]
   quality_dist_every_n_steps: 300
   quality_dist_num_batches: 4
+  # Step-0 baseline: run the inference grid + loss eval for an at-init reference,
+  # but skip the expensive FID/FVD (+ paired) quality pass at step 0. The periodic
+  # quality cadences above are unaffected.
+  baseline_eval_inference: true
+  baseline_eval_loss: true
+  baseline_eval_quality: false
 
   extra:
     amp_dtype: bf16

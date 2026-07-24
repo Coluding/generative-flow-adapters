@@ -144,6 +144,21 @@ class TrainingConfig:
     quality_dist_metrics: list[str] = field(default_factory=list)
     quality_dist_every_n_steps: int | None = None
     quality_dist_num_batches: int = 16
+    # --- step-0 baseline eval toggles ----------------------------------------
+    # On a fresh run (global_step == 0) a full baseline eval runs *before* the
+    # first gradient update so every metric has a genuine "at init" reference.
+    # These gate which components of that baseline run, independently of the
+    # per-cadence toggles above — the periodic mid-training cadences are
+    # unaffected. All default True to preserve the full-baseline behaviour.
+    #   * baseline_eval_loss     — the held-out loss eval cycle ("normal eval")
+    #   * baseline_eval_inference — the native generation grid ("inference")
+    #   * baseline_eval_quality  — the quality metrics (paired psnr/ssim/lpips/
+    #                              mse AND the distribution fid/fvd metrics)
+    # e.g. set baseline_eval_quality: false to run inference + loss eval at
+    # step 0 but skip the expensive FID/FVD (+ paired) quality pass there.
+    baseline_eval_loss: bool = True
+    baseline_eval_inference: bool = True
+    baseline_eval_quality: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
 

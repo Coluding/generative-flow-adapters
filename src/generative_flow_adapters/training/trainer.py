@@ -592,13 +592,30 @@ class Trainer:
         # to compare the rest of the run against. Also means the lazily-captured
         # `self._probe_batch` (see evaluate()) is captured from the untrained
         # model, not from whatever step happened to hit the first eval cadence.
+        # Which components run at step 0 is config-gated (see TrainingConfig
+        # baseline_eval_* flags) so a run can, e.g., get the inference grid and
+        # loss reference without paying for the FID/FVD quality pass at init.
         if self.global_step == 0 and eval_loader is not None:
-            with self._prof("eval cycle (loss) — pre-training baseline"):
-                self._run_eval_cycle(eval_loader, preprocessor=preprocessor, log=log_every > 0)
-            if self._native_base is not None and self.config.inference_every_n_steps:
+            if self.config.baseline_eval_loss:
+                with self._prof("eval cycle (loss) — pre-training baseline"):
+                    self._run_eval_cycle(
+                        eval_loader,
+                        preprocessor=preprocessor,
+                        log=log_every > 0,
+                        run_quality=self.config.baseline_eval_quality,
+                    )
+            if (
+                self.config.baseline_eval_inference
+                and self._native_base is not None
+                and self.config.inference_every_n_steps
+            ):
                 with self._prof("native eval grid (generation) — pre-training baseline"):
                     self._native_eval_grid(eval_loader, preprocessor=preprocessor)
-            if self.config.quality_dist_metrics and self.config.quality_dist_every_n_steps:
+            if (
+                self.config.baseline_eval_quality
+                and self.config.quality_dist_metrics
+                and self.config.quality_dist_every_n_steps
+            ):
                 self._run_quality_eval(
                     eval_loader,
                     preprocessor=preprocessor,
@@ -699,8 +716,14 @@ class Trainer:
         *,
         preprocessor: Callable[..., Mapping[str, object]] | None,
         log: bool,
+        run_quality: bool = True,
     ) -> dict[str, float]:
-        """Evaluate, log to wandb/jsonl, and save ``best.pt`` on improvement."""
+        """Evaluate, log to wandb/jsonl, and save ``best.pt`` on improvement.
+
+        ``run_quality=False`` skips the paired quality-metric pass (psnr/ssim/
+        lpips/mse) while keeping the loss eval — used for the step-0 baseline
+        when ``config.baseline_eval_quality`` is off.
+        """
         eval_metrics = self.evaluate(
             eval_loader,
             max_batches=self.config.eval_num_batches,
@@ -727,7 +750,7 @@ class Trainer:
             )
             if log:
                 print(f"  new best {metric_key}={value:.5f} -> {path}")
-        if self.config.quality_metrics:
+        if run_quality and self.config.quality_metrics:
             self._run_quality_eval(
                 eval_loader,
                 preprocessor=preprocessor,
