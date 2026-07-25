@@ -141,6 +141,8 @@ def main() -> None:
     parser.add_argument("--no-clip-null-prompt", dest="clip_null_prompt", action="store_false")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--debug", action="store_true",
+                        help="Print base-UNet input-channel check + per-frame latent drift diagnostics.")
     parser.add_argument("--out-dir", default="outputs/dynamicrafter_compare")
     args = parser.parse_args()
 
@@ -319,6 +321,22 @@ def main() -> None:
     anchor_mask = torch.zeros_like(target)
     anchor_mask[:, :, 0, :, :] = 1.0
 
+    # Diagnostic: verify the frozen base UNet actually receives the concatenated
+    # image latent (8 = 4 noisy + 4 concat channels). A silent 4-channel input
+    # (concat dropped) would leave every non-anchored frame unconditioned.
+    _dbg = {"logged": False}
+    def _in_hook(module, inp):
+        if not _dbg["logged"]:
+            x = inp[0]
+            print(f"[debug] base UNet input channels={tuple(x.shape)} (expect C=8: 4 latent + 4 concat)")
+            _dbg["logged"] = True
+    _h = model.base_model.module.register_forward_pre_hook(_in_hook) if args.debug else None
+
+    def _stats(name, z):
+        z = z.float()
+        print(f"[debug] {name} latent: shape={tuple(z.shape)} mean={z.mean():.3f} std={z.std():.3f} "
+              f"min={z.min():.2f} max={z.max():.2f}")
+
     with torch.no_grad():
         shared_noise = torch.randn_like(target)
         adapted = trainer.inference_sampler.sample_from_batch(
@@ -331,6 +349,18 @@ def main() -> None:
             num_inference_steps=args.num_steps, initial_sample=shared_noise,
             anchor_mask=anchor_mask, anchor_latent=target,
         )
+        if args.debug:
+            _h.remove()
+            _stats("target(GT)", target)
+            _stats("base     ", base)
+            _stats("adapted  ", adapted)
+            # Per-frame drift of the base latent away from frame 0 (temporal
+            # collapse check): if the base i2v is holding, later frames stay
+            # near frame 0.
+            b0 = base[:, :, 0:1].float()
+            drift = [(base[:, :, i].float() - b0[:, :, 0]).norm().item() for i in range(base.shape[2])]
+            print(f"[debug] base per-frame L2 drift from frame0: "
+                  f"{', '.join(f'{d:.1f}' for d in drift)}")
         gt_frames = _decode_to_uint8_frames(model.base_model, target)
         base_frames = _decode_to_uint8_frames(model.base_model, base)
         adapted_frames = _decode_to_uint8_frames(model.base_model, adapted)
