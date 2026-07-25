@@ -1,0 +1,96 @@
+name: diffusion_avid_shortcut_metaworld_native
+
+# Same AVID output-adapter recipe as diffusion_avid_shortcut_metaworld.yaml, but
+# the frozen base is the NATIVE DynamiCrafter (`dynamicrafter_video` provider):
+# it instantiates the real vendored lvdm LatentVisualDiffusion and delegates
+# generation to its own DDIMSampler (correct concat + CLIP + fps + first-frame
+# anchoring + zero-SNR dynamic rescale), instead of the reimplemented sampler.
+#
+# NOTE: the native UNet (external_deps/lvdm) differs from the old wrapper's
+# UNet (backbones/dynamicrafter) by ~2.6% on the base prediction (cosine 0.974)
+# — the native one is the faithful upstream DynamiCrafter whose generation is
+# validated coherent. So adapters trained here are NOT interchangeable with ones
+# trained on the `dynamicrafter` provider; this is a fresh-base run.
+
+data:
+  frame_stride: 4
+  fs_value: 1
+
+model:
+  type: diffusion
+  provider: dynamicrafter_video
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  pretrained_model_name_or_path: ckts/dynami512.ckpt
+  extra:
+    model_config_path: configs/base/dynamicrafter512.yaml
+    dtype: bf16
+    temporal_length: 16
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 4
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  shortcut_consistency_target: endpoint_inversion
+  inference_every_n_steps: 2000
+  inference_num_steps: 50
+  output_dir: outputs/diffusion_avid_shortcut_metaworld_native
+  log_metrics_jsonl: true
+  checkpoint_every_n_steps: 2000
+  keep_last_checkpoints: 3
+  eval_every_n_steps: 2000
+  eval_num_batches: 8
+  eval_metric: base_loss
+  extra:
+    amp_dtype: bf16
+    shortcut_step_level_key: step_level
+    shortcut_anchor_prob: 0.55
+    eval_step_schedule:
+      - { num_steps: 1,  step_level: 1.0 }
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    video_logging:
+      enable: true
+      num_samples: 1
+      fps: 2
+      wandb_project: avid-shortcut-metaworld-055

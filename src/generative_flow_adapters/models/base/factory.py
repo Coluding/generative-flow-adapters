@@ -65,6 +65,41 @@ def build_base_model(config: ModelConfig):
             load_first_stage_model=bool(config.extra.get("load_first_stage_model", False)),
             dtype=_parse_dtype(config.extra.get("dtype")),
         )
+    elif provider == "dynamicrafter_video":
+        # Native DynamiCrafter as a BaseVideoModel: instantiates the REAL vendored
+        # lvdm LatentVisualDiffusion and delegates generation to its own DDIMSampler
+        # (correct concat + CLIP + fps + first-frame anchoring + SNR rescale), with
+        # the adapter injected at the apply_model seam. Faithful to upstream; the
+        # older `dynamicrafter` (UNet-only wrapper) reimplements the sampler.
+        from generative_flow_adapters.models.base.dynamicrafter_video import DynamiCrafterVideoModel
+
+        ckpt = config.pretrained_model_name_or_path
+        if not ckpt:
+            raise ValueError("dynamicrafter_video provider requires model.pretrained_model_name_or_path (the .ckpt)")
+        model = DynamiCrafterVideoModel.from_config(
+            checkpoint_path=ckpt,
+            model_config_path=config.extra.get("model_config_path", "configs/base/dynamicrafter512.yaml"),
+            device=config.extra.get("device", "cuda"),
+            dtype=_parse_dtype(config.extra.get("dtype")),
+        )
+    elif provider == "skyreels":
+        # SkyReels-V2-I2V-1.3B as a BaseVideoModel: wraps the vendored
+        # Image2VideoPipeline (16-ch Wan2.1 VAE, flow/velocity), delegates the
+        # rollout to it, and injects the adapter at the transformer seam. Weak
+        # flow base for the base-strength axis. Weights auto-resolve from the HF
+        # cache (Skywork/SkyReels-V2-I2V-1.3B-540P) unless model.extra.model_path
+        # points at a local snapshot.
+        from generative_flow_adapters.models.base.skyreels_video import SkyReelsVideoModel
+
+        model = SkyReelsVideoModel.from_config(
+            model_id=config.extra.get("model_id", "Skywork/SkyReels-V2-I2V-1.3B-540P"),
+            model_path=config.extra.get("model_path"),
+            device=config.extra.get("device", "cuda"),
+            dtype=_parse_dtype(config.extra.get("dtype")),
+            offload=bool(config.extra.get("offload", True)),
+            default_prompt=config.extra.get("default_prompt", ""),
+            default_negative=config.extra.get("default_negative", ""),
+        )
     elif provider in ("wan2.1", "wan", "wan2.2"):
         wan_config_path = config.extra.get("wan_config_path")
         if not isinstance(wan_config_path, str) or not wan_config_path:

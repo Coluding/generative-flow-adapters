@@ -50,6 +50,19 @@ from generative_flow_adapters.models.base.wan_ti2v import _ensure_wan_importable
 # Wan2.2-VAE spatial stride (vae_stride = (4, 16, 16)); align grid = patch(2)*stride(16).
 _WAN22_VAE_SPATIAL_STRIDE = 16
 
+# Per-provider VAE spatial stride. Wan2.2 downsamples 16x, SkyReels' Wan2.1 VAE 8x.
+# Drives target_height/width and the align grid so a provider's latent geometry
+# matches its VAE. Default (unlisted providers) -> the Wan2.2 stride, so the
+# Wan path is byte-identical to before.
+_PROVIDER_VAE_SPATIAL_STRIDE = {
+    "wan2.2": 16, "wan": 16, "wan2.1": 16,
+    "skyreels": 8,
+}
+
+
+def _vae_spatial_stride(provider: str | None) -> int:
+    return _PROVIDER_VAE_SPATIAL_STRIDE.get((provider or "").lower(), _WAN22_VAE_SPATIAL_STRIDE)
+
 _DTYPES = {
     "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
     "fp16": torch.float16, "float16": torch.float16,
@@ -74,9 +87,33 @@ def _make_bar(total: int, mode: str):
     return tqdm(total=total, unit="win", desc="encoding", dynamic_ncols=True, smoothing=0.05)
 
 
-def _load_vae_only(ckpt_dir: Path, device: str):
-    """Instantiate ONLY the Wan2.2 VAE (skips the 5B DiT that ``wan.WanTI2V`` also
-    builds). Mirrors ``WanTI2V.__init__``'s VAE construction exactly."""
+def _load_vae_only(ckpt_dir: Path, device: str, provider: str = "wan2.2", model_path: str | None = None):
+    """Instantiate ONLY the provider's VAE (skips the DiT).
+
+    - ``wan2.2`` / ``wan`` (default): the 48-ch Wan2.2 VAE, mirroring
+      ``WanTI2V.__init__``'s construction exactly (byte-identical to before).
+    - ``skyreels``: the 16-ch Wan2.1 VAE (``vae_stride=(4,8,8)``) from the
+      vendored SkyReels repo. ``model_path`` (a local snapshot) or the HF cache is
+      searched for ``Wan2.1_VAE.pth``.
+
+    NOTE (skyreels): swapping the VAE is necessary but NOT sufficient for a real
+    SkyReels precompute — SkyReels-I2V is i2v-conditioned (needs ``y``/``clip_fea``
+    per window), so the Wan22DiffusionForcingPreprocessor below does not produce a
+    training-complete SkyReels batch. A SkyReels preprocessor is the remaining
+    piece; this branch exists so the VAE-selection choke point is provider-aware.
+    """
+    if provider.lower() == "skyreels":
+        from generative_flow_adapters.models.base.skyreels_video import _ensure_skyreels_importable  # noqa: PLC0415
+        _ensure_skyreels_importable()
+        from skyreels_v2_infer.modules import download_model, get_vae  # noqa: PLC0415
+        import os  # noqa: PLC0415
+
+        snap = model_path or download_model("Skywork/SkyReels-V2-I2V-1.3B-540P")
+        vae_pth = os.path.join(snap, "Wan2.1_VAE.pth")
+        if not os.path.exists(vae_pth):
+            raise FileNotFoundError(f"Wan2.1_VAE.pth not found in {snap}; pass model.extra.model_path.")
+        return get_vae(vae_pth, device=device, weight_dtype=torch.float32)
+
     _ensure_wan_importable()
     from wan.configs import WAN_CONFIGS  # noqa: PLC0415
     from wan.modules.vae2_2 import Wan2_2_VAE  # noqa: PLC0415
@@ -127,11 +164,13 @@ def main() -> None:
     temporal_length = int(config.model.extra.get("temporal_length", 17))
     latent_height = int(config.model.extra.get("latent_height", 16))
     latent_width = int(config.model.extra.get("latent_width", 16))
-    target_height = latent_height * _WAN22_VAE_SPATIAL_STRIDE
-    target_width = latent_width * _WAN22_VAE_SPATIAL_STRIDE
+    provider = str(config.model.provider).lower()
+    vae_stride = _vae_spatial_stride(provider)  # 16 for wan2.2, 8 for skyreels
+    target_height = latent_height * vae_stride
+    target_width = latent_width * vae_stride
     max_area = args.max_area if args.max_area is not None else config.model.extra.get("max_area")
     max_area = int(max_area) if max_area is not None else None
-    align = 2 * _WAN22_VAE_SPATIAL_STRIDE  # = 32
+    align = 2 * vae_stride  # patch(2) * stride (= 32 for wan2.2, 16 for skyreels)
     num_windows = args.num_windows or None  # 0 -> None
     if args.dataset == "acwm_phys":
         if not args.data_dir:
@@ -141,10 +180,13 @@ def main() -> None:
         default_cache = str(Path(args.hdf5).with_suffix("")) + ".latents"
     cache_dir = args.latent_cache_dir or default_cache
 
-    # VAE only — no DiT, no adapter, no trainer.
-    vae = _load_vae_only(Path(args.ckpt_dir), device)
+    # VAE only — no DiT, no adapter, no trainer. Provider-aware: wan2.2 -> 48-ch
+    # Wan2.2 VAE (stride 16); skyreels -> 16-ch Wan2.1 VAE (stride 8).
+    vae = _load_vae_only(
+        Path(args.ckpt_dir), device, provider=provider, model_path=config.model.extra.get("model_path")
+    )
     vae.dtype = _DTYPES[args.vae_dtype]
-    print(f"loaded Wan2.2 VAE (only) on {device}, encode dtype={args.vae_dtype}")
+    print(f"loaded {provider} VAE (only) on {device}, stride={vae_stride}, encode dtype={args.vae_dtype}")
 
     preprocessor = Wan22DiffusionForcingPreprocessor(
         vae=vae,

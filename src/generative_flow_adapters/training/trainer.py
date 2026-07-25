@@ -1044,6 +1044,11 @@ class Trainer:
         generation, a wandb logger, and a schedule are all present."""
         if self._native_base is None or self.wandb_logger is None:
             return
+        # DynamiCrafter's native loop is batch-based (whole clip + fs/DDIM kwargs),
+        # not Wan's per-frame (frame + max_area/frame_num), so it needs its own
+        # rollout branch. Everything below this guard is the Wan-shaped path.
+        if getattr(self._native_base, "native_eval_batch_mode", False):
+            return self._native_dc_eval_grid(eval_loader, preprocessor)
         schedule = self._eval_step_schedule()
         if not schedule:
             return
@@ -1136,6 +1141,138 @@ class Trainer:
             self.model.to(device)
             self._release_cuda_cache()
 
+    @staticmethod
+    def _dc_norm_video(raw_video: Tensor, device, dtype) -> Tensor:
+        """Raw clip ``[b, T, H, W, 3]`` uint8 -> ``[b, 3, T, 320, 512]`` in [-1, 1]
+        on ``device`` — the pixel form DynamiCrafter's ``generate`` batch expects
+        (same recipe as the compare script's ``_norm_video``)."""
+        v = raw_video.to(torch.float32).div(127.5).sub(1.0)          # [b,T,H,W,3]
+        v = v.permute(0, 4, 1, 2, 3).contiguous()                   # [b,3,T,H,W]
+        b, c, t, h, w = v.shape
+        v = v.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)        # [(b t),3,H,W]
+        v = torch.nn.functional.interpolate(v, size=(320, 512), mode="bilinear", align_corners=False)
+        v = v.reshape(b, t, c, 320, 512).permute(0, 2, 1, 3, 4).contiguous()  # [b,3,T,320,512]
+        return v.to(device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def _native_dc_eval_grid(self, eval_loader: Iterable, preprocessor) -> None:
+        """Batch-mode native eval grid for DynamiCrafter (``native_eval_batch_mode``).
+
+        Twin of :meth:`_native_eval_grid`, but driving DynamiCrafter's *batch*-based
+        ``generate`` (whole clip + ``ddim_steps`` / ``fs``) instead of Wan's
+        per-frame ``generate(frame, max_area, frame_num, ...)``. For each held-out
+        clip and each ``(num_steps, step_level)`` in the schedule it renders the
+        frozen-base rollout and the adapter-composed rollout via the lvdm
+        ``DDIMSampler`` and logs a ``gt | base | adapted`` pixel grid.
+
+        The adapter cond is ``{act, fs, concat}`` — ``concat`` (the first-frame
+        latent, replicated) is re-encoded from the native VAE so the adapter sees
+        exactly the conditioning it trained on (the base builds its own concat
+        internally). The Wan-shaped helpers are left untouched."""
+        schedule = self._eval_step_schedule() or [(int(self.config.inference_num_steps), None)]
+        want = int(self.wandb_logger.num_samples)
+        e = self.config.extra
+        fs = int(e.get("inference_fs", 10))
+        guide = float(e.get("inference_guide_scale", 1.0))
+        step_level_key = str(e.get("shortcut_step_level_key", "step_level"))
+        device = next(self.model.parameters()).device
+        base = self.model.base_model
+        ac_dtype = getattr(base, "_autocast_dtype", None) or torch.bfloat16
+
+        # Collect up to `want` clips across successive eval batches.
+        videos: list[Tensor] = []      # [3,T,320,512] in [-1,1], on device
+        raw_clips: list[Tensor] = []   # [T,H,W,3] uint8 for the GT panel
+        acts: list[Tensor | None] = [] # [1,T,A] on device (adapter action)
+        fpss: list[Tensor | None] = [] # [1] long
+        caps: list[str] = []
+        for raw_batch in eval_loader:
+            if len(videos) >= want:
+                break
+            raw_video = raw_batch.get("video")
+            if not isinstance(raw_video, Tensor):
+                continue
+            norm = self._dc_norm_video(raw_video, device, ac_dtype)
+            act = raw_batch.get("act")
+            fps = raw_batch.get("fps")
+            caption = raw_batch.get("caption")
+            for i in range(norm.shape[0]):
+                if len(videos) >= want:
+                    break
+                videos.append(norm[i])
+                raw_clips.append(raw_video[i])
+                acts.append(act[i : i + 1].to(device=device, dtype=ac_dtype) if isinstance(act, Tensor) else None)
+                fpss.append(fps[i : i + 1].to(device) if isinstance(fps, Tensor) else None)
+                caps.append(caption[i] if isinstance(caption, (list, tuple)) and i < len(caption) else "")
+        if not videos:
+            return
+        n_samples = len(videos)
+
+        was_training = self.model.training
+        self.model.eval()
+        self._release_cuda_cache()
+        try:
+            adapted_by_steps: list[tuple[int, Tensor]] = []
+            base_by_steps: list[tuple[int, Tensor]] = []
+            out_h = out_w = n_frames = None
+            for num_steps, step_level in schedule:
+                ad_rows, bs_rows = [], []
+                for j in range(n_samples):
+                    video_j = videos[j].unsqueeze(0)  # [1,3,T,320,512]
+                    t_len = video_j.shape[2]
+                    act_j = acts[j]
+                    if act_j is None:  # dataset always yields `act`, but stay safe
+                        act_j = torch.zeros((1, t_len, 4), device=device, dtype=ac_dtype)
+                    fps_j = fpss[j] if fpss[j] is not None else torch.full((1,), fs, device=device, dtype=torch.long)
+                    batch = {"video": video_j, "caption": [caps[j]], "act": act_j, "fps": fps_j}
+
+                    base_px = base.generate(
+                        batch, compose_fn=None, ddim_steps=int(num_steps), guidance_scale=guide, fs=fs
+                    )[0]
+
+                    # Adapter cond mirrors training: {act, fs, concat}. concat is the
+                    # first-frame latent replicated, from the SAME native VAE.
+                    z0 = base.encode(video_j)
+                    concat = z0[:, :, 0:1].repeat(1, 1, z0.shape[2], 1, 1)
+                    adapter_cond: dict[str, object] = {
+                        "act": act_j,
+                        "fs": torch.full((1,), fs, device=device, dtype=torch.long),
+                        "concat": concat,
+                    }
+                    if step_level is not None:
+                        adapter_cond[step_level_key] = torch.full((1,), float(step_level), device=device)
+                    adapted_px = self.model.generate(
+                        batch, cond=adapter_cond, ddim_steps=int(num_steps), guidance_scale=guide, fs=fs
+                    )[0]
+
+                    if out_h is None:
+                        out_h, out_w = int(base_px.shape[-2]), int(base_px.shape[-1])
+                        n_frames = min(int(base_px.shape[1]), int(raw_clips[j].shape[0]))
+                    bs_rows.append(self._pixels_to_uint8(base_px)[:n_frames])
+                    ad_rows.append(self._pixels_to_uint8(adapted_px)[:n_frames])
+                adapted_by_steps.append((int(num_steps), torch.stack(ad_rows)))
+                base_by_steps.append((int(num_steps), torch.stack(bs_rows)))
+            gt = torch.stack([self._gt_to_uint8(raw_clips[j], out_h, out_w, n_frames) for j in range(n_samples)])
+            cond_actions = [a for a in acts if a is not None]
+            self.wandb_logger.log_step_size_grid_pixels(
+                target_pixels=gt,
+                adapted_by_steps=adapted_by_steps,
+                base_by_steps=base_by_steps,
+                cond={"act": torch.cat(cond_actions)} if cond_actions else None,
+                step=self.global_step,
+            )
+        except torch.cuda.OutOfMemoryError:
+            print(
+                f"[eval] OOM during DynamiCrafter eval grid at step {self.global_step} — "
+                "skipping this grid.",
+                flush=True,
+            )
+            self._release_cuda_cache()
+        finally:
+            self.model.train(was_training)
+            self._release_cuda_cache()
+            self.model.to(device)
+            self._release_cuda_cache()
+
     @torch.no_grad()
     def _native_quality_eval(
         self, eval_loader: Iterable, preprocessor, metric_names: list[str], num_batches: int, num_steps: int
@@ -1144,6 +1281,11 @@ class Trainer:
         ground-truth clip, at a cheaper step count. Pixel twin of
         ``_run_quality_eval`` — the native path decodes inside ``generate``. A native call makes sure to use the existign 'generate' method of a VideoBaseModel interface"""
         if not metric_names or self._native_base is None:
+            return {}
+        # Pixel quality metrics on a batch-mode (DynamiCrafter) native base are
+        # not wired yet — the visual eval grid is (see _native_dc_eval_grid). Skip
+        # cleanly rather than drive it with the Wan-shaped rollout below.
+        if getattr(self._native_base, "native_eval_batch_mode", False):
             return {}
         params = self._eval_gen_params()
         device = next(self.model.parameters()).device

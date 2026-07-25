@@ -4,19 +4,23 @@
 # rendering (unlike Push Cube's flat vector graphics), 480x640. These prompts
 # describe the content + realistic-render style to keep the base in-domain.
 #
-# STATUS: first guess — NOT yet validated against the base (unlike Push Cube's,
-# which were confirmed via a coherence probe). Run the base-coherence probe on
-# a robot_arm frame before trusting these; prune any that yield noise.
+# STATUS: VALIDATED via SkyReels-V2-1.3B coherence probe (2026-07-25). The
+# first-guess prompts said "Franka Panda" — the word "Panda" made the base
+# hallucinate a panda creature + sepia recolor. DROPPING the brand words
+# ("Franka", "Panda") and using a neutral geometric description + an explicit
+# "no people, no animals" negative gives a coherent white arm with real
+# articulated motion, correct neutral palette, static camera. The `default`
+# below is the exact string that produced the good probe. Keep brand words OUT.
 #
 # Pipeline (same as acwm_pushblock.yaml):
 #   python external_repos/Wan2.2/precompute_prompt_contexts.py \
 #     --ckpt_dir ckpts/Wan2.2-TI2V-5B --prompts_file configs/prompts/acwm_robotarm.yaml
 #   -> writes configs/prompts/acwm_robotarm.contexts.pt
 
-default: "A robotic arm in a simulated tabletop workspace, realistic 3D rendering, the arm moves and reaches toward a target, smooth articulated motion, static camera, plain background."
+default: "A white multi-jointed robotic manipulator arm mounted on a dark cube base, standing on a gray tiled floor, neutral studio lighting, 3D physics simulation render. The arm rotates at its joints and sweeps sideways toward a target. Static camera, plain dark background, no people, no animals."
 
 prompts:
-  - "A Franka Panda robot arm on a table in a physics simulation, realistic 3D render, the arm articulates through its joints reaching for a goal, smooth motion, fixed camera."
-  - "Simulation of a 7-DoF robotic manipulator moving in a clean workspace, photorealistic rendering, the arm sweeps toward a target position, steady overhead-side view."
-  - "A robot arm reaching and moving in an Isaac Sim scene, realistic materials and lighting, continuous joint motion toward a target, stationary camera, uncluttered background."
-  - "Industrial robotic arm executing a reaching motion on a tabletop, 3D simulation render, smooth articulated trajectory, plain floor and wall, static viewpoint."
+  - "A white multi-jointed robotic manipulator arm mounted on a dark cube base, standing on a gray tiled floor, neutral studio lighting, 3D physics simulation render. The arm rotates at its joints and sweeps sideways toward a target. Static camera, plain dark background, no people, no animals."
+  - "A white articulated 7-joint robot arm on a black pedestal over a gridded gray floor, clean simulation render, neutral lighting. The arm bends and reaches toward a target, continuous joint motion. Fixed camera, plain background, no people, no animals."
+  - "A robotic manipulator with a light-colored body and a gripper end-effector on a dark base, gray tiled ground, physics-simulation rendering. The arm swings and articulates through its joints. Stationary camera, uncluttered dark background, no people, no animals."
+  - "A white industrial robot arm mounted on a cube stand, gray checkerboard floor, soft even lighting, 3D render. The arm rotates at the shoulder and folds its gripper down toward the surface. Static viewpoint, plain background, no people, no animals."
