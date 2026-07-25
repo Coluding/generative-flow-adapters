@@ -33,6 +33,9 @@ source .venv-skyreels/bin/activate
 uv pip install --upgrade pip
 echo ">>> installing SkyReels-V2 requirements (isolated 3.10 venv)"
 uv pip install -r "$REPO/requirements.txt"
+# flash-attn kernels need triton, which needs setuptools to import (not pulled
+# by the pinned requirements on 3.10).
+uv pip install setuptools "triton==3.1.0"
 
 # flash-attn: commented out in their requirements.txt, but SkyReels' code
 # imports it at runtime. Building from source is slow/fragile; use a prebuilt

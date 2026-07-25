@@ -19,15 +19,27 @@
 
 set -euo pipefail
 
+<<<<<<< HEAD
 DEST="..scratch-shared/acwm-phys"
 mkdir -p "$DEST"
 
+=======
+# Matches the push_block precompute convention ($HOME/scratch-shared/acwm-phys).
+DEST="$HOME/scratch-shared/acwm-phys"
+mkdir -p "$DEST"
+
+cd "$HOME/generative-flow-adapters"
+>>>>>>> eb7fd3c330edf4a35c5fb98b653799fa1336df7e
 source .venv/bin/activate
 
 huggingface-cli download t1an/ACWM-Phys \
     --repo-type dataset \
     --include "kinematics/robot_arm/*" \
+<<<<<<< HEAD
     --local-dir 
+=======
+    --local-dir "$DEST"
+>>>>>>> eb7fd3c330edf4a35c5fb98b653799fa1336df7e
 
 echo "---- verifying ----"
 for split in ind_train ind_test ood_test; do
@@ -39,7 +51,11 @@ for split in ind_train ind_test ood_test; do
         echo "  $split: MISSING metadata.pt" >&2
     fi
 done
+<<<<<<< HEAD
 echo "Done. data-dir for the pipeline: ds/acwm-phys/kinematics/robot_arm/<split>"
+=======
+echo "Done. data-dir for the pipeline: $HOME/scratch-shared/acwm-phys/kinematics/robot_arm/<split>"
+>>>>>>> eb7fd3c330edf4a35c5fb98b653799fa1336df7e
 echo "Next: base-coherence probe, e.g."
 echo "  IMG_SRC=ds/acwm-phys/kinematics/robot_arm/ind_train/episode_0.mp4 \\"
 echo "  bash jobs/experiments/local_compare_acwm_native.sh   # (point it at the robot_arm data-dir)"

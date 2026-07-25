@@ -46,6 +46,7 @@ class AdaptedModel(nn.Module):
         output_composition: str = "add",
         gate_bias: float = 0.0,
         gate_cap: float | None = None,
+        pretrain_steps: int = 0,
         include_base_direction: bool = False,
         normalize_base_direction: bool = True,
     ) -> None:
@@ -65,6 +66,13 @@ class AdaptedModel(nn.Module):
         # e.g. 0.9 guarantees the adapter prediction keeps >= (1-cap) of the
         # gradient forever. None = no cap (original behaviour).
         self.gate_cap = gate_cap
+        # AVID pure-adapter warmup (see AdapterConfig.pretrain_steps). The
+        # Trainer feeds the current optimizer step into `_train_step` before
+        # each forward; while `_train_step < pretrain_steps` the composition is
+        # bypassed (loss on the standalone adapter prediction) so the pred head
+        # is competent before the gate starts learning.
+        self.pretrain_steps = int(pretrain_steps)
+        self._train_step = 0
         self.include_base_direction = include_base_direction
         self.normalize_base_direction = normalize_base_direction
         self.adapter.attach_base_model(base_model)
@@ -163,6 +171,11 @@ class AdaptedModel(nn.Module):
 
         return generate(conditioning, compose_fn=_compose_step, **kwargs)
 
+    def set_train_step(self, step: int) -> None:
+        """Trainer hook: current optimizer step, drives the AVID pure-adapter
+        warmup schedule in `_compose`. No-op effect unless `pretrain_steps > 0`."""
+        self._train_step = int(step)
+
     def _compose(self, base_output: Tensor, adapter_result: Tensor | OutputAdapterResult) -> Tensor:
         self._last_gate = None
         # Raw adapter-branch output from this call (pre-composition), detached —
@@ -179,6 +192,22 @@ class AdaptedModel(nn.Module):
 
         output_kind = adapter_result.output_kind.lower()
         composition = self.output_composition.lower()
+
+        # AVID pure-adapter warmup: for the first `pretrain_steps`, bypass the
+        # gate and return the STANDALONE adapter output (mask_mix) / full residual
+        # (gated_residual). The gate tensor is not used, so it gets no gradient
+        # and stays at init until the warmup ends — by which point the pred head
+        # is already competent, so the gate has something worth mixing in.
+        if self.pretrain_steps > 0 and self._train_step < self.pretrain_steps:
+            if composition in {"mask_mix", "avid_mask_mix"}:
+                if output_kind != "prediction":
+                    raise ValueError("Mask-mix warmup requires adapter output_kind='prediction'.")
+                self._last_gate = torch.zeros_like(adapter_result.adapter_output).detach()
+                return adapter_result.adapter_output
+            if composition in {"gated_residual", "gated_add", "residual_mask"}:
+                self._last_gate = torch.ones_like(adapter_result.adapter_output).detach()
+                return base_output + adapter_result.adapter_output
+            # add / replace: already "pure adapter" or ungated — warmup is a no-op.
 
         if composition == "add":
             if output_kind == "delta":

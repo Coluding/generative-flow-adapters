@@ -1,0 +1,22 @@
+# Text prompts for the frozen Wan2.2 base on ACWM-Phys Robot Arm (kinematics).
+#
+# Domain: a 7-DoF Franka Panda arm in an Isaac Sim workspace, realistic 3D
+# rendering (unlike Push Cube's flat vector graphics), 480x640. These prompts
+# describe the content + realistic-render style to keep the base in-domain.
+#
+# STATUS: first guess — NOT yet validated against the base (unlike Push Cube's,
+# which were confirmed via a coherence probe). Run the base-coherence probe on
+# a robot_arm frame before trusting these; prune any that yield noise.
+#
+# Pipeline (same as acwm_pushblock.yaml):
+#   python external_repos/Wan2.2/precompute_prompt_contexts.py \
+#     --ckpt_dir ckpts/Wan2.2-TI2V-5B --prompts_file configs/prompts/acwm_robotarm.yaml
+#   -> writes configs/prompts/acwm_robotarm.contexts.pt
+
+default: "A robotic arm in a simulated tabletop workspace, realistic 3D rendering, the arm moves and reaches toward a target, smooth articulated motion, static camera, plain background."
+
+prompts:
+  - "A Franka Panda robot arm on a table in a physics simulation, realistic 3D render, the arm articulates through its joints reaching for a goal, smooth motion, fixed camera."
+  - "Simulation of a 7-DoF robotic manipulator moving in a clean workspace, photorealistic rendering, the arm sweeps toward a target position, steady overhead-side view."
+  - "A robot arm reaching and moving in an Isaac Sim scene, realistic materials and lighting, continuous joint motion toward a target, stationary camera, uncluttered background."
+  - "Industrial robotic arm executing a reaching motion on a tabletop, 3D simulation render, smooth articulated trajectory, plain floor and wall, static viewpoint."

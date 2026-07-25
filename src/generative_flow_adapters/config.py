@@ -38,6 +38,13 @@ class AdapterConfig:
     # gradient — counters the measured gate-saturation trap (uxrst2k5:
     # gate 0.5 -> 0.99 in ~70 steps, adapter grad norm -> 0.003).
     gate_cap: float | None = None
+    # AVID pure-adapter warmup: for the first `pretrain_steps` optimizer steps,
+    # the composition is bypassed and the loss is on the adapter's STANDALONE
+    # prediction (mask=0 for mask_mix; full residual for gated_residual), so the
+    # adapter head becomes competent BEFORE the gate is learnable — a different
+    # escape from gate-saturation than gate_cap. The gate receives no gradient
+    # during warmup and stays at its init. 0 = off. (AVID `pretrain_steps`.)
+    pretrain_steps: int = 0
     rank: int = 4
     alpha: float = 1.0
     target_modules: list[str] = field(default_factory=lambda: ["to_q", "to_k", "to_v", "to_out", "ff", "proj"])

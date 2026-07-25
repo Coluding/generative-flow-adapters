@@ -401,6 +401,10 @@ class Trainer:
 
     def training_step(self, batch: Mapping[str, Tensor | object]) -> dict[str, object]:
         self.model.train()
+        # Feed the current optimizer step to the model for the AVID pure-adapter
+        # warmup schedule (no-op unless the adapter set pretrain_steps > 0).
+        if hasattr(self.model, "set_train_step"):
+            self.model.set_train_step(self.global_step)
         with self._prof("  forward"):
             loss, loss_components, _x_t, _t, _cond, _prediction, batch = self._forward_and_loss(batch)
         model_type = getattr(self.model, "model_type", None)
