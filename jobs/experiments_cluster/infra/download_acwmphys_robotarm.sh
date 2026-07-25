@@ -19,10 +19,11 @@
 
 set -euo pipefail
 
-DEST="$HOME/projects/generative-flow-adapters/ds/acwm-phys"
+# Matches the push_block precompute convention ($HOME/scratch-shared/acwm-phys).
+DEST="$HOME/scratch-shared/acwm-phys"
 mkdir -p "$DEST"
 
-cd "$HOME/projects/generative-flow-adapters"
+cd "$HOME/generative-flow-adapters"
 source .venv/bin/activate
 
 huggingface-cli download t1an/ACWM-Phys \
@@ -40,7 +41,7 @@ for split in ind_train ind_test ood_test; do
         echo "  $split: MISSING metadata.pt" >&2
     fi
 done
-echo "Done. data-dir for the pipeline: ds/acwm-phys/kinematics/robot_arm/<split>"
+echo "Done. data-dir for the pipeline: $HOME/scratch-shared/acwm-phys/kinematics/robot_arm/<split>"
 echo "Next: base-coherence probe, e.g."
 echo "  IMG_SRC=ds/acwm-phys/kinematics/robot_arm/ind_train/episode_0.mp4 \\"
 echo "  bash jobs/experiments/local_compare_acwm_native.sh   # (point it at the robot_arm data-dir)"

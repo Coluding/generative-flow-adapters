@@ -31,6 +31,8 @@ class DiffusionInferenceSampler:
         initial_sample: Tensor | None = None,
         unconditional_cond: object | None = None,
         guidance_scale: float = 1.0,
+        anchor_mask: Tensor | None = None,
+        anchor_latent: Tensor | None = None,
     ) -> Tensor:
         target = batch.get("target")
         if not isinstance(target, Tensor):
@@ -44,6 +46,8 @@ class DiffusionInferenceSampler:
             initial_sample=initial_sample,
             unconditional_cond=unconditional_cond,
             guidance_scale=guidance_scale,
+            anchor_mask=anchor_mask,
+            anchor_latent=anchor_latent,
         )
 
     def sample(
@@ -57,6 +61,8 @@ class DiffusionInferenceSampler:
         initial_sample: Tensor | None = None,
         unconditional_cond: object | None = None,
         guidance_scale: float = 1.0,
+        anchor_mask: Tensor | None = None,
+        anchor_latent: Tensor | None = None,
         verbose: bool = True,
     ) -> Tensor:
         """Run the denoising rollout. Set ``guidance_scale > 1`` and pass
@@ -68,8 +74,21 @@ class DiffusionInferenceSampler:
         the supplied ``cond``, one with ``unconditional_cond``. The outputs
         are combined as ``e_uncond + scale * (e_cond - e_uncond)`` (single-CFG;
         if you need DynamiCrafter's text/image dual-CFG, build a custom loop).
+
+        ``anchor_mask`` + ``anchor_latent`` reproduce DynamiCrafter's image
+        anchoring (lvdm ``DDIMSampler.ddim_sampling`` with ``clean_cond=True``):
+        at the top of every step the masked positions of the running sample are
+        overwritten with the CLEAN ``anchor_latent``
+        (``sample = anchor_latent*mask + (1-mask)*sample``), pinning e.g. the
+        first frame to the observation latent so generation stays grounded on
+        it. Both ``None`` (the default) keeps the plain unanchored rollout, so
+        existing callers are unaffected.
         """
         cfg_active = guidance_scale > 1.0 and unconditional_cond is not None
+        anchoring = anchor_mask is not None and anchor_latent is not None
+        if anchoring:
+            anchor_mask = anchor_mask.to(device=device, dtype=dtype)
+            anchor_latent = anchor_latent.to(device=device, dtype=dtype)
         scheduler = self._build_scheduler()
         if initial_sample is not None:
             if tuple(initial_sample.shape) != tuple(shape):
@@ -88,6 +107,10 @@ class DiffusionInferenceSampler:
                 if verbose: iterator = tqdm(scheduler.timesteps, desc="Inference sampling...",)
                 else: iterator = iter(scheduler.timesteps)
                 for timestep in iterator:
+                    # Image anchoring (clean_cond): pin masked positions to the
+                    # clean anchor latent before the model sees the sample.
+                    if anchoring:
+                        sample = anchor_latent * anchor_mask + (1.0 - anchor_mask) * sample
                     t = torch.full((shape[0],), int(timestep), device=device, dtype=torch.long)
                     cond_output = self.model(sample, t, cond)
                     if False: #TODO check if we need unconditional sampling
