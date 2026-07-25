@@ -12,6 +12,9 @@ On-disk layout (one directory per environment split, e.g.
 Verified against the release 2026-07-22: ``push_block`` (the paper's Push
 Cube, A=2 pusher-target actions) and ``pushcube_2`` (two-pusher ablation,
 A=4) both have fixed 66-frame episodes with action rows == frame count.
+``kinematics/robot_arm`` (A=7) is nominally 128 frames, but ``length`` there
+is nominal only — a few mp4s decode shorter, so episode length comes from
+probing the videos (see :meth:`ACWMPhysTranslator._probe_frame_counts`).
 
 The translator emits the same clip dict as :class:`MetaWorldTranslator`
 (``video`` uint8 [T, H, W, C], ``act`` float32 [T, A] summed per stride
@@ -83,15 +86,76 @@ class ACWMPhysTranslator(Translator):
         # Lazily opened per process (DataLoader workers fork before first
         # __getitem__, so each worker builds its own readers).
         self._readers: dict[int, object] = {}
+        # metadata.pt's `length` is NOMINAL, not the decodable frame count — see
+        # _probe_frame_counts. Probed once here (list[int], pickles by value to
+        # workers), so the sampler never asks decord for a frame past EOF.
+        self._video_frames: list[int] = self._probe_frame_counts()
+
+    def _probe_frame_counts(self) -> list[int]:
+        """Decodable frame count per episode, probed from the mp4s themselves.
+
+        The release's ``metadata.pt`` reports a *nominal* per-episode ``length``
+        (128 for ``kinematics/robot_arm``) and always ships ``actions`` with that
+        many rows, but a few exported videos are genuinely shorter — in
+        ``robot_arm/ind_train`` 6 of 2002 episodes decode to 75/79/79/80/96/121
+        frames (verified 2026-07-25: local sha256 matches the upstream HF
+        blob hash and ``ffprobe -count_frames`` agrees with decord, so the files
+        are complete, not truncated downloads). Trusting ``length`` makes the
+        window sampler emit starts past the end of the video and decord raises
+        ``IndexError: Out of bound indices``.
+
+        Result is cached to a JSON sidecar next to ``metadata.pt`` (best effort —
+        a read-only data dir just means re-probing, ~7 s for 2000 episodes).
+        """
+        import json  # noqa: PLC0415 — only needed on this path
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        cache_path = self.data_dir / "frame_counts.json"
+        cached: dict[str, int] = {}
+        if cache_path.exists():
+            try:
+                cached = {str(k): int(v) for k, v in json.loads(cache_path.read_text()).items()}
+            except (OSError, ValueError):
+                cached = {}
+
+        paths = [str(entry["video_path"]) for entry in self._meta]
+        missing = [p for p in dict.fromkeys(paths) if p not in cached]
+        if missing:
+            from decord import VideoReader  # noqa: PLC0415 — heavy import
+
+            def probe(rel: str) -> tuple[str, int]:
+                return rel, len(VideoReader(str(self.data_dir / rel)))
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                cached.update(dict(pool.map(probe, missing)))
+            try:
+                cache_path.write_text(json.dumps(cached, sort_keys=True))
+            except OSError:
+                pass  # read-only dataset dir: just re-probe next time
+
+        return [cached[p] for p in paths]
 
     def list_episodes(self) -> list[EpisodeRef]:
         refs: list[EpisodeRef] = []
+        short: list[tuple[int, int, int]] = []
         for idx, entry in enumerate(self._meta):
             n_frames = int(entry["length"])
             n_actions = int(entry["actions"].shape[0])
-            # The usable span is bounded by both streams (release has them
-            # equal; min() keeps us safe if a future env pads differently).
-            refs.append(EpisodeRef(identifier=(self.env_name, str(idx)), length=min(n_frames, n_actions)))
+            n_video = int(self._video_frames[idx])
+            # The usable span is bounded by all three streams: nominal length,
+            # action rows, and what the mp4 actually decodes to (the last one is
+            # smaller for a handful of episodes — see _probe_frame_counts).
+            usable = min(n_frames, n_actions, n_video)
+            if n_video < min(n_frames, n_actions):
+                short.append((idx, min(n_frames, n_actions), n_video))
+            refs.append(EpisodeRef(identifier=(self.env_name, str(idx)), length=usable))
+        if short:
+            preview = ", ".join(f"ep{i}: {claimed}->{actual}" for i, claimed, actual in short[:5])
+            more = f" (+{len(short) - 5} more)" if len(short) > 5 else ""
+            print(
+                f"[acwm_phys] {self.env_name}: {len(short)}/{len(refs)} episodes have fewer video "
+                f"frames than metadata claims; clipped to the decodable length [{preview}{more}]"
+            )
         return refs
 
     def _reader(self, episode_idx: int):
