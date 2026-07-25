@@ -44,6 +44,14 @@ class BaseVideoModel(nn.Module, ABC):
     the older :class:`BaseGenerativeModel`, so existing losses keep working.
     """
 
+    # When True, the Trainer's periodic native generation eval must drive this
+    # backbone with a whole *batch* + backbone-native kwargs (DynamiCrafter's
+    # ``generate(batch, ddim_steps, fs, ...)``) rather than the Wan-shaped
+    # per-frame ``generate(frame, max_area, frame_num, ...)`` path. Subclasses
+    # that own a batch-based native loop set this True to select the matching
+    # branch in ``Trainer._native_eval_grid`` / ``_native_quality_eval``.
+    native_eval_batch_mode = False
+
     def __init__(self, model_type: str, prediction_type: str) -> None:
         super().__init__()
         self.model_type = model_type

@@ -41,6 +41,7 @@ from generative_flow_adapters.data import (
     SD_VAE_DDCONFIG,
     TranslatedClipDataset,
     VideoAutoencoderKL,
+    build_acwmphys_clip_dataset,
     build_metaworld_clip_dataset,
     precompute_null_text_embedding,
 )
@@ -62,6 +63,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/dynamicrafter/diffusion_avid_shortcut_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2_large.hdf5")
+    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
+                        help="Source dataset. 'acwm_phys' reads a split dir of the HF ACWM-Phys "
+                             "release via --data-dir (DC encodes latents live with its SD-VAE).")
+    parser.add_argument("--data-dir", default=None,
+                        help="ACWM-Phys split directory (e.g. ds/acwm-phys/kinematics/robot_arm/ind_train). "
+                             "Required when --dataset acwm_phys.")
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument(
@@ -334,13 +341,29 @@ def main() -> None:
         image_resampler=image_resampler,
     )
 
-    translator, dataset = build_metaworld_clip_dataset(
-        config.data,
-        default_window_width=temporal_length,
-        hdf5=args.hdf5,
-        frame_stride=args.frame_stride,
-        sampling=args.sampling,
-    )
+    if args.dataset == "acwm_phys":
+        if not args.data_dir:
+            parser.error("--dataset acwm_phys requires --data-dir (a split directory of the HF release).")
+        # ACWM-Phys emits the SAME clip dict as MetaWorld, so the DynamiCrafter
+        # preprocessor + trainer downstream are unchanged; DC encodes latents
+        # live via its SD-VAE (no Wan-style precompute). letterbox_aspect=None
+        # keeps the raw frames (square 1024^2 push_block / 4:3 robot_arm); the
+        # preprocessor resizes to the DC512 target below.
+        translator, dataset = build_acwmphys_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            data_dir=args.data_dir,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+        )
+    else:
+        translator, dataset = build_metaworld_clip_dataset(
+            config.data,
+            default_window_width=temporal_length,
+            hdf5=args.hdf5,
+            frame_stride=args.frame_stride,
+            sampling=args.sampling,
+        )
 
     # Hold out a fraction for the periodic eval cycle. Random window-level split
     # with a fixed generator — note that adjacent windows from the same episode

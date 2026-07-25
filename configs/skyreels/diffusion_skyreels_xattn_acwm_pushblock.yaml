@@ -1,0 +1,91 @@
+# ACWM-Phys Push Cube on the SkyReels-V2-I2V-1.3B base (matrix run 2).
+#
+# SkyReels is the WEAK flow-matching base for the base-strength axis (vs
+# Wan2.2-5B strong, DynamiCrafter diffusion). Wan(2.1)-lineage DiT, velocity,
+# 16-channel Wan2.1 VAE (vae_stride (4,8,8) -> 8x spatial, 4x temporal).
+# See thesis-vault 30_Knowledge/writing/ablation-axes.md (Axis 5).
+#
+# === DRAFT — NOT YET RUNNABLE FOR TRAINING ===
+# SkyReelsVideoModel + provider registration + provider-aware precompute exist,
+# but SkyReels-V2-I2V is I2V-CONDITIONED (each DiT step needs clip_fea + y), so a
+# SkyReels-specific batch preprocessor (producing z0 + y + clip_fea + context per
+# window) is still required before precompute/training. generate() (base-only and
+# adapter-composed) works via the native Image2VideoPipeline. Text is encoded on
+# the fly by SkyReels' OWN T5 — the Wan umT5 configs/prompts/*.contexts.pt are
+# NOT reusable here.
+
+name: diffusion_skyreels_xattn_acwm_pushblock
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+
+model:
+  type: flow
+  provider: skyreels
+  prediction_type: velocity
+  freeze: true
+  extra:
+    model_id: Skywork/SkyReels-V2-I2V-1.3B-540P
+    # model_path:  # optional local snapshot; else resolved from the HF cache
+    dtype: bf16
+    offload: true
+    latent_channels: 16
+    temporal_length: 65       # 66-frame episodes -> 65 = 4*16+1 -> 17 latent frames
+    max_area: 147456          # ~384^2 (stride-8 regime; smaller than Wan's 768^2)
+    latent_height: 48         # 48 * 8 = 384 px
+    latent_width: 48
+    default_prompt: "colored squares and a gray circle move on a plain white surface, minimal flat 2D animation, crisp edges, static camera."
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 16             # SkyReels Wan2.1 VAE latent channels
+  composition: mask_mix
+  gate_bias: 0.0
+  gate_cap: 0.9
+  pretrain_steps: 0
+  extra:
+    backbone: wan             # Wan-lineage adapter head
+    wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
+    condition_on_base_outputs: true
+    use_step_level_conditioning: false
+    action_dropout_prob: 0.0
+    action_injection: cross_attention
+    action_max_len: 128
+
+conditioning:
+  type: action
+  input_dim: 2               # ACWM-Phys push_block: 2D pusher-target action
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  output_dir: outputs/acwm-pushblock-skyreels-run
+  checkpoint_every_n_steps: 500
+  keep_last_checkpoints: 3
+  inference_every_n_steps: 300
+  eval_every_n_steps: 300
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_frame_num: 97
+    inference_seed: 0
+    cond_frames: 1
+    action_per_frame: false
+    wandb:
+      enable: true
+      require_vae: false
+      project: SkyReels-avid-xattn-acwm-pushblock
+      num_samples: 3
+      fps: 5

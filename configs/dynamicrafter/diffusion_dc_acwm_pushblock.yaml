@@ -1,0 +1,112 @@
+name: diffusion_dc_acwm_pushblock
+
+# DynamiCrafter (native `dynamicrafter_video` BaseVideoModel) on ACWM-Phys Push
+# Cube — matrix run 5 (DC x 2D cube). The frozen base is the real vendored lvdm
+# LatentVisualDiffusion (4-channel SD-VAE, z_channels=4), delegating generation
+# to its own DDIMSampler with the adapter injected at the apply_model seam. This
+# is the BaseVideoModel-conforming path; the OLD run used the non-conforming
+# `dynamicrafter` UNet wrapper (reimplemented sampler) — this config is the
+# migration (2026-07-25).
+#
+# DATA: HF t1an/ACWM-Phys rigid_dynamics/push_block. 1500 ind_train episodes,
+# fixed 66 frames @ 10 fps, released 1024x1024 (square). Actions [66, 2] in
+# [-1,1] (2D pusher target — action-informative). DC encodes latents LIVE via
+# its SD-VAE (no Wan-style precompute). Launch reads the split dir directly:
+#
+#   python scripts/train_avid_shortcut_metaworld.py \
+#     --config configs/dynamicrafter/diffusion_dc_acwm_pushblock.yaml \
+#     --dataset acwm_phys --data-dir ds/acwm-phys/rigid_dynamics/push_block/ind_train \
+#     --frame-stride 1 --target-height 512 --target-width 512
+#
+# RESOLUTION: source is square 1024^2. DC512's native latent is 40x64 (8x down
+# of 320x512); a square target keeps the Push Cube framing undistorted. Use
+# --target-height 512 --target-width 512 (latent 64x64) — or 320x320 for the
+# lighter footprint. resize_mode is "stretch"; square in -> square out, no warp.
+#
+# ADAPTER: DC's native AVID output-adapter recipe (avid_mask_mix + structured
+# `act` conditioning at the 4-ch SD-VAE width) — DC injects actions through its
+# own structured encoder, NOT the Wan cross-attention path. Matrix "clean
+# baseline" intent holds: no gate_cap, no warmup, no sigma_shift here.
+
+data:
+  frame_stride: 1
+  fs_value: 1
+
+model:
+  type: diffusion
+  provider: dynamicrafter_video
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  pretrained_model_name_or_path: ckts/dynami512.ckpt
+  extra:
+    model_config_path: configs/base/dynamicrafter512.yaml
+    dtype: bf16
+    temporal_length: 16
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 2            # ACWM push_block: 2D pusher-target action
+    image_encoder_device: cuda
+  conditions:
+    - key: act
+      input_dim: 2           # ACWM push_block da=2
+      encoder: mlp
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  shortcut_consistency_target: endpoint_inversion
+  inference_every_n_steps: 2000
+  inference_num_steps: 50
+  output_dir: outputs/diffusion_dc_acwm_pushblock
+  log_metrics_jsonl: true
+  checkpoint_every_n_steps: 2000
+  keep_last_checkpoints: 3
+  eval_every_n_steps: 2000
+  eval_num_batches: 8
+  eval_metric: base_loss
+  extra:
+    amp_dtype: bf16
+    shortcut_step_level_key: step_level
+    shortcut_anchor_prob: 0.55
+    eval_step_schedule:
+      - { num_steps: 1,  step_level: 1.0 }
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    video_logging:
+      enable: true
+      num_samples: 1
+      fps: 2
+      wandb_project: dc-acwm-pushblock

@@ -1,0 +1,120 @@
+# ACWM-Phys Push Cube — INTERVENTION run (matrix run 6, 2026-07-25).
+#
+# Question: can a HARDER gate cap + adapter warmup rescue the adapter from
+# base-parity collapse on the action-informative-but-flat 2D domain, WITHOUT
+# moving to Robot Arm? Push Cube is the stress case: the frozen base is
+# near-perfect (masked denoise loss ~0.036 at 17f — 8.7x below Robot Arm's
+# 0.314, measured 2026-07-25 with a random adapter), so there is almost no
+# residual and the mask_mix gate happily saturates toward a clone. This run
+# fights that with two levers, ON TOP of the established capshift recipe:
+#   gate_cap:       0.9 -> 0.5   base keeps >=50%; adapter forced to own the rest
+#   pretrain_steps: 0   -> 500   AVID pure-adapter warmup before composition
+# Everything else is identical to the parent
+# (diffusion_wan22_avid_xattn_gatelow_capshift_acwm_pushblock.yaml), incl.
+# sigma_shift 5.0 — so a diff against the parent isolates cap+warmup.
+# Reuses the SAME precomputed pushblock latents (no new precompute).
+#
+# See thesis-vault 30_Knowledge/writing/ablation-axes.md (Axis 3 interventions).
+
+name: diffusion_wan22_avid_xattn_cap50_warmup_acwm_pushblock
+
+data:
+  frame_stride: 1
+  fs_value: 1
+  val_fraction: 0.01
+
+model:
+  type: flow
+  provider: wan2.2
+  prediction_type: velocity
+  freeze: true
+  extra:
+    wan_config_path: configs/base/wan2.2_ti2v_5B.yaml
+    allow_missing_checkpoint: true
+    dtype: bf16
+    latent_channels: 48
+    temporal_length: 65
+    max_area: 589824
+    latent_height: 16
+    latent_width: 16
+    text_prompts_file: configs/prompts/acwm_pushblock.yaml
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 48
+  composition: mask_mix
+  gate_bias: 0.0
+  gate_cap: 0.5             # RUN 6: harder cap (was 0.9) — base keeps >=50%
+  pretrain_steps: 500       # RUN 6: AVID pure-adapter warmup (was 0)
+  extra:
+    backbone: wan
+    wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
+    condition_on_base_outputs: true
+    use_step_level_conditioning: false
+    step_level_key: step_level
+    step_level_transform: log2
+    action_dropout_prob: 0.0
+    action_injection: cross_attention
+    action_max_len: 128
+
+conditioning:
+  type: action
+  input_dim: 2
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  output_dir: outputs/acwm-pushblock-cap50-warmup-run
+  checkpoint_every_n_steps: 500
+  keep_last_checkpoints: 3
+  shortcut_direction_weight: 0.0
+  shortcut_target_method: distillation
+  inference_every_n_steps: 300
+  eval_every_n_steps: 300
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+  quality_eval_num_steps: 10
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 300
+  quality_dist_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    sigma_shift: 5.0          # kept from parent recipe (train-only; eval stays U(0,1))
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_use_prompt: true
+    inference_frame_num: 65
+    inference_seed: 0
+    inference_max_area: 589824
+    cond_frames: 1
+    cond_frames_dist:
+      1: 1
+    action_per_frame: false
+    shortcut_anchor_prob: 1.0
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
+
+    wandb:
+      enable: true
+      require_vae: false
+      project: Wan2.2-avid-xattn-acwm-pushblock
+      num_samples: 3
+      fps: 5
