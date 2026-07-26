@@ -6,8 +6,8 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=32:00:00
-#SBATCH --output=logs/acwm-robotarm-skyreels-%x-%j.out
-#SBATCH --error=logs/acwm-robotarm-skyreels-%x-%j.err
+#SBATCH --output=logs/skyreels/acwm-robotarm-skyreels-%x-%j.out
+#SBATCH --error=logs/skyreels/acwm-robotarm-skyreels-%x-%j.err
 
 # SkyReels-V2-I2V-1.3B x ACWM-Phys Robot Arm (matrix run 3) — the WEAK flow base
 # on the VISUALLY-RICH da=7 domain (the clean base-strength arena: the frozen Wan
@@ -34,7 +34,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="$HOME/scratch-shared/acwm-phys/kinematics/robot_arm"
+ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
 CACHE="$ROOT/skyreels.latents.shared"
 
 for d in "$ROOT/ind_train/metadata.pt" "$ROOT/ind_test/metadata.pt"; do

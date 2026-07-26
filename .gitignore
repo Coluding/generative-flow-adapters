@@ -12,7 +12,7 @@ build/
 external_repos/
 
 # Model checkpoints and weights
-ckpts/
+ckpts
 checkpoints/
 *.safetensors
 *.pt
@@ -24,10 +24,10 @@ checkpoints/
 huggingface/
 
 # Experiment outputs
-outputs/
+outputs
 samples/
 logs/
-wandb/
+wandb
 tensorboard/
 
 # IDE

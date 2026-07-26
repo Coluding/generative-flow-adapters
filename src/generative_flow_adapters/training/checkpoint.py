@@ -16,11 +16,69 @@ Two checkpoint flavours:
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+
+
+def _probe_write_error(directory: Path) -> str | None:
+    """Re-attempt a tiny write in ``directory`` to recover the real ``errno``.
+
+    ``torch.save`` reports a failed write as its own ``PytorchStreamWriter`` /
+    ``unexpected pos`` ``RuntimeError`` and discards the underlying ``OSError``,
+    so a traceback never names the actual cause. A 4 KiB write plus ``fsync`` in
+    the same directory brings ``EDQUOT`` / ``ENOSPC`` straight back. Note that
+    ``shutil.disk_usage`` is useless here: on a quota'd shared filesystem the
+    device reports terabytes free while the user's own quota is exhausted.
+    """
+    probe = directory / ".checkpoint_write_probe"
+    try:
+        with open(probe, "wb") as handle:
+            handle.write(b"\0" * 4096)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        if exc.errno == errno.EDQUOT:
+            return "disk quota exceeded"
+        if exc.errno == errno.ENOSPC:
+            return "no space left on device"
+        return f"{exc.strerror} (errno {exc.errno})"
+    finally:
+        probe.unlink(missing_ok=True)
+    return None
+
+
+def _save_atomic(payload: dict[str, Any], path: Path) -> None:
+    """``torch.save`` into a sibling temp file, then rename it into place.
+
+    Saving straight to ``path`` means a write that dies partway — full disk,
+    exhausted quota, killed job — leaves a truncated file where a checkpoint
+    should be. That is worse than no checkpoint at all: a short ``best.pt`` is
+    still a readable zip prefix, so the next run may load it without complaint.
+    Staging through ``.tmp`` keeps the last good checkpoint intact, and the
+    rename is atomic within a directory.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(payload, tmp)
+    except (OSError, RuntimeError) as exc:
+        tmp.unlink(missing_ok=True)
+        cause = _probe_write_error(path.parent)
+        detail = (
+            f"the filesystem holding {path.parent} reports: {cause}"
+            if cause
+            else f"a follow-up test write to {path.parent} succeeded, so the cause is unclear"
+        )
+        raise RuntimeError(
+            f"Failed writing checkpoint {path} ({type(exc).__name__}: {exc}) — {detail}. "
+            f"If this is a quota problem, check it (`myquota`) and point "
+            f"training.output_dir at scratch rather than $HOME."
+        ) from exc
+    os.replace(tmp, path)
 
 
 def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -66,7 +124,7 @@ class CheckpointManager:
             path = self.directory / f"{tag}.pt"
         else:
             path = self.directory / f"step_{int(global_step):08d}.pt"
-        torch.save(payload, path)
+        _save_atomic(payload, path)
 
         if tag is None:
             self._step_checkpoints.append(path)

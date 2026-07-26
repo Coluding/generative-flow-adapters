@@ -41,7 +41,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="$HOME/scratch-shared/acwm-phys/kinematics/robot_arm"
+ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
 test -f "$ROOT/ind_train/metadata.pt" || { echo "Error: $ROOT/ind_train/metadata.pt missing — run download_acwmphys_robotarm.sh" >&2; exit 1; }
 test -f "ckts/dynami512.ckpt" || { echo "Error: DC checkpoint ckts/dynami512.ckpt missing" >&2; exit 1; }
 

@@ -6,8 +6,8 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=32:00:00
-#SBATCH --output=logs/acwm-pushblock-%x-%j.out
-#SBATCH --error=logs/acwm-pushblock-%x-%j.err
+#SBATCH --output=logs/wan/acwm-pushblock-%x-%j.out
+#SBATCH --error=logs/wan/acwm-pushblock-%x-%j.err
 
 # MATRIX RUN 6 — Wan2.2 · ACWM Push Cube · gate_cap 0.5 + AVID warmup 500.
 # Intervention test: can a harder cap + adapter warmup rescue the adapter from
@@ -37,7 +37,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="$(pwd)/ds/acwm-phys/rigid_dynamics/push_block"
+ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
 CACHE="$ROOT/latents.shared"
 
 for d in "$ROOT/ind_train/metadata.pt" "$ROOT/ind_test/metadata.pt"; do

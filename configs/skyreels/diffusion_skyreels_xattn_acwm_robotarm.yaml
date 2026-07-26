@@ -66,10 +66,21 @@ training:
   output_dir: outputs/acwm-robotarm-skyreels-run
   checkpoint_every_n_steps: 500
   keep_last_checkpoints: 3
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 0.0      
+  shortcut_target_method: distillation
   inference_every_n_steps: 300
   eval_every_n_steps: 300
   quality_metrics: [psnr, ssim, lpips, mse]
   quality_eval_num_batches: 4
+  quality_eval_num_steps: 10
+  quality_dist_metrics: [fvd, fid]
+  quality_dist_every_n_steps: 300
+  quality_dist_num_batches: 4
+  baseline_eval_inference: true
+  baseline_eval_loss: false
+  baseline_eval_quality: false
 
   extra:
     amp_dtype: bf16

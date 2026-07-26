@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=acwm-pushblock-dc
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=32:00:00
-#SBATCH --output=logs/acwm-pushblock-%x-%j.out
-#SBATCH --error=logs/acwm-pushblock-%x-%j.err
+#SBATCH --output=logs/dc/acwm-pushblock-dc-%x-%j.out
+#SBATCH --error=logs/dc/acwm-pushblock-dc-%x-%j.err
 
 # MATRIX RUN 5 — DynamiCrafter · ACWM Push Cube (weak diffusion base, flat 2D).
 # `dynamicrafter_video` provider, live 4-ch SD-VAE encode, no precompute.
@@ -36,7 +36,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="$(pwd)/ds/acwm-phys/rigid_dynamics/push_block"
+ROOT="/home/lbierling/scratch-shared/acwm-phys/rigid_dynamics/push_block"
 test -f "$ROOT/ind_train/metadata.pt" || { echo "Error: $ROOT/ind_train/metadata.pt missing — run jobs/download_acwmphys.sh" >&2; exit 1; }
 test -f "ckts/dynami512.ckpt" || { echo "Error: DC checkpoint ckts/dynami512.ckpt missing" >&2; exit 1; }
 

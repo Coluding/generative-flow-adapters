@@ -64,13 +64,13 @@ adapter:
   feature_dim: 48
   composition: mask_mix
   gate_bias: 0.0
-  gate_cap: 0.9
+  gate_cap: 0.5
   # AVID pure-adapter warmup: for the first N optimizer steps the loss is on
   # the adapter's STANDALONE prediction (gate bypassed), so the pred head is
   # competent before the gate starts learning — a toolbox lever vs gate
   # saturation (ablation-axes.md Axis 3). 0 = off (the clean baseline). Set
   # e.g. 500 to enable.
-  pretrain_steps: 0
+  pretrain_steps: 150
   extra:
     backbone: wan
     wan_adapter_config_path: configs/base/wan_adapter_34m.yaml

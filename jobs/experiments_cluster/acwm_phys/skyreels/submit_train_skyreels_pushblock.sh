@@ -6,8 +6,8 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=32:00:00
-#SBATCH --output=logs/acwm-pushblock-skyreels-%x-%j.out
-#SBATCH --error=logs/acwm-pushblock-skyreels-%x-%j.err
+#SBATCH --output=logs/skyreels/acwm-pushblock-skyreels-%x-%j.out
+#SBATCH --error=logs/skyreels/acwm-pushblock-skyreels-%x-%j.err
 
 # SkyReels-V2-I2V-1.3B x ACWM-Phys Push Cube (matrix run 2) — the WEAK flow base
 # for the base-strength axis. SkyReels weights auto-download from HF on first run
@@ -34,7 +34,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="$(pwd)/ds/acwm-phys/rigid_dynamics/push_block"
+ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
 CACHE="$ROOT/skyreels.latents.shared"
 
 for d in "$ROOT/ind_train/metadata.pt" "$ROOT/ind_test/metadata.pt"; do

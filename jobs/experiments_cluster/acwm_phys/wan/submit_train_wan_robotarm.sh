@@ -6,8 +6,8 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=32:00:00
-#SBATCH --output=logs/acwm-robotarm-%x-%j.out
-#SBATCH --error=logs/acwm-robotarm-%x-%j.err
+#SBATCH --output=logs/wan/acwm-robotarm-%x-%j.out
+#SBATCH --error=logs/wan/acwm-robotarm-%x-%j.err
 
 # MATRIX RUN 1 — Wan2.2 · ACWM Robot Arm (clean baseline on the rich domain).
 # Motivation (measured 2026-07-25): frozen-base masked denoise loss 0.314 at 17f
@@ -39,7 +39,7 @@ source .venv/bin/activate
 
 # Robot Arm raw + latent cache live under scratch-shared (see the robot_arm
 # download/precompute scripts — different location from push_block's in-repo ds/).
-ROOT="$HOME/scratch-shared/acwm-phys/kinematics/robot_arm"
+ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
 CACHE="$ROOT/latents.shared"
 
 for d in "$ROOT/ind_train/metadata.pt" "$ROOT/ind_test/metadata.pt"; do
