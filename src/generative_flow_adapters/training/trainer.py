@@ -266,8 +266,17 @@ class Trainer:
                 cond, shortcut_target = self._maybe_prepare_shortcut(
                     batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
                 )
+            # Request the frozen-base prediction too (when the composed model
+            # supports it) so the seam diagnostics below — gate mean, pred-vs-base
+            # cosine, adapter_rel_contribution, base-only denoise loss — are logged
+            # for diffusion bases (e.g. DynamiCrafter) exactly as for flow (Wan),
+            # not just the flow branch.
+            want_base = getattr(self.model, "supports_return_base", False)
             with self._prof("  model forward (base + adapter)"), self._autocast():
-                prediction = self.model(x_t, t, cond)
+                if want_base:
+                    prediction, base_output = self.model(x_t, t, cond, return_base=True)
+                else:
+                    prediction, base_output = self.model(x_t, t, cond), None
             # Upcast the (possibly bf16) prediction back to fp32 so the loss and
             # backward run in full precision — keeps autograd dtypes consistent
             # and the diffusion loss numerically stable. No-op when amp is off.
@@ -280,6 +289,12 @@ class Trainer:
                 noise=noise,
             ) ## Very important. We can predict either noise, starting data point or velocity. Velocity is a combination of the first two.
             loss = self.loss_fn(prediction, target_tensor)
+            if base_output is not None:
+                # Frozen-base denoise loss on this batch (same objective as the
+                # adapted loss above) — feeds denoise_base_only / _adapter_delta.
+                with torch.no_grad():
+                    base_only = self.loss_fn(base_output.float(), target_tensor)
+                base_only_loss_val = float(base_only.detach().cpu())
         else:
             x_t = batch["x_t"]
             if not isinstance(x_t, Tensor):
