@@ -1,0 +1,87 @@
+# MetaWorld (corner2) on the SkyReels-V2-I2V-1.3B base — SkyReels arm of the
+# base-strength axis on MetaWorld (parallels the ACWM SkyReels configs).
+#
+# Adapted from diffusion_skyreels_xattn_acwm_robotarm.yaml: only the `data:`
+# block (MetaWorld conventions), the action `input_dim` (4-DoF), the latent
+# geometry (square MetaWorld frames), and the prompt differ. The SkyReels
+# model/adapter blocks are unchanged so precompute + training share geometry.
+#
+# === DRAFT — validate the i2v seam with a short --steps smoke first ===
+# generate() works via the native pipeline; text is encoded live by SkyReels' T5.
+
+name: diffusion_skyreels_xattn_metaworld
+
+data:
+  frame_stride: 4
+  fs_value: 1
+  # env: reach-v3       # str or list of env names; omit = all environments
+  # camera: corner2     # str or list of cameras (camera-split layout); omit = all cameras
+
+model:
+  type: flow
+  provider: skyreels
+  prediction_type: velocity
+  freeze: true
+  extra:
+    model_id: Skywork/SkyReels-V2-I2V-1.3B-540P
+    # model_path:  # optional local snapshot; else resolved from the HF cache
+    dtype: bf16
+    offload: true
+    latent_channels: 16
+    temporal_length: 17       # 4*4+1 -> 5 latent frames (SkyReels VAE temporal stride 4)
+    max_area: 147456          # ~384^2 (stride-8 regime)
+    latent_height: 48         # 48 * 8 = 384 px
+    latent_width: 48          # 48 * 8 = 384 px (MetaWorld corner2 is ~square)
+    default_prompt: "a red robotic arm on a wooden table in a simulated workspace, realistic 3D render, the arm articulates toward a target object, static camera, plain background."
+
+adapter:
+  type: output
+  hidden_dim: 256
+  feature_dim: 16
+  composition: mask_mix
+  gate_bias: 0.0
+  gate_cap: 0.9
+  pretrain_steps: 0
+  extra:
+    backbone: wan
+    wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
+    condition_on_base_outputs: true
+    use_step_level_conditioning: false
+    action_dropout_prob: 0.0
+    action_injection: cross_attention
+    action_max_len: 128
+
+conditioning:
+  type: action
+  input_dim: 4               # MetaWorld action dimension
+  output_dim: 512
+  drop_condition_prob: 0.0
+
+training:
+  loss: flow_matching
+  learning_rate: 1.0e-4
+  grad_clip_norm: 1.0
+  output_dir: outputs/metaworld-skyreels-run
+  checkpoint_every_n_steps: 500
+  keep_last_checkpoints: 3
+  inference_every_n_steps: 300
+  eval_every_n_steps: 300
+  quality_metrics: [psnr, ssim, lpips, mse]
+  quality_eval_num_batches: 4
+
+  extra:
+    amp_dtype: bf16
+    use_batch_timesteps_for_flow: true
+    flow_timestep_scale: 1000
+    inference_guide_scale: 5.0
+    inference_shift: 5.0
+    inference_frame_num: 17
+    inference_seed: 0
+    cond_frames: 1
+    action_per_frame: false
+    wandb:
+      enable: true
+      require_vae: false
+      project: SkyReels-avid-xattn-metaworld
+      num_samples: 3
+      fps: 5
