@@ -36,6 +36,7 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         step_level_hidden_dim: int | None = None,
         step_level_transform: str = "linear",
         output_format: str = "direct",
+        action_time_combine: str = "add",
     ) -> None:
         super().__init__()
 
@@ -44,6 +45,9 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         self.condition_on_base_outputs = condition_on_base_outputs
         self.output_mask = output_mask
         self.output_format = normalize_output_format(output_format)
+        if action_time_combine not in ("add", "concat"):
+            raise ValueError(f"action_time_combine must be 'add' or 'concat', got {action_time_combine!r}")
+        self.action_time_combine = action_time_combine
         # Channels of the base prediction the adapter operates on, captured
         # before any affine doubling so the base-output channel-concat below
         # still uses the true latent width.
@@ -65,13 +69,19 @@ class DynamicCrafterOutputAdapter(OutputAdapterInterface):
         if self.use_adapter_conditioning and self.cond_dim is not None and self.cond_dim > 0:
             params["adapter_condition_dim"] = self.cond_dim
             params["adapter_condition_hidden_dim"] = self.cond_hidden_dim
-            # The UNet's concat path (add_act_time_emb=False) was designed for
-            # action_conditioned=True, where time_emb and action_emb are each
-            # half embed_dim and concat produces a full-width emb. When we feed
-            # an adapter_embedding instead (action_conditioned=False), both
-            # vectors are full embed_dim; concat would double the width and
-            # break fs_embed + ResBlock addition. Force the ADD branch.
-            params.setdefault("add_act_time_emb", True)
+            # Time⊕action combine mode (thesis-vault
+            # 30_Knowledge/tech/avid-vs-ours-action-conditioning):
+            #   "add"  (default) — add_act_time_emb=True: our full-width
+            #     adapter_embedding is ADDED to the full-width time_emb. Concat
+            #     of two full-width vectors would double the emb and break
+            #     fs_embed + ResBlock addition, so the UNet keeps both at
+            #     embed_dim.
+            #   "concat" — add_act_time_emb=False: matches AVID's native recipe;
+            #     time and the adapter conditioning each take HALF embed_dim and
+            #     are concatenated, reserving the action its own orthogonal
+            #     subspace (the UNet's action_conditioned=False branch sizes
+            #     time_embed_dim and adapter_condition_output_dim to embed_dim//2).
+            params["add_act_time_emb"] = self.action_time_combine == "add"
         if self.condition_on_base_outputs:
             params["in_channels"] = int(params["in_channels"]) + int(params["out_channels"])
         if self.output_mask:

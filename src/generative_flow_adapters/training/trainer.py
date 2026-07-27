@@ -95,6 +95,18 @@ class Trainer:
         )
         self._last_shortcut_step_level: float | None = None
         self._probe_batch: dict[str, object] | None = None
+        # Action-sensitivity probe (thesis R1), run every eval cycle: perturb the
+        # action and measure whether the adapter's prediction moves at all.
+        # Default ON — this is the metric the D2 "are actions ignored?" story
+        # turns on. Disable per-run with training.extra.action_sensitivity_probe:
+        # false. Variants default to shuffle (donor clip) + zero (null action).
+        self._action_probe_enabled = bool(config.extra.get("action_sensitivity_probe", True))
+        self._action_probe_variants = tuple(
+            config.extra.get("action_sensitivity_variants", ("shuffle", "zero"))
+        )
+        self._action_probe_draws = int(config.extra.get("action_sensitivity_draws", 2))
+        self._action_probe_batches = int(config.extra.get("action_sensitivity_batches", 2))
+        self._action_probe_warned = False
         self._accum_micro_step = 0
         warmup_steps = config.linear_warmup_steps
         self.lr_scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
@@ -221,6 +233,54 @@ class Trainer:
         found = False
         for p in adapter.parameters():
             if p.grad is not None:
+                found = True
+                total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
+        return total_sq**0.5 if found else None
+
+    def _condition_grad_norm(self) -> float | None:
+        """L2 norm of gradients on the CONDITION ENCODER params only — the module
+        whose entire input is the action. This is the backward-direction answer to
+        "do the actions give a gradient signal?": logged as ``condition_grad_norm``
+        every optimizer step alongside ``adapter_grad_norm``. If it sits at ~0
+        while ``adapter_grad_norm`` is healthy, the loss is not pushing on the
+        action pathway at all — the adapter is learning the task without the
+        actions. Complements the forward-direction ``eval_action_effect_rel``
+        probe (that asks whether the output *moves* when the action changes; this
+        asks whether the action *receives* gradient). ``None`` if the model has no
+        ``condition_encoder`` or none of its params carry a grad yet."""
+        encoder = getattr(self.model, "condition_encoder", None)
+        if encoder is None:
+            return None
+        total_sq = 0.0
+        found = False
+        for p in encoder.parameters():
+            if p.grad is not None:
+                found = True
+                total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
+        return total_sq**0.5 if found else None
+
+    def _action_inject_grad_norm(self) -> float | None:
+        """L2 norm of gradients on the CROSS-ATTENTION action-injection params
+        only — the action-token embedding (raw action → tokens) plus the cross-attn
+        key/value projections that consume those tokens. Q/O touch the visual
+        stream, so they are excluded. This is the faithful "is the cross-attention
+        action path receiving gradient?" trace for ``action_injection:
+        cross_attention`` — unlike ``condition_grad_norm``, which scopes to the
+        aggregated/adaLN condition encoder, a *different* action route. Per the
+        gradient theory (loss · (1−gate) · W_head · [K/V softmax] · action_MLP)
+        this is the first thing to flatline when the composition gate saturates.
+        Wan/SkyReels parameter naming; ``None`` when nothing matches (e.g. a
+        non-cross-attn adapter such as DynamiCrafter's structured injection)."""
+        adapter = getattr(self.model, "adapter", None)
+        if adapter is None:
+            return None
+        fragments = ("action_embedding", "action_pos_emb", "cross_attn.k.", "cross_attn.v.")
+        total_sq = 0.0
+        found = False
+        for name, p in adapter.named_parameters():
+            if p.grad is None:
+                continue
+            if any(frag in name for frag in fragments):
                 found = True
                 total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
         return total_sq**0.5 if found else None
@@ -429,11 +489,19 @@ class Trainer:
         self._accum_micro_step += 1
         did_step = self._accum_micro_step >= accum_steps
         adapter_grad_norm: float | None = None
+        condition_grad_norm: float | None = None
+        action_inject_grad_norm: float | None = None
         if did_step:
             # Adapter-only grad norm, captured post-accumulation (all
             # micro-steps' backward() calls have summed into .grad by now) but
             # pre-zero_grad — the true norm the optimizer is about to apply.
             adapter_grad_norm = self._adapter_grad_norm()
+            # Action-pathway grad norms — "do actions give a gradient signal?"
+            # Same timing (post-accum, pre-zero_grad). condition_grad_norm =
+            # aggregated/adaLN route; action_inject_grad_norm = the cross-attn
+            # action-token route (the faithful one for cross_attention injection).
+            condition_grad_norm = self._condition_grad_norm()
+            action_inject_grad_norm = self._action_inject_grad_norm()
             if self.config.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
             with self._prof("  optimizer.step"):
@@ -449,6 +517,10 @@ class Trainer:
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
         if adapter_grad_norm is not None:
             metrics["adapter_grad_norm"] = adapter_grad_norm
+        if condition_grad_norm is not None:
+            metrics["condition_grad_norm"] = condition_grad_norm
+        if action_inject_grad_norm is not None:
+            metrics["action_inject_grad_norm"] = action_inject_grad_norm
         metrics.update(loss_components)
         shortcut_s = self._last_shortcut_step_level
         if shortcut_s is not None and "shortcut_direction_loss" in loss_components:
@@ -486,6 +558,9 @@ class Trainer:
         self.model.eval()
         totals: dict[str, float] = {}
         count = 0
+        # Preprocessed batches retained for the action-sensitivity probe (>=2 so
+        # the shuffle variant has a donor clip). Detached so they survive the loop.
+        probe_batches: list[Mapping[str, object]] = []
         try:
             for raw_batch in loader:
                 if max_batches is not None and count >= max_batches:
@@ -504,6 +579,8 @@ class Trainer:
                     and isinstance(batch.get("t"), Tensor)
                 ):
                     self._probe_batch = _detach_clone(dict(batch))
+                if self._action_probe_enabled and len(probe_batches) < self._action_probe_batches:
+                    probe_batches.append(_detach_clone(dict(batch)))
                 loss, loss_components, *_ = self._forward_and_loss(batch)
                 loss_components["loss"] = float(loss.detach().cpu())
                 for key, value in loss_components.items():
@@ -516,7 +593,81 @@ class Trainer:
         if count > 0:
             result = {f"eval_{key}": value / count for key, value in totals.items()}
         result.update({f"eval_{key}": value for key, value in self._probe_eval().items()})
+        if self._action_probe_enabled and probe_batches:
+            result.update(self._action_sensitivity_eval(probe_batches))
         return result
+
+    @torch.no_grad()
+    def _action_sensitivity_eval(self, batches: list[Mapping[str, object]]) -> dict[str, float]:
+        """Action-sensitivity probe (R1) over held-out batches, logged every eval
+        cycle as ``eval_action_*``. Perturbs the action (default shuffle + zero)
+        with paired noise and measures whether the adapter's prediction moves:
+
+        - ``eval_action_effect_rel``  — mean ‖pred_true − pred_shuffle‖ / ‖pred_true‖.
+          **≈ 0 ⇒ action-blind** (the D2 failure mode).
+        - ``eval_action_cos``         — cosine(pred_true, pred_shuffle); ≈ 1 ⇒ blind.
+        - ``eval_action_loss_gap``    — how much perturbing the action hurts the loss
+          (movement in a *useful* direction, not just any movement).
+        - ``eval_action_effect_vs_adapter`` — effect ÷ adapter_rel_contribution;
+          separates "adapter does nothing" from "does something, but nothing
+          action-driven".
+        - ``eval_action_base_null_violation`` — the frozen base must be
+          action-invariant; > 0 flags a harness leak (actions into the base).
+
+        Best-effort: on any failure (e.g. a config with no action conditioning)
+        it warns once and returns ``{}`` — the probe must never break training."""
+        try:
+            from generative_flow_adapters.evaluation.action_sensitivity import (  # noqa: PLC0415
+                run_action_sensitivity,
+            )
+
+            res = run_action_sensitivity(
+                trainer=self,
+                model=self.model,
+                batches=batches,
+                variants=self._action_probe_variants,
+                num_draws=self._action_probe_draws,
+                progress=lambda _msg: None,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let the probe break training
+            if not self._action_probe_warned:
+                self._action_probe_warned = True
+                print(
+                    f"[action-probe] skipped ({type(exc).__name__}: {exc}); "
+                    "disable with training.extra.action_sensitivity_probe: false"
+                )
+            return {}
+
+        def _mean(xs: list[float]) -> float | None:
+            return sum(xs) / len(xs) if xs else None
+
+        out: dict[str, float] = {}
+        # Primary variant: shuffle (cleanest — actions from a different clip) if
+        # present, else whatever the first configured variant is.
+        primary = "shuffle" if "shuffle" in res.variants else next(iter(res.variants), None)
+        if primary is not None:
+            st = res.variants[primary]
+            eff = _mean(st.action_effect_rel)
+            if eff is not None:
+                out["eval_action_effect_rel"] = eff
+                adapter_rel = _mean(res.adapter_rel_contribution)
+                if adapter_rel:
+                    out["eval_action_effect_vs_adapter"] = eff / adapter_rel
+            cos = _mean(st.cos_true_variant)
+            if cos is not None:
+                out["eval_action_cos"] = cos
+            gap = _mean(st.loss_gap)
+            if gap is not None:
+                out["eval_action_loss_gap"] = gap
+        out["eval_action_base_null_violation"] = float(res.base_null_violation)
+        # Secondary variants (e.g. zero) get their own effect trace.
+        for name, st in res.variants.items():
+            if name == primary:
+                continue
+            eff = _mean(st.action_effect_rel)
+            if eff is not None:
+                out[f"eval_action_effect_rel_{name}"] = eff
+        return out
 
     @torch.no_grad()
     def _probe_eval(self) -> dict[str, float]:

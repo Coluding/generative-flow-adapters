@@ -440,8 +440,17 @@ class UNetModel(nn.Module):
             self.action_dropout_prob = action_dropout_prob
             adapter_condition_output_dim = int(self.null_action_emb.shape[1])
         else:
-            time_embed_dim = embed_dim
-            adapter_condition_output_dim = time_embed_dim
+            if self.add_act_time_emb:
+                # ADD: time_emb + cond_emb, both full embed_dim.
+                time_embed_dim = embed_dim
+                adapter_condition_output_dim = time_embed_dim
+            else:
+                # CONCAT (AVID parity): time and the adapter conditioning each
+                # take HALF embed_dim, so cat([time, cond]) == embed_dim — matches
+                # the ResBlock emb_channels (embed_dim) and the fs_embed add, and
+                # reserves the action its own orthogonal subspace.
+                time_embed_dim = embed_dim // 2
+                adapter_condition_output_dim = embed_dim // 2
 
         ## Time embedding blocks
         self.time_embed = nn.Sequential(

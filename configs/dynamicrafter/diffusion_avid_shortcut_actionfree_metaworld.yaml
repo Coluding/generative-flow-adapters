@@ -1,0 +1,134 @@
+name: diffusion_avid_shortcut_actionfree_metaworld
+
+# ACTION-FREE shortcut adapter on DynamiCrafter — the pure D3 test.
+#
+# Fork of diffusion_avid_shortcut_metaworld.yaml with ONE change: the `act`
+# condition is removed. The adapter is step-size-conditioned only
+# (`use_step_level_conditioning: true`), so its entire job is to distil the
+# frozen base into a good FEW-STEP generator.
+#
+# Why this config exists
+# ----------------------
+# In the action-conditioned runs, "does the shortcut work?" and "does action
+# conditioning work?" are confounded — a bad few-step grid could be blamed on
+# either, and the action-conditioning side is currently the one failing
+# (base-parity collapse). Removing actions isolates the D3 question:
+#
+#     can a step-size-conditioned adapter make the frozen base samplable
+#     in few steps, at all?
+#
+# This is why D3 is NOT gated on D2 succeeding: the pure shortcut result can be
+# obtained without action conditioning ever working. A clean negative here is
+# still a thesis-worthy D3 finding — it would say the problem is the shortcut
+# approach/implementation rather than the action pathway.
+#
+# Pairs with the R7 A/B: run this config twice, swapping only
+# `shortcut_consistency_target` between `v_average` (biased Frans eq.4) and
+# `endpoint_inversion` (exact under v-prediction). Both arms MUST run at the
+# same commit — see thesis-vault decided/shortcut-target-endpoint-vs-v-averaging.
+#
+# See: thesis-vault 20_Tickets/experiments/exp-shortcut-action-free-isolation.md
+#      thesis-vault 30_Knowledge/writing/storyline-experiment-requirements.md (R7)
+
+data:
+  frame_stride: 4
+  fs_value: 1
+
+model:
+  type: diffusion
+  provider: dynamicrafter
+  prediction_type: velocity
+  freeze: true
+  # No structured conditions to pass through; the base is unconditioned here
+  # beyond its own text/image context.
+  pass_cond_to_base: true
+  extra:
+    unet_config_path: configs/base/dynamicrafter512.yaml
+    strict_checkpoint: true
+    latent_channels: 4
+    latent_height: 16
+    latent_width: 16
+    temporal_length: 16
+    allow_dummy_concat_condition: false
+    allow_missing_checkpoint: true
+    load_first_stage_model: true
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    # The ONLY conditioning the adapter receives in this config.
+    use_step_level_conditioning: true
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+    # The 11M AVID UNet has an action-conditioning input by construction; with
+    # no `act` condition emitted, it is fed the dummy concat condition instead.
+    allow_dummy_concat_condition: true
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 4
+    image_encoder_device: cuda
+  # EMPTY on purpose — no `act` entry. The condition encoder sees only the
+  # trainer-synthesized `step_level`. The training script prints a warning about
+  # having no dataset-emitted conditions; here that is the intended setup, not a
+  # misconfiguration.
+  conditions: []
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  # R7 A/B switch — override per arm with --shortcut-consistency-target.
+  shortcut_consistency_target: endpoint_inversion
+  inference_every_n_steps: 2000
+  inference_num_steps: 50
+  output_dir: outputs/diffusion_avid_shortcut_actionfree_metaworld
+  log_metrics_jsonl: true
+  checkpoint_every_n_steps: 2000
+  keep_last_checkpoints: 3
+  eval_every_n_steps: 2000
+  eval_num_batches: 8
+  eval_metric: base_loss
+  extra:
+    amp_dtype: bf16
+    shortcut_step_level_key: step_level
+    shortcut_anchor_prob: 0.55
+    # The few-step grid IS the D3 readout: rows = denoising budget, and the
+    # headline is the adapter's added value over the frozen base at low NFE.
+    # Kept broad here (unlike the action-conditioned config, which trimmed it)
+    # because this run exists precisely to read the few-step rows.
+    eval_step_schedule:
+      - { num_steps: 1,  step_level: 1.0 }
+      - { num_steps: 2,  step_level: 0.5 }
+      - { num_steps: 4,  step_level: 0.25 }
+      - { num_steps: 8,  step_level: 0.125 }
+      - { num_steps: 25, step_level: 0.04 }
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128   # finest — grounded by the standard loss
+      max: 1       # one-step
+      base: 2
+    video_logging:
+      enable: true
+      num_samples: 1
+      fps: 2
+      wandb_project: avid-shortcut-actionfree-metaworld
