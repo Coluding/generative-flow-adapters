@@ -42,19 +42,29 @@ uv pip install setuptools "triton==3.1.0"
 # wheel (mjun0812/flash-attention-prebuild-wheels) matching this venv's
 # python(3.10) + torch(2.5) + CUDA. Auto-detect CUDA from the installed torch.
 echo ">>> installing prebuilt flash-attn (matched to torch/CUDA)"
+# Derive EVERY tag from the live interpreter. These were hardcoded to
+# torch2.5/cp310, so on any other env the grep silently matched nothing and fell
+# through to the warning below — which is how job 24970757 reached a GPU without
+# flash-attn.
 CUDA_TAG="$(python -c 'import torch; print("cu"+torch.version.cuda.replace(".",""))')"
-echo "    detected torch $(python -c 'import torch;print(torch.__version__)'), CUDA tag ${CUDA_TAG}"
-FA_WHEEL="flash_attn-2.7.4%2B${CUDA_TAG}torch2.5-cp310-cp310-linux_x86_64.whl"
+TORCH_TAG="$(python -c 'import torch; print("torch"+".".join(torch.__version__.split("+")[0].split(".")[:2]))')"
+PY_TAG="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
+echo "    detected torch $(python -c 'import torch;print(torch.__version__)') -> ${CUDA_TAG}/${TORCH_TAG}/${PY_TAG}"
+FA_WHEEL="%2B${CUDA_TAG}${TORCH_TAG}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
 FA_URL="$(curl -s 'https://api.github.com/repos/mjun0812/flash-attention-prebuild-wheels/releases?per_page=100' \
-    | grep 'browser_download_url' | grep -oE 'https://[^\"]+' \
-    | grep "${FA_WHEEL}" | head -1)"
+    | grep 'browser_download_url' | grep -oE 'https://[^"]+' \
+    | grep -- "${FA_WHEEL}" | sort -V | tail -1)"
 if [ -n "$FA_URL" ]; then
     echo "    -> $FA_URL"
-    uv pip install "$FA_URL"
+    uv pip install --no-deps "$FA_URL"
 else
-    echo "    WARN: no prebuilt flash-attn wheel found for ${CUDA_TAG}/torch2.5/cp310."
+    echo "    ERROR: no prebuilt flash-attn wheel for ${CUDA_TAG}/${TORCH_TAG}/${PY_TAG}."
     echo "    Browse: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases"
-    echo "    (SkyReels may still run on SDPA — try the probe; only install flash-attn if it ImportErrors.)"
+    echo "    SkyReels does NOT silently fall back: clip.py and transformer.py call"
+    echo "    flash_attention() directly, which opens with 'assert FLASH_ATTN_2_AVAILABLE'."
+    echo "    Without a wheel the run dies on the first CLIP/DiT forward unless"
+    echo "    _patch_flash_attention_fallback() (models/base/skyreels_video.py) routes"
+    echo "    it to SDPA — that shim works, but the native kernels are preferred."
 fi
 # (frame extraction is done by the MAIN .venv in the probe script, so no
 # decord needed here.)

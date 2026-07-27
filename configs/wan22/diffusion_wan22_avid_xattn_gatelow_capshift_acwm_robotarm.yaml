@@ -54,8 +54,8 @@ adapter:
   feature_dim: 48
   composition: mask_mix
   gate_bias: 0.0
-  gate_cap: 0.9
-  pretrain_steps: 0           # AVID pure-adapter warmup; 0 = off (clean baseline). Set e.g. 500 to enable.
+  gate_cap: 0.5             # matched to the live pushblock run (2026-07-27); was 0.9
+  pretrain_steps: 200       # AVID pure-adapter warmup; matched to pushblock (was 0)
   extra:
     backbone: wan
     wan_adapter_config_path: configs/base/wan_adapter_34m.yaml
@@ -78,20 +78,18 @@ training:
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
   output_dir: outputs/acwm-robotarm-gatelow-capshift-run
-  checkpoint_every_n_steps: 500
+  checkpoint_every_n_steps: 200
   keep_last_checkpoints: 3
-  learning_rate: 1.0e-4
-  grad_clip_norm: 1.0
-  shortcut_direction_weight: 0.0      
+  shortcut_direction_weight: 0.0
   shortcut_target_method: distillation
-  inference_every_n_steps: 300
-  eval_every_n_steps: 300
+  inference_every_n_steps: 200
+  eval_every_n_steps: 400
   quality_metrics: [psnr, ssim, lpips, mse]
-  quality_eval_num_batches: 4
+  quality_eval_num_batches: 1
   quality_eval_num_steps: 10
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 300
-  quality_dist_num_batches: 4
+  quality_dist_every_n_steps: 400
+  quality_dist_num_batches: 1
   baseline_eval_inference: true
   baseline_eval_loss: false
   baseline_eval_quality: false

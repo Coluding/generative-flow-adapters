@@ -33,6 +33,11 @@ export GFA_PROFILE=0
 export GFA_DEBUG_CACHE=0
 export BATCH_SIZE=8
 
+# See submit_train_skyreels_robotarm.sh: SkyReels' torch.compile makes Triton
+# shell out to gcc, which fails to link -lcuda on the compute nodes. torch 2.9
+# reads TORCH_COMPILE_DISABLE (not the older TORCHDYNAMO_DISABLE).
+export TORCH_COMPILE_DISABLE=1
+
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
 export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
 export PATH="$HOME/.local/bin:$PATH"

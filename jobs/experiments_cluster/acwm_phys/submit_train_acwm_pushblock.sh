@@ -36,8 +36,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="$(pwd)/ds/acwm-phys/rigid_dynamics/push_block"
-CACHE="$ROOT/latents.shared"
+ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"CACHE="$ROOT/latents.shared"
 
 for d in "$ROOT/ind_train/metadata.pt" "$ROOT/ind_test/metadata.pt"; do
     test -f "$d" || { echo "Error: $d missing — run jobs/download_acwmphys.sh first" >&2; exit 1; }

@@ -27,7 +27,7 @@ module load 2024
 
 export GFA_PROFILE=0
 export GFA_DEBUG_CACHE=0
-export BATCH_SIZE=12
+export BATCH_SIZE=18
 
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
 export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python

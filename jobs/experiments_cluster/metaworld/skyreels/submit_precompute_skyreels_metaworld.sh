@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=precompute-skyreels-metaworld
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1

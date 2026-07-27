@@ -21,10 +21,18 @@ contract as :class:`Wan22DiffusionForcingPreprocessor`
 ``y`` / ``clip_fea`` / ``context`` depend only on the conditioning frame + prompt,
 so they are built live per batch (only ``z0`` benefits from the latent cache).
 
-DRAFT status: the tensor plumbing mirrors the vendored ``Image2VideoPipeline``
-(external_repos/SkyReels-V2/.../pipelines/image2video_pipeline.py:88-116); the
-exact text-encoder batching and CLIP call signature still need a GPU run to
-confirm (flagged inline with ``# GPU-VALIDATE``).
+The tensor plumbing mirrors the vendored ``Image2VideoPipeline``
+(external_repos/SkyReels-V2/.../pipelines/image2video_pipeline.py:88-116).
+
+OFFLOAD: with ``offload=True`` that pipeline loads the DiT, T5 and CLIP on CPU
+in bf16 and onloads them per call inside ``generate``. The DiT is fine here —
+``SkyReelsVideoModel`` registers it as ``self.dit``, so ``model.to(device)``
+reaches it — but the two encoders are only reachable through the pipeline, so
+they stayed on CPU and every call raised
+``Input type (torch.cuda.FloatTensor) and weight type (CPUBFloat16Type)``.
+Both are now onloaded here, but differently: CLIP runs every batch so it is moved
+once and kept resident, while the text encoder is guarded by a prompt cache and
+so keeps the pipeline's offload behaviour. See ``_onload_clip`` / ``_encode_text``.
 """
 
 from __future__ import annotations
@@ -68,6 +76,17 @@ class SkyReelsI2VPreprocessor(WanBatchPreprocessor):
         self._text_encoder = pipe.text_encoder
         self._device = torch.device(device)
         self._default_prompt = default_prompt
+        # With offload=True the pipeline loads the DiT/T5/CLIP on CPU in bf16
+        # (image2video_pipeline.py:42); only the VAE is unconditionally on GPU.
+        # The DiT rides along with model.to(device) because SkyReelsVideoModel
+        # registers it as self.dit — but these two encoders are reached through
+        # the pipeline, so nothing ever moves them. See _onload_clip/_encode_text.
+        self._offload = bool(getattr(model, "offload", False))
+        self._encoder_dtype = getattr(
+            pipe.transformer, "dtype", getattr(model, "dtype", torch.bfloat16)
+        )
+        self._clip_on_device = False
+        self._text_cache: dict[str, Tensor] = {}
 
     # SkyReels' WanVAE lacks .device/.dtype attributes the parent reads.
     @property
@@ -138,15 +157,56 @@ class SkyReelsI2VPreprocessor(WanBatchPreprocessor):
         mask = torch.ones_like(img_cond)
         mask[:, :, 1:] = 0.0                                            # only the first latent frame is observed
         y = torch.cat([mask[:, :4], img_cond], dim=1)                  # [B,20,T',h,w]
-        # GPU-VALIDATE: clip.encode_video expects the [B,3,1,H,W] conditioning frame.
-        clip_fea = self._clip.encode_video(cond_pixels.to(self._device))
+        # clip.encode_video takes the [B,3,1,H,W] conditioning frame, cast to the
+        # DiT dtype exactly as image2video_pipeline.py:90 does before its own call.
+        self._onload_clip()
+        clip_fea = self._clip.encode_video(
+            cond_pixels.to(self._device, self._encoder_dtype)
+        )
         return {"y": y, "clip_fea": clip_fea}
 
-    def _encode_text(self, prompts: list[str]) -> Any:
-        """SkyReels' own T5 encode of per-sample prompts. Returns whatever the DiT
-        text_embedding expects ([B,L,C] tensor, or a list of [L,C])."""
-        # GPU-VALIDATE: pipeline calls text_encoder.encode(<str>); confirm list batching.
-        return self._text_encoder.encode(prompts)
+    def _onload_clip(self) -> None:
+        """Move CLIP to the compute device once and keep it resident.
+
+        ``Image2VideoPipeline.generate`` shuttles it per call — onload, encode,
+        ``.cpu()``, ``empty_cache()`` (lines 100-104) — which is right when you
+        generate once. CLIP runs on EVERY training batch here (the conditioning
+        frame changes per sample), so shuttling would just burn PCIe bandwidth
+        every step. It is the small one (~1.5 GB), so it stays.
+
+        Idempotent — free to call per batch after the first.
+        """
+        if self._clip_on_device:
+            return
+        self._clip.to(self._device)
+        self._clip_on_device = True
+
+    def _encode_text(self, prompts: list[str]) -> Tensor:
+        """SkyReels' own T5 encode of per-sample prompts -> ``[B, L, C]``.
+
+        Cached per prompt string: the base is frozen and in eval mode, so a given
+        string always encodes to the same tensor, and ACWM draws every prompt from
+        a handful of fixed strings (``task_name`` or the config default).
+
+        That cache is what lets the text encoder keep the pipeline's offload
+        behaviour where CLIP cannot. Misses happen only until each distinct
+        prompt has been seen once, so umT5-XXL (~11 GB) is onloaded a couple of
+        times at the start and then returns to CPU for good — instead of either
+        occupying 11 GB of VRAM for the whole run or being re-run every step to
+        recompute a constant.
+        """
+        missing = [p for p in dict.fromkeys(prompts) if p not in self._text_cache]
+        if missing:
+            self._text_encoder.to(self._device)
+            # T5EncoderModel.encode batches a list of strings -> [M, L, C]
+            # (L is padded to text_len, so rows stack cleanly).
+            encoded = self._text_encoder.encode(missing)
+            for i, prompt in enumerate(missing):
+                self._text_cache[prompt] = encoded[i].detach()
+            if self._offload:
+                self._text_encoder.cpu()
+                torch.cuda.empty_cache()
+        return torch.stack([self._text_cache[p] for p in prompts], dim=0)
 
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
         raw_video = batch["video"]

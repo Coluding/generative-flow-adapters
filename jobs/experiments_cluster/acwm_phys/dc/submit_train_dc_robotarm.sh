@@ -31,7 +31,7 @@ module purge
 module load 2024
 
 export GFA_PROFILE=0
-export BATCH_SIZE=8
+export BATCH_SIZE=24
 
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
 export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
@@ -41,7 +41,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
+ROOT="../scratch-shared/acwm-phys/kinematics/robot_arm"
 test -f "$ROOT/ind_train/metadata.pt" || { echo "Error: $ROOT/ind_train/metadata.pt missing — run download_acwmphys_robotarm.sh" >&2; exit 1; }
 test -f "ckts/dynami512.ckpt" || { echo "Error: DC checkpoint ckts/dynami512.ckpt missing" >&2; exit 1; }
 

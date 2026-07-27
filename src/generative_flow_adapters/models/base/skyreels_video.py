@@ -33,6 +33,7 @@ it composes cleanly under CFG (``uncond+δ + g·((cond+δ)-(uncond+δ)) == base+
 from __future__ import annotations
 
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,53 @@ def _ensure_skyreels_importable() -> None:
                 "Run jobs/experiments/setup_skyreels.sh to clone it."
             )
         sys.path.insert(0, path)
+
+
+def _patch_flash_attention_fallback() -> None:
+    """Route SkyReels' attention through SDPA when flash-attn is absent.
+
+    ``skyreels_v2_infer.modules.attention`` already ships the fallback: its
+    ``attention()`` dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+    when neither flash-attn 2 nor 3 imports. But nothing calls it — ``clip.py``
+    (2 sites) and ``transformer.py`` (4 sites) call ``flash_attention()``
+    directly, which opens with a bare ``assert FLASH_ATTN_2_AVAILABLE``. On a
+    venv without flash-attn that is an ``AssertionError`` the moment CLIP or the
+    DiT runs a forward pass.
+
+    Equivalent here, not merely a degradation: every call site uses
+    ``window_size=(-1, -1)`` (flash-attn's "no windowing") and none passes
+    ``q_lens``/``k_lens``, so the two paths compute the same full, unmasked
+    attention. On H100 + bf16 torch's SDPA picks its own flash kernel, so the
+    throughput cost is small.
+
+    Patching the module globals is enough: Python resolves ``flash_attention``
+    at call time, and both modules bound it with ``from .attention import ...``,
+    so the name must be replaced in each importing module, not just the source.
+
+    No-op when flash-attn IS installed — the real kernels are preferred.
+    """
+    from skyreels_v2_infer.modules import attention as attn_mod  # noqa: PLC0415
+
+    if attn_mod.FLASH_ATTN_2_AVAILABLE or attn_mod.FLASH_ATTN_3_AVAILABLE:
+        return
+
+    from skyreels_v2_infer.modules import clip as clip_mod  # noqa: PLC0415
+    from skyreels_v2_infer.modules import transformer as transformer_mod  # noqa: PLC0415
+
+    def _sdpa_flash_attention(q, k, v, version=None, fa_version=None, **kwargs):
+        # `version`/`fa_version` select a flash-attn build; meaningless here.
+        return attn_mod.attention(q=q, k=k, v=v, **kwargs)
+
+    for module in (clip_mod, transformer_mod):
+        module.flash_attention = _sdpa_flash_attention
+
+    warnings.warn(
+        "flash-attn not installed — SkyReels attention is running on torch SDPA. "
+        "Numerically equivalent (window_size=(-1,-1), no padding masks at any "
+        "call site); install flash-attn 2 to use the native kernels.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 class _ComposedSkyReelsDiT:
@@ -107,6 +155,7 @@ class SkyReelsVideoModel(BaseVideoModel):
     ) -> None:
         super().__init__(model_type="flow", prediction_type="velocity")
         _ensure_skyreels_importable()
+        _patch_flash_attention_fallback()
         from skyreels_v2_infer.pipelines import Image2VideoPipeline  # noqa: PLC0415
 
         self.device = device
@@ -198,13 +247,64 @@ class SkyReelsVideoModel(BaseVideoModel):
         guidance_scale: float = 5.0,
         shift: float = 5.0,
         seed: int = 0,
+        # --- Wan-dialect aliases, named so they are NOT swallowed by **kwargs ---
+        sampling_steps: int | None = None,
+        guide_scale: float | None = None,
+        frame_num: int | None = None,
+        max_area: int | None = None,
+        context: Tensor | None = None,
+        context_null: Tensor | None = None,
+        offload_model: bool | None = None,
         **kwargs: object,
     ) -> Tensor:
         """Run SkyReels' native i2v rollout conditioned on the frame
         ``conditioning`` (PIL / HWC uint8 array / ``[3,H,W]`` or ``[H,W,3]``
         tensor). ``compose_fn is None`` -> byte-for-byte upstream; otherwise every
-        DiT prediction is replaced by ``compose_fn(x, t, base_pred)``."""
+        DiT prediction is replaced by ``compose_fn(x, t, base_pred)``.
+
+        Returns ``[3, N, H, W]`` float in ``[-1, 1]`` — the
+        :class:`BaseVideoModel` contract that ``Trainer._native_clip_rollout``
+        consumes. The vendored pipeline instead returns a *list* of uint8 numpy
+        ``[T, H, W, 3]`` arrays in 0-255, so we convert. (Round-tripping through
+        uint8 is lossless for the caller: the grid is re-quantised to uint8 by
+        ``Trainer._pixels_to_uint8`` anyway.)
+
+        WAN-DIALECT ALIASES: ``_native_clip_rollout`` is shared across backbones
+        and speaks Wan's kwarg names. They used to land in ``**kwargs`` and be
+        dropped in silence, which is worse than an error — every eval row would
+        have rendered at the *defaults* (50 steps, 544x960) no matter what the
+        schedule and config asked for, so the 8-vs-50-step grid would have been
+        two identical rows at the wrong resolution. Declared explicitly so they
+        bind and get translated:
+
+            sampling_steps -> num_inference_steps
+            guide_scale    -> guidance_scale
+            frame_num      -> num_frames
+            max_area       -> (width, height) via best_output_size, aspect
+                              preserved, aligned to 16 (VAE stride 8 x patch 2)
+
+        ``context``/``context_null`` are accepted and DELIBERATELY ignored: they
+        are Wan umT5 embeddings, and SkyReels encodes text with its own T5 from
+        ``prompt`` (the config header says the umT5 tables are not reusable).
+        ``offload_model`` is likewise ignored — the pipeline drives offload from
+        its own flag.
+        """
+        # Local import: keeps models/ -> data/ off the module import graph.
+        from generative_flow_adapters.data.wan_batch_preprocessor import (  # noqa: PLC0415
+            best_output_size,
+        )
+
+        if sampling_steps is not None:
+            num_inference_steps = int(sampling_steps)
+        if guide_scale is not None:
+            guidance_scale = float(guide_scale)
+        if frame_num is not None:
+            num_frames = int(frame_num)
+
         img = self._to_pil(conditioning)
+        if max_area is not None:
+            src_w, src_h = img.size
+            width, height = best_output_size(src_w, src_h, 16, 16, int(max_area))
         pipe = self._pipeline
         original = pipe.transformer
         pipe.transformer = _ComposedSkyReelsDiT(original, compose_fn)
@@ -224,7 +324,35 @@ class SkyReelsVideoModel(BaseVideoModel):
             )
         finally:
             pipe.transformer = original
-        return video
+        return self._pipeline_video_to_tensor(video)
+
+    @staticmethod
+    def _pipeline_video_to_tensor(video: object) -> Tensor:
+        """Pipeline output -> ``[3, N, H, W]`` float in ``[-1, 1]``.
+
+        ``Image2VideoPipeline.__call__`` ends with
+
+            videos = [v.permute(1, 2, 3, 0) * 255 for v in videos]
+            videos = [v.cpu().numpy().astype(np.uint8) for v in videos]
+
+        i.e. a LIST of uint8 numpy ``[T, H, W, 3]`` in 0-255 — one entry per
+        batch item, and we always roll out a single clip.
+        """
+        if isinstance(video, (list, tuple)):
+            if not video:
+                raise ValueError("SkyReels pipeline returned no video.")
+            video = video[0]
+        if isinstance(video, np.ndarray):
+            video = torch.from_numpy(np.ascontiguousarray(video))
+        if not isinstance(video, Tensor):
+            raise TypeError(f"Unexpected SkyReels pipeline output type: {type(video)!r}")
+        if video.dtype == torch.uint8:                  # [T,H,W,3] 0..255
+            video = video.float().div_(127.5).sub_(1.0)
+            return video.permute(3, 0, 1, 2).contiguous()
+        # Already float: accept [3,T,H,W] as-is, else assume [T,H,W,3] in [0,1].
+        if video.shape[0] == 3:
+            return video.float()
+        return video.float().mul(2.0).sub(1.0).permute(3, 0, 1, 2).contiguous()
 
     # -- construction -----------------------------------------------------
     @classmethod

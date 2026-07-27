@@ -59,7 +59,7 @@ adapter:
     condition_on_base_outputs: true
     output_mask: true
     strict_checkpoint: false
-    use_step_level_conditioning: true
+    use_step_level_conditioning: false   # matched to pushblock (2026-07-27); was true
     step_level_key: step_level
     step_level_hidden_dim: 64
     step_level_transform: log2
@@ -88,21 +88,22 @@ training:
   shortcut_direction_weight: 1.0
   shortcut_target_method: distillation
   shortcut_consistency_target: endpoint_inversion
-  inference_every_n_steps: 2000
+  inference_every_n_steps: 200
   inference_num_steps: 50
   output_dir: outputs/diffusion_dc_acwm_robotarm
   log_metrics_jsonl: true
-  checkpoint_every_n_steps: 2000
+  checkpoint_every_n_steps: 200
   keep_last_checkpoints: 3
-  eval_every_n_steps: 2000
+  eval_every_n_steps: 500
   eval_num_batches: 8
   eval_metric: base_loss
   extra:
     amp_dtype: bf16
     shortcut_step_level_key: step_level
-    shortcut_anchor_prob: 0.55
+    shortcut_anchor_prob: 1.0            # matched to pushblock (2026-07-27); was 0.55
     eval_step_schedule:
-      - { num_steps: 1,  step_level: 1.0 }
+      - { num_steps: 8,  step_level: 0.125 }
+      - { num_steps: 50,  step_level: 0.02 }
     shortcut_step_schedule:
       units: normalized
       mode: log2
@@ -111,6 +112,6 @@ training:
       base: 2
     video_logging:
       enable: true
-      num_samples: 1
-      fps: 2
+      num_samples: 3
+      fps: 4
       wandb_project: dc-acwm-robotarm

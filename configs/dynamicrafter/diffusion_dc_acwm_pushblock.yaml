@@ -84,8 +84,8 @@ training:
   shortcut_direction_weight: 1.0
   shortcut_target_method: distillation
   shortcut_consistency_target: endpoint_inversion
-  inference_every_n_steps: 2000
-  inference_num_steps: 200
+  inference_every_n_steps: 200
+  inference_num_steps: 50
   output_dir: outputs/diffusion_dc_acwm_pushblock
   log_metrics_jsonl: true
   checkpoint_every_n_steps: 200

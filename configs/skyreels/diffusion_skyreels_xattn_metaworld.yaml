@@ -76,6 +76,9 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_frame_num: 17
+    # Mirrors model.extra.max_area — see the robotarm config: unset falls back to
+    # 704*1280 in Trainer._eval_gen_params and evaluates off-distribution.
+    inference_max_area: 147456
     inference_seed: 0
     cond_frames: 1
     action_per_frame: false

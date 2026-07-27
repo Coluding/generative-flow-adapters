@@ -928,6 +928,13 @@ class Trainer:
             "frame_num": int(frame_num) if frame_num else 121,
             "seed": int(e.get("inference_seed", 0)),
             "use_prompt": bool(e.get("inference_use_prompt", False)),
+            # None (the default) means "don't override" — the base model applies
+            # its own `model.extra.offload_model`. Set true only to force CPU
+            # offload during eval generation on a VRAM-tight card.
+            "offload_model": (
+                None if e.get("inference_offload_model") is None
+                else bool(e.get("inference_offload_model"))
+            ),
         }
 
     @contextlib.contextmanager
@@ -997,10 +1004,16 @@ class Trainer:
             "max_area": params["max_area"], "frame_num": params["frame_num"],
             "sampling_steps": int(num_steps), "shift": params["shift"],
             "guide_scale": params["guide_scale"], "seed": params["seed"],
-            # Offload the 10 GB DiT to CPU before the VAE decode (upstream does this
-            # when offload_model=True) so the decode fits alongside the resident
-            # training model on a 24 GB card. Restored to GPU after the eval loop.
-            "offload_model": True,
+            # None -> defer to the base model's own `offload_model` (set from
+            # `model.extra.offload_model`, default False). Only force it via
+            # `training.extra.inference_offload_model` on a card that needs it:
+            # upstream's offload path is far more than a CPU round-trip of the
+            # 10 GB DiT — it also calls `torch.cuda.empty_cache()` *twice per
+            # denoise step* (after the cond and uncond forward), which syncs the
+            # device and hands every cached block back to the driver, so the next
+            # allocation pays a fresh cudaMalloc. On a 24 GB card that is the
+            # price of fitting; on an 80 GB H100 it is pure overhead.
+            "offload_model": params["offload_model"],
         }
         if context is not None:
             kw["context"] = context.to(device)

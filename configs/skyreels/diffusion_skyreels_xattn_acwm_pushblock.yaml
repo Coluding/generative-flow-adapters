@@ -5,7 +5,10 @@
 # 16-channel Wan2.1 VAE (vae_stride (4,8,8) -> 8x spatial, 4x temporal).
 # See thesis-vault 30_Knowledge/writing/ablation-axes.md (Axis 5).
 #
-# === DRAFT — NOT YET RUNNABLE FOR TRAINING ===
+# STATUS: RUNNABLE (2026-07-27) — the blocker below is RESOLVED; the SkyReels
+# i2v batch preprocessor now exists as
+# generative_flow_adapters.data.skyreels_batch_preprocessor.SkyReelsI2VPreprocessor.
+# The push_block z0 cache is complete (3200 windows). Historical note follows:
 # SkyReelsVideoModel + provider registration + provider-aware precompute exist,
 # but SkyReels-V2-I2V is I2V-CONDITIONED (each DiT step needs clip_fea + y), so a
 # SkyReels-specific batch preprocessor (producing z0 + y + clip_fea + context per
@@ -66,20 +69,20 @@ training:
   learning_rate: 1.0e-4
   grad_clip_norm: 1.0
   output_dir: outputs/acwm-pushblock-skyreels-run
-  checkpoint_every_n_steps: 500
+  # Eval cadence matched to the Wan runs (2026-07-27) so the Axis-5
+  # base-strength comparison samples all three backbones on the same grid.
+  checkpoint_every_n_steps: 200
   keep_last_checkpoints: 3
-  learning_rate: 1.0e-4
-  grad_clip_norm: 1.0
-  shortcut_direction_weight: 0.0      
+  shortcut_direction_weight: 0.0
   shortcut_target_method: distillation
-  inference_every_n_steps: 300
-  eval_every_n_steps: 300
+  inference_every_n_steps: 200
+  eval_every_n_steps: 400
   quality_metrics: [psnr, ssim, lpips, mse]
-  quality_eval_num_batches: 4
+  quality_eval_num_batches: 1
   quality_eval_num_steps: 10
   quality_dist_metrics: [fvd, fid]
-  quality_dist_every_n_steps: 300
-  quality_dist_num_batches: 4
+  quality_dist_every_n_steps: 400
+  quality_dist_num_batches: 1
   baseline_eval_inference: true
   baseline_eval_loss: false
   baseline_eval_quality: false
@@ -91,9 +94,20 @@ training:
     inference_guide_scale: 5.0
     inference_shift: 5.0
     inference_frame_num: 97
+    # Mirrors model.extra.max_area — see the robotarm config: unset falls back to
+    # 704*1280 in Trainer._eval_gen_params and evaluates off-distribution.
+    inference_max_area: 147456
     inference_seed: 0
     cond_frames: 1
     action_per_frame: false
+    # Matched to the Wan runs. step_level is inert here (the adapter sets
+    # use_step_level_conditioning: false, as Wan does) — what this buys is the
+    # 8-step and 50-step sampling grid, so SkyReels reports two quality points
+    # per eval like DC/Wan instead of falling back to the single-point
+    # [(inference_num_steps, None)] default in Trainer._eval_step_schedule().
+    eval_step_schedule:
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 50, step_level: 0.02}
     wandb:
       enable: true
       require_vae: false

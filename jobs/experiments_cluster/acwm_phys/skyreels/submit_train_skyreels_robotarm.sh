@@ -26,6 +26,16 @@ export GFA_PROFILE=0
 export GFA_DEBUG_CACHE=0
 export BATCH_SIZE=6
 
+# SkyReels' transformer.py hardcodes DISABLE_COMPILE=False (upstream left the
+# "# get os env" hook unimplemented), so torch.compile fires on the first DiT
+# forward. Triton then shells out to gcc to build cuda_utils.c and that link
+# fails on the compute nodes (-lcuda not resolvable), killing the job — see
+# 24970922. The compiled bits are minor elementwise fusions (mul_add /
+# mul_add_add), not core math, so eager costs us very little.
+# NOTE: torch 2.9 reads TORCH_COMPILE_DISABLE; the older TORCHDYNAMO_DISABLE is
+# silently ignored (verified against torch/_dynamo/config.py:185).
+export TORCH_COMPILE_DISABLE=1
+
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
 export UV_PYTHON_INSTALL_DIR=/scratch-shared/$USER/uv-python
 export PATH="$HOME/.local/bin:$PATH"
@@ -34,7 +44,7 @@ cd "$HOME/generative-flow-adapters"
 mkdir -p logs
 source .venv/bin/activate
 
-ROOT="../scratch-shared/acwm-phys/rigid_dynamics/push_block"
+ROOT="../scratch-shared/acwm-phys/kinematics/robot_arm"
 CACHE="$ROOT/skyreels.latents.shared"
 
 for d in "$ROOT/ind_train/metadata.pt" "$ROOT/ind_test/metadata.pt"; do
