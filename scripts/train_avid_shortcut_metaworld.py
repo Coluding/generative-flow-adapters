@@ -146,6 +146,19 @@ def main() -> None:
         help="Override training.extra.shortcut_step_level_max for quick debugging.",
     )
     parser.add_argument(
+        "--shortcut-consistency-target",
+        choices=("v_average", "endpoint_inversion", "displacement"),
+        default=None,
+        help=(
+            "Override training.shortcut_consistency_target. This is the R7 A/B switch: "
+            "'v_average' is the biased Frans eq.(4) baseline (exact for flow matching, "
+            "biased on the VP arc), 'endpoint_inversion' is the exact target under "
+            "v-prediction. Run both arms AT THE SAME COMMIT — comparing against an older "
+            "baseline run confounds the target rule with every other change. See "
+            "thesis-vault decided/shortcut-target-endpoint-vs-v-averaging."
+        ),
+    )
+    parser.add_argument(
         "--shortcut-step-level-min",
         type=int,
         default=None,
@@ -212,6 +225,8 @@ def main() -> None:
     if checkpoint_path and not Path(checkpoint_path).exists():
         config.model.extra.setdefault("allow_missing_checkpoint", False)
 
+    if args.shortcut_consistency_target is not None:
+        config.training.shortcut_consistency_target = args.shortcut_consistency_target
     if args.shortcut_step_level_max is not None:
         config.training.extra["shortcut_step_level_max"] = int(args.shortcut_step_level_max)
     if args.shortcut_step_level_min is not None:

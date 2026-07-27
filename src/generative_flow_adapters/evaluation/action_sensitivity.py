@@ -113,6 +113,7 @@ def perturb_cond(
     *,
     donor: object | None,
     generator: torch.Generator | None = None,
+    action_keys: Sequence[str] = ACTION_KEYS,
 ) -> object:
     """Return ``cond`` with its action entries replaced according to ``variant``.
 
@@ -131,7 +132,7 @@ def perturb_cond(
     if not isinstance(cond, Mapping):
         return cond
     out = dict(cond)
-    for key in ACTION_KEYS:
+    for key in action_keys:
         value = out.get(key)
         if not isinstance(value, Tensor):
             continue
@@ -161,7 +162,12 @@ def perturb_cond(
     return out
 
 
-def _assert_actions_present(cond: object) -> tuple[str, ...]:
+def _assert_actions_present(
+    cond: object,
+    action_keys: Sequence[str] = ACTION_KEYS,
+    *,
+    require_all: bool = False,
+) -> tuple[str, ...]:
     """Fail if the batch carries no action tensor under a key we perturb.
 
     This is the probe's most dangerous silent failure: a preprocessor that emits
@@ -169,20 +175,37 @@ def _assert_actions_present(cond: object) -> tuple[str, ...]:
     every variant equals the reference, and the report confidently declares the
     model ACTION-BLIND. The measurement would be of *nothing*. So a missing key
     is an error, never a zero.
+
+    ``require_all`` is for explicitly-requested keys: if the caller named the
+    keys, every one of them must exist, because a typo that silently narrows the
+    perturbation is exactly as misleading as finding none at all. With the
+    built-in defaults, one match is enough (``action_seq`` is absent on backbones
+    that do not use per-frame action tokens).
     """
     if not isinstance(cond, Mapping):
         raise RuntimeError(
             f"batch['cond'] is {type(cond).__name__}, not a mapping — the probe cannot "
             "locate or perturb the action conditioning."
         )
-    found = tuple(k for k in ACTION_KEYS if isinstance(cond.get(k), Tensor))
+    available = sorted(str(k) for k in cond)
+    found = tuple(k for k in action_keys if isinstance(cond.get(k), Tensor))
+    missing = tuple(k for k in action_keys if k not in found)
+
     if not found:
         raise RuntimeError(
-            f"no action tensor found in cond under any of {ACTION_KEYS}. "
-            f"Available keys: {sorted(str(k) for k in cond)}. "
-            "This preprocessor emits actions under a different name — add it to "
-            "ACTION_KEYS, or the probe would report a meaningless 0.0 and the "
-            "report would call the model action-blind."
+            f"no action tensor found in cond under any of {tuple(action_keys)}. "
+            f"Available cond keys: {available}. "
+            "This preprocessor emits actions under a different name — pass "
+            "--action-keys with the correct name(s). Continuing would perturb "
+            "nothing and report a meaningless 0.0, which the report would then "
+            "call ACTION-BLIND."
+        )
+    if require_all and missing:
+        raise RuntimeError(
+            f"requested action keys {missing} are not in the batch (found {found}). "
+            f"Available cond keys: {available}. "
+            "Explicitly-named keys must all be present — a typo here silently "
+            "narrows the perturbation and under-reports action sensitivity."
         )
     return found
 
@@ -224,6 +247,8 @@ def run_action_sensitivity(
     variants: Sequence[str] = VARIANTS,
     num_draws: int = 4,
     seed: int = 0,
+    action_keys: Sequence[str] = ACTION_KEYS,
+    require_all_keys: bool = False,
     progress: Callable[[str], None] = print,
 ) -> ActionSensitivityResult:
     """Measure whether perturbing the action changes the adapter's prediction.
@@ -240,7 +265,25 @@ def run_action_sensitivity(
         raise ValueError("no batches supplied to the action-sensitivity probe.")
 
     notes: list[str] = []
-    action_keys = _assert_actions_present(pool[0].get("cond"))
+    # Validated against EVERY batch, not just the first: a preprocessor can emit
+    # `action_seq` only on some batches (variable cond-frame counts), and a
+    # silently-unperturbed batch would drag the mean toward "action-blind".
+    # Every batch is resolved against the ORIGINAL requested keys, never against
+    # batch 0's narrowed result — otherwise a key present only on later batches
+    # would go unnoticed and be left unperturbed.
+    requested = tuple(action_keys)
+    resolved_per_batch = [
+        _assert_actions_present(batch.get("cond"), requested, require_all=require_all_keys)
+        for batch in pool
+    ]
+    action_keys = resolved_per_batch[0]
+    for index, resolved in enumerate(resolved_per_batch[1:], start=1):
+        if set(resolved) != set(action_keys):
+            raise RuntimeError(
+                f"batch {index} exposes action keys {resolved} but batch 0 exposed "
+                f"{tuple(action_keys)}. Inconsistent conditioning across batches would "
+                "perturb different things per batch and average into a meaningless number."
+            )
     notes.append(f"perturbing action keys: {', '.join(action_keys)}")
     stats = {name: VariantStats(name=name) for name in variants}
     result = ActionSensitivityResult(
@@ -305,7 +348,8 @@ def run_action_sensitivity(
                 for name in variants:
                     perturbed = dict(batch)
                     perturbed["cond"] = perturb_cond(
-                        batch.get("cond"), name, donor=donor, generator=gen
+                        batch.get("cond"), name, donor=donor, generator=gen,
+                        action_keys=action_keys,
                     )
                     with torch.random.fork_rng(devices=_rng_devices()), torch.no_grad():
                         torch.manual_seed(draw_seed)  # identical noise/timesteps

@@ -173,6 +173,46 @@ def test_missing_action_key_is_an_error_not_an_action_blind_verdict():
         )
 
 
+def test_custom_action_keys_are_perturbed():
+    """A backbone emitting actions under a non-default name works once named."""
+    model = _FakeModel(action_weight=0.0)  # weight irrelevant; we check the key plumbing
+    batch_a, batch_b = _batch(0), _batch(1)
+    for batch in (batch_a, batch_b):
+        batch["cond"] = {"act_tokens": batch["cond"]["action"]}
+    result = run_action_sensitivity(
+        trainer=_FakeTrainer(model), model=model, batches=[batch_a, batch_b],
+        variants=("zero",), num_draws=1, action_keys=("act_tokens",),
+        progress=lambda _msg: None,
+    )
+    assert any("act_tokens" in note for note in result.notes)
+
+
+def test_explicitly_named_missing_key_aborts():
+    """A typo in --action-keys must abort, not silently narrow the perturbation."""
+    model = _FakeModel(action_weight=1.0)
+    with pytest.raises(RuntimeError, match="are not in the batch"):
+        run_action_sensitivity(
+            trainer=_FakeTrainer(model), model=model, batches=[_batch(0), _batch(1)],
+            variants=("zero",), num_draws=1,
+            action_keys=("action", "action_seq"),  # action_seq absent from the fake batch
+            require_all_keys=True,
+            progress=lambda _msg: None,
+        )
+
+
+def test_inconsistent_keys_across_batches_abort():
+    """A batch missing the action would be silently unperturbed and drag the
+    mean toward 'action-blind'."""
+    model = _FakeModel(action_weight=1.0)
+    good, odd = _batch(0), _batch(1)
+    odd["cond"] = {"action": odd["cond"]["action"], "action_seq": torch.ones(2, 3, 5)}
+    with pytest.raises(RuntimeError, match="exposes action keys"):
+        run_action_sensitivity(
+            trainer=_FakeTrainer(model), model=model, batches=[good, odd],
+            variants=("zero",), num_draws=1, progress=lambda _msg: None,
+        )
+
+
 def test_summary_is_json_serialisable():
     import json
 

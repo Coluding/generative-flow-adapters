@@ -95,6 +95,18 @@ class Trainer:
         )
         self._last_shortcut_step_level: float | None = None
         self._probe_batch: dict[str, object] | None = None
+        # Action-sensitivity probe (thesis R1), run every eval cycle: perturb the
+        # action and measure whether the adapter's prediction moves at all.
+        # Default ON — this is the metric the D2 "are actions ignored?" story
+        # turns on. Disable per-run with training.extra.action_sensitivity_probe:
+        # false. Variants default to shuffle (donor clip) + zero (null action).
+        self._action_probe_enabled = bool(config.extra.get("action_sensitivity_probe", True))
+        self._action_probe_variants = tuple(
+            config.extra.get("action_sensitivity_variants", ("shuffle", "zero"))
+        )
+        self._action_probe_draws = int(config.extra.get("action_sensitivity_draws", 2))
+        self._action_probe_batches = int(config.extra.get("action_sensitivity_batches", 2))
+        self._action_probe_warned = False
         self._accum_micro_step = 0
         warmup_steps = config.linear_warmup_steps
         self.lr_scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
@@ -486,6 +498,9 @@ class Trainer:
         self.model.eval()
         totals: dict[str, float] = {}
         count = 0
+        # Preprocessed batches retained for the action-sensitivity probe (>=2 so
+        # the shuffle variant has a donor clip). Detached so they survive the loop.
+        probe_batches: list[Mapping[str, object]] = []
         try:
             for raw_batch in loader:
                 if max_batches is not None and count >= max_batches:
@@ -504,6 +519,8 @@ class Trainer:
                     and isinstance(batch.get("t"), Tensor)
                 ):
                     self._probe_batch = _detach_clone(dict(batch))
+                if self._action_probe_enabled and len(probe_batches) < self._action_probe_batches:
+                    probe_batches.append(_detach_clone(dict(batch)))
                 loss, loss_components, *_ = self._forward_and_loss(batch)
                 loss_components["loss"] = float(loss.detach().cpu())
                 for key, value in loss_components.items():
@@ -516,7 +533,81 @@ class Trainer:
         if count > 0:
             result = {f"eval_{key}": value / count for key, value in totals.items()}
         result.update({f"eval_{key}": value for key, value in self._probe_eval().items()})
+        if self._action_probe_enabled and probe_batches:
+            result.update(self._action_sensitivity_eval(probe_batches))
         return result
+
+    @torch.no_grad()
+    def _action_sensitivity_eval(self, batches: list[Mapping[str, object]]) -> dict[str, float]:
+        """Action-sensitivity probe (R1) over held-out batches, logged every eval
+        cycle as ``eval_action_*``. Perturbs the action (default shuffle + zero)
+        with paired noise and measures whether the adapter's prediction moves:
+
+        - ``eval_action_effect_rel``  — mean ‖pred_true − pred_shuffle‖ / ‖pred_true‖.
+          **≈ 0 ⇒ action-blind** (the D2 failure mode).
+        - ``eval_action_cos``         — cosine(pred_true, pred_shuffle); ≈ 1 ⇒ blind.
+        - ``eval_action_loss_gap``    — how much perturbing the action hurts the loss
+          (movement in a *useful* direction, not just any movement).
+        - ``eval_action_effect_vs_adapter`` — effect ÷ adapter_rel_contribution;
+          separates "adapter does nothing" from "does something, but nothing
+          action-driven".
+        - ``eval_action_base_null_violation`` — the frozen base must be
+          action-invariant; > 0 flags a harness leak (actions into the base).
+
+        Best-effort: on any failure (e.g. a config with no action conditioning)
+        it warns once and returns ``{}`` — the probe must never break training."""
+        try:
+            from generative_flow_adapters.evaluation.action_sensitivity import (  # noqa: PLC0415
+                run_action_sensitivity,
+            )
+
+            res = run_action_sensitivity(
+                trainer=self,
+                model=self.model,
+                batches=batches,
+                variants=self._action_probe_variants,
+                num_draws=self._action_probe_draws,
+                progress=lambda _msg: None,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let the probe break training
+            if not self._action_probe_warned:
+                self._action_probe_warned = True
+                print(
+                    f"[action-probe] skipped ({type(exc).__name__}: {exc}); "
+                    "disable with training.extra.action_sensitivity_probe: false"
+                )
+            return {}
+
+        def _mean(xs: list[float]) -> float | None:
+            return sum(xs) / len(xs) if xs else None
+
+        out: dict[str, float] = {}
+        # Primary variant: shuffle (cleanest — actions from a different clip) if
+        # present, else whatever the first configured variant is.
+        primary = "shuffle" if "shuffle" in res.variants else next(iter(res.variants), None)
+        if primary is not None:
+            st = res.variants[primary]
+            eff = _mean(st.action_effect_rel)
+            if eff is not None:
+                out["eval_action_effect_rel"] = eff
+                adapter_rel = _mean(res.adapter_rel_contribution)
+                if adapter_rel:
+                    out["eval_action_effect_vs_adapter"] = eff / adapter_rel
+            cos = _mean(st.cos_true_variant)
+            if cos is not None:
+                out["eval_action_cos"] = cos
+            gap = _mean(st.loss_gap)
+            if gap is not None:
+                out["eval_action_loss_gap"] = gap
+        out["eval_action_base_null_violation"] = float(res.base_null_violation)
+        # Secondary variants (e.g. zero) get their own effect trace.
+        for name, st in res.variants.items():
+            if name == primary:
+                continue
+            eff = _mean(st.action_effect_rel)
+            if eff is not None:
+                out[f"eval_action_effect_rel_{name}"] = eff
+        return out
 
     @torch.no_grad()
     def _probe_eval(self) -> dict[str, float]:
