@@ -278,6 +278,7 @@ def _build_output(model: ModelConfig, adapter: AdapterConfig, conditioning: Cond
             step_level_hidden_dim=adapter.extra.get("step_level_hidden_dim"),
             step_level_transform=str(adapter.extra.get("step_level_transform", "linear")),
             output_format=output_format,
+            action_time_combine=str(adapter.extra.get("action_time_combine", "add")),
         )
 
     # The head operates in latent space, so the channel count must be the true

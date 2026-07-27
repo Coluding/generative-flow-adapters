@@ -1,4 +1,4 @@
-name: diffusion_dc_acwm_robotarm
+name: diffusion_dc_acwm_robotarm_concat
 
 # DynamiCrafter (native `dynamicrafter_video` BaseVideoModel) on ACWM-Phys Robot
 # Arm — matrix run 4 (DC x robot arm). Frozen base = real vendored lvdm
@@ -70,7 +70,7 @@ adapter:
     # orthogonal subspaces). See thesis-vault
     # 30_Knowledge/tech/avid-vs-ours-action-conditioning. The ..._concat.yaml
     # variant flips this to test whether AVID-parity recovers action-following.
-    action_time_combine: add
+    action_time_combine: concat   # AVID-parity: orthogonal time/action subspaces
 
 conditioning:
   type: structured
@@ -97,7 +97,7 @@ training:
   shortcut_consistency_target: endpoint_inversion
   inference_every_n_steps: 2000
   inference_num_steps: 50
-  output_dir: outputs/diffusion_dc_acwm_robotarm
+  output_dir: outputs/dc-acwm-robotarm-concat-run
   log_metrics_jsonl: true
   checkpoint_every_n_steps: 2000
   keep_last_checkpoints: 3

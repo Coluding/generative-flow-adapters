@@ -237,6 +237,54 @@ class Trainer:
                 total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
         return total_sq**0.5 if found else None
 
+    def _condition_grad_norm(self) -> float | None:
+        """L2 norm of gradients on the CONDITION ENCODER params only — the module
+        whose entire input is the action. This is the backward-direction answer to
+        "do the actions give a gradient signal?": logged as ``condition_grad_norm``
+        every optimizer step alongside ``adapter_grad_norm``. If it sits at ~0
+        while ``adapter_grad_norm`` is healthy, the loss is not pushing on the
+        action pathway at all — the adapter is learning the task without the
+        actions. Complements the forward-direction ``eval_action_effect_rel``
+        probe (that asks whether the output *moves* when the action changes; this
+        asks whether the action *receives* gradient). ``None`` if the model has no
+        ``condition_encoder`` or none of its params carry a grad yet."""
+        encoder = getattr(self.model, "condition_encoder", None)
+        if encoder is None:
+            return None
+        total_sq = 0.0
+        found = False
+        for p in encoder.parameters():
+            if p.grad is not None:
+                found = True
+                total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
+        return total_sq**0.5 if found else None
+
+    def _action_inject_grad_norm(self) -> float | None:
+        """L2 norm of gradients on the CROSS-ATTENTION action-injection params
+        only — the action-token embedding (raw action → tokens) plus the cross-attn
+        key/value projections that consume those tokens. Q/O touch the visual
+        stream, so they are excluded. This is the faithful "is the cross-attention
+        action path receiving gradient?" trace for ``action_injection:
+        cross_attention`` — unlike ``condition_grad_norm``, which scopes to the
+        aggregated/adaLN condition encoder, a *different* action route. Per the
+        gradient theory (loss · (1−gate) · W_head · [K/V softmax] · action_MLP)
+        this is the first thing to flatline when the composition gate saturates.
+        Wan/SkyReels parameter naming; ``None`` when nothing matches (e.g. a
+        non-cross-attn adapter such as DynamiCrafter's structured injection)."""
+        adapter = getattr(self.model, "adapter", None)
+        if adapter is None:
+            return None
+        fragments = ("action_embedding", "action_pos_emb", "cross_attn.k.", "cross_attn.v.")
+        total_sq = 0.0
+        found = False
+        for name, p in adapter.named_parameters():
+            if p.grad is None:
+                continue
+            if any(frag in name for frag in fragments):
+                found = True
+                total_sq += float(p.grad.detach().float().norm(2).item()) ** 2
+        return total_sq**0.5 if found else None
+
     def _forward_and_loss(
         self, batch: Mapping[str, Tensor | object]
     ) -> tuple[Tensor, dict[str, float], Tensor, Tensor, object, Tensor, dict]:
@@ -441,11 +489,19 @@ class Trainer:
         self._accum_micro_step += 1
         did_step = self._accum_micro_step >= accum_steps
         adapter_grad_norm: float | None = None
+        condition_grad_norm: float | None = None
+        action_inject_grad_norm: float | None = None
         if did_step:
             # Adapter-only grad norm, captured post-accumulation (all
             # micro-steps' backward() calls have summed into .grad by now) but
             # pre-zero_grad — the true norm the optimizer is about to apply.
             adapter_grad_norm = self._adapter_grad_norm()
+            # Action-pathway grad norms — "do actions give a gradient signal?"
+            # Same timing (post-accum, pre-zero_grad). condition_grad_norm =
+            # aggregated/adaLN route; action_inject_grad_norm = the cross-attn
+            # action-token route (the faithful one for cross_attention injection).
+            condition_grad_norm = self._condition_grad_norm()
+            action_inject_grad_norm = self._action_inject_grad_norm()
             if self.config.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
             with self._prof("  optimizer.step"):
@@ -461,6 +517,10 @@ class Trainer:
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
         if adapter_grad_norm is not None:
             metrics["adapter_grad_norm"] = adapter_grad_norm
+        if condition_grad_norm is not None:
+            metrics["condition_grad_norm"] = condition_grad_norm
+        if action_inject_grad_norm is not None:
+            metrics["action_inject_grad_norm"] = action_inject_grad_norm
         metrics.update(loss_components)
         shortcut_s = self._last_shortcut_step_level
         if shortcut_s is not None and "shortcut_direction_loss" in loss_components:
