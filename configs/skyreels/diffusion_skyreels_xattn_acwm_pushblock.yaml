@@ -89,6 +89,12 @@ training:
 
   extra:
     amp_dtype: bf16
+    # Action diagnostics: forward-direction sensitivity probe (runs each eval cycle).
+    # Backward-direction grad-norms (adapter/condition/action_inject) auto-log every step.
+    action_sensitivity_probe: true
+    action_sensitivity_variants: [shuffle, zero]
+    action_sensitivity_draws: 2
+    action_sensitivity_batches: 2
     use_batch_timesteps_for_flow: true
     flow_timestep_scale: 1000
     inference_guide_scale: 5.0

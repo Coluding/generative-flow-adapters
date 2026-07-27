@@ -106,6 +106,12 @@ training:
   eval_metric: base_loss
   extra:
     amp_dtype: bf16
+    # Action diagnostics: forward-direction sensitivity probe (runs each eval cycle).
+    # Backward-direction grad-norms (adapter/condition/action_inject) auto-log every step.
+    action_sensitivity_probe: true
+    action_sensitivity_variants: [shuffle, zero]
+    action_sensitivity_draws: 2
+    action_sensitivity_batches: 2
     shortcut_step_level_key: step_level
     shortcut_anchor_prob: 1.0            # matched to pushblock (2026-07-27); was 0.55
     eval_step_schedule:
