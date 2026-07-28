@@ -42,6 +42,8 @@ from generative_flow_adapters.data import (
     TranslatedClipDataset,
     VideoAutoencoderKL,
     build_acwmphys_clip_dataset,
+    build_rt1_clip_dataset,
+    build_openvid_clip_dataset,
     build_metaworld_clip_dataset,
     precompute_null_text_embedding,
 )
@@ -63,7 +65,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/dynamicrafter/diffusion_avid_shortcut_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2_large.hdf5")
-    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
+    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys", "rt1", "openvid"], default="metaworld",
                         help="Source dataset. 'acwm_phys' reads a split dir of the HF ACWM-Phys "
                              "release via --data-dir (DC encodes latents live with its SD-VAE).")
     parser.add_argument("--data-dir", default=None,
@@ -356,15 +358,16 @@ def main() -> None:
         image_resampler=image_resampler,
     )
 
-    if args.dataset == "acwm_phys":
+    if args.dataset in ("acwm_phys", "rt1", "openvid"):
         if not args.data_dir:
-            parser.error("--dataset acwm_phys requires --data-dir (a split directory of the HF release).")
-        # ACWM-Phys emits the SAME clip dict as MetaWorld, so the DynamiCrafter
-        # preprocessor + trainer downstream are unchanged; DC encodes latents
-        # live via its SD-VAE (no Wan-style precompute). letterbox_aspect=None
-        # keeps the raw frames (square 1024^2 push_block / 4:3 robot_arm); the
-        # preprocessor resizes to the DC512 target below.
-        translator, dataset = build_acwmphys_clip_dataset(
+            parser.error(f"--dataset {args.dataset} requires --data-dir (a split dir with metadata.pt + episode_*.mp4).")
+        # ACWM-Phys and RT-1 emit the SAME clip dict as MetaWorld, so the
+        # DynamiCrafter preprocessor + trainer downstream are unchanged; DC
+        # encodes latents live via its SD-VAE (no Wan-style precompute).
+        # letterbox_aspect=None keeps raw frames; the preprocessor resizes to
+        # the DC512 target below.
+        _builder = {"rt1": build_rt1_clip_dataset, "openvid": build_openvid_clip_dataset}.get(args.dataset, build_acwmphys_clip_dataset)
+        translator, dataset = _builder(
             config.data,
             default_window_width=temporal_length,
             data_dir=args.data_dir,

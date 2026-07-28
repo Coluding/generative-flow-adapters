@@ -239,8 +239,15 @@ class SkyReelsI2VPreprocessor(WanBatchPreprocessor):
         return {"x_t": x_t, "t": t, "target": target, "x0": z0, "frame_mask": frame_mask, "cond": cond}
 
     def _prompts_for(self, batch: Mapping[str, Any], batch_size: int) -> list[str]:
-        """Per-sample prompt strings. Uses the dataset's ``task_name`` when present,
-        else the config default. (SkyReels encodes text live, so no umT5 table.)"""
+        """Per-sample prompt strings. Prefers the per-clip ``caption`` (real
+        descriptive text — OpenVid/RT-1 carry a different caption per clip), then
+        falls back to ``task_name`` (ACWM's id/env-name), then the config default.
+        SkyReels encodes text live, so no umT5 table — the caption string is used
+        directly. (task_name is the Wan positive-table KEY, not a prompt, so for
+        per-clip-captioned data the caption is the right field here.)"""
+        caps = batch.get("caption")
+        if isinstance(caps, (list, tuple)) and len(caps) == batch_size and any(str(c).strip() for c in caps):
+            return [str(c).strip() or self._default_prompt for c in caps]
         names = batch.get("task_name")
         if isinstance(names, (list, tuple)) and len(names) == batch_size:
             return [str(n) or self._default_prompt for n in names]

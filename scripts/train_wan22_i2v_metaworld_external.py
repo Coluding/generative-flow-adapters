@@ -44,6 +44,8 @@ from generative_flow_adapters.data import (
     Wan22DiffusionForcingPreprocessor,
     WanBatchPreprocessConfig,
     build_acwmphys_clip_dataset,
+    build_rt1_clip_dataset,
+    build_openvid_clip_dataset,
     build_metaworld_clip_dataset,
 )
 from generative_flow_adapters.training import build_experiment
@@ -63,7 +65,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/wan22/diffusion_wan22_avid_xattn_replace_metaworld.yaml")
     parser.add_argument("--hdf5", default="ds/metaworld_corner2.hdf5", help="Path to MetaWorld HDF5 file")
-    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys"], default="metaworld",
+    parser.add_argument("--dataset", choices=["metaworld", "acwm_phys", "rt1", "openvid"], default="metaworld",
                         help="Dataset family. acwm_phys reads a split dir of the HF t1an/ACWM-Phys release "
                              "(--data-dir) instead of --hdf5.")
     parser.add_argument("--data-dir", default=None,
@@ -313,10 +315,11 @@ def main() -> None:
         print("sigma shift: OFF — training sigma ~ U(0,1)")
 
     num_windows = args.num_windows or None  # 0 -> None (unbounded random, cache can't hit)
-    if args.dataset == "acwm_phys":
+    if args.dataset in ("acwm_phys", "rt1", "openvid"):
         if not args.data_dir:
-            raise SystemExit("--dataset acwm_phys requires --data-dir (a split dir of the HF release).")
-        translator, dataset = build_acwmphys_clip_dataset(
+            raise SystemExit(f"--dataset {args.dataset} requires --data-dir (a split dir with metadata.pt + episode_*.mp4).")
+        _builder = {"rt1": build_rt1_clip_dataset, "openvid": build_openvid_clip_dataset}.get(args.dataset, build_acwmphys_clip_dataset)
+        translator, dataset = _builder(
             config.data,
             default_window_width=temporal_length,
             data_dir=args.data_dir,
@@ -324,7 +327,7 @@ def main() -> None:
             sampling=args.sampling,
             num_windows=num_windows,
         )
-        print(f"dataset: ACWM-Phys {translator.env_name} ({len(translator.list_episodes())} episodes) from {args.data_dir}")
+        print(f"dataset: {args.dataset} {translator.env_name} ({len(translator.list_episodes())} episodes) from {args.data_dir}")
     else:
         translator, dataset = build_metaworld_clip_dataset(
             config.data,
@@ -379,8 +382,9 @@ def main() -> None:
               f"Eval/generation targets the same clip; "
               f"pass --eval-gen (default) to see the inference grid regenerate it.")
     if want_eval and args.eval_data_dir is not None:
-        # ACWM-Phys: eval on a real held-out split dir (ind_test / ood_test).
-        _, eval_dataset = build_acwmphys_clip_dataset(
+        # ACWM-Phys / RT-1: eval on a real held-out split dir.
+        _eval_builder = {"rt1": build_rt1_clip_dataset, "openvid": build_openvid_clip_dataset}.get(args.dataset, build_acwmphys_clip_dataset)
+        _, eval_dataset = _eval_builder(
             config.data,
             default_window_width=temporal_length,
             data_dir=args.eval_data_dir,
@@ -388,7 +392,7 @@ def main() -> None:
             sampling=args.sampling,
             num_windows=num_windows,
         )
-        print(f"eval dataset: ACWM-Phys split {args.eval_data_dir}")
+        print(f"eval dataset: {args.dataset} split {args.eval_data_dir}")
     elif want_eval and eval_hdf5 is not None:
         _, eval_dataset = build_metaworld_clip_dataset(
             config.data,

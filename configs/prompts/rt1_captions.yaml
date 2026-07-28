@@ -1,0 +1,4 @@
+# RT-1 per-clip captions (natural_language_instruction). PLACEHOLDER — real
+# payload is rt1_captions.contexts.pt, built by scripts/precompute_clip_captions.py
+# on a converted RT-1 split's metadata.pt (positive table keyed by clip_id).
+default: "a robot arm manipulating objects on a table"

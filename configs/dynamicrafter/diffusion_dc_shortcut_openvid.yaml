@@ -1,0 +1,131 @@
+name: diffusion_dc_shortcut_openvid
+
+# ACTION-FREE SHORTCUT (D3): conditions: [] (no action branch) + step-size
+# conditioning + full few-step shortcut recipe. Clean isolation of D3 from actions.
+
+# DynamiCrafter (native `dynamicrafter_video` BaseVideoModel) on ACWM-Phys Robot
+# Arm — matrix run 4 (DC x robot arm). Frozen base = real vendored lvdm
+# LatentVisualDiffusion (4-channel SD-VAE), own DDIMSampler with the adapter at
+# the apply_model seam. BaseVideoModel-conforming migration of the old
+# `dynamicrafter` UNet-wrapper run (2026-07-25).
+#
+# WHY robot arm: on the flat 2D Push Cube the frozen base is near-perfect
+# (Wan base masked-denoise ~0.036 vs 0.314 on robot arm, 8.7x more residual —
+# measured 2026-07-25) so the adapter clones. Robot arm is visually rich, giving
+# the base a real residual to leave for the adapter. See thesis-vault
+# 30_Knowledge/writing/ablation-axes.md.
+#
+# DATA: HF t1an/ACWM-Phys kinematics/robot_arm. ~2000 ind_train episodes,
+# nominally 128 frames @ 10 fps (a few mp4s decode shorter — the translator
+# probes real length), released 480x640 (4:3 landscape). Actions [128, 7]
+# joint-angle deltas in ~[-0.19, 0.18]. DC encodes latents LIVE via its SD-VAE.
+#
+#   python scripts/train_avid_shortcut_metaworld.py \
+#     --config configs/dynamicrafter/diffusion_dc_acwm_robotarm.yaml \
+#     --dataset acwm_phys --data-dir ds/acwm-phys/kinematics/robot_arm/ind_train \
+#     --frame-stride 4 --target-height 384 --target-width 512
+#
+# RESOLUTION: source is 480x640 (480 tall x 640 wide = 4:3 landscape). DC512
+# native latent 40x64 comes from 320x512. Use --target-height 384 --target-width
+# 512 (latent 48x64, preserves the 4:3 landscape aspect, resize_mode "stretch").
+# frame_stride 4 spans ~64 of the 128 frames in a 16-frame window (temporal
+# coverage of the reach trajectory).
+#
+# ADAPTER: DC native AVID output-adapter (avid_mask_mix + structured `act`
+# conditioning at 4-ch width; DC's own action injection, not Wan cross-attn).
+# Clean-baseline intent: no gate_cap / warmup / sigma_shift.
+
+data:
+  frame_stride: 4
+  fs_value: 1
+
+model:
+  type: diffusion
+  provider: dynamicrafter_video
+  prediction_type: velocity
+  freeze: true
+  pass_cond_to_base: true
+  pretrained_model_name_or_path: ckts/dynami512.ckpt
+  extra:
+    model_config_path: configs/base/dynamicrafter512.yaml
+    dtype: bf16
+    temporal_length: 16
+
+adapter:
+  type: output
+  hidden_dim: 512
+  composition: avid_mask_mix
+  gate_bias: 0.0
+  extra:
+    architecture: dynamicrafter
+    unet_config_path: external_repos/avid/latent_diffusion/configs/train/act_cond_diffusion_11M.yaml
+    condition_on_base_outputs: true
+    output_mask: true
+    strict_checkpoint: false
+    use_step_level_conditioning: true    # ACTION-FREE SHORTCUT: condition on step-size
+    step_level_key: step_level
+    step_level_hidden_dim: 64
+    step_level_transform: log2
+    allow_dummy_concat_condition: true
+    # Time⊕action combine: "add" (default, our recipe) superimposes the
+    # full-width action embedding onto the time embedding; "concat" matches
+    # AVID's native recipe (time & action each embed_dim//2, concatenated →
+    # orthogonal subspaces). See thesis-vault
+    # 30_Knowledge/tech/avid-vs-ours-action-conditioning. The ..._concat.yaml
+    # variant flips this to test whether AVID-parity recovers action-following.
+    action_time_combine: add
+
+conditioning:
+  type: structured
+  output_dim: 512
+  drop_condition_prob: 0.0
+  extra:
+    context_tokens: 77
+    context_dim: 1024
+    temporal_length: 8
+    action_dim: 7            # ACWM robot_arm: 7-DoF per-joint angle deltas
+    image_encoder_device: cuda
+  conditions: []           # ACTION-FREE: no action branch (step-size only)
+
+training:
+  loss: diffusion
+  learning_rate: 1.0e-4
+  diffusion_timesteps: 1000
+  grad_clip_norm: 1.0
+  shortcut_direction_weight: 1.0
+  shortcut_target_method: distillation
+  shortcut_consistency_target: endpoint_inversion
+  multistep_consistency_weight: 1.0     # THE self-consistency term (few-step D3)
+  inference_every_n_steps: 200
+  inference_num_steps: 50
+  output_dir: outputs/dc-shortcut-openvid
+  log_metrics_jsonl: true
+  checkpoint_every_n_steps: 200
+  keep_last_checkpoints: 3
+  eval_every_n_steps: 500
+  eval_num_batches: 8
+  eval_metric: base_loss
+  extra:
+    amp_dtype: bf16
+    # Action diagnostics: forward-direction sensitivity probe (runs each eval cycle).
+    # Backward-direction grad-norms (adapter/condition/action_inject) auto-log every step.
+    action_sensitivity_probe: false   # action-free — nothing to probe
+    action_sensitivity_variants: [shuffle, zero]
+    action_sensitivity_draws: 2
+    action_sensitivity_batches: 2
+    shortcut_step_level_key: step_level
+    shortcut_anchor_prob: 0.5            # <1 so shortcut/consistency targets are built
+    eval_step_schedule:
+      - { num_steps: 8,  step_level: 0.125 }
+      - { num_steps: 50,  step_level: 0.02 }
+    shortcut_step_schedule:
+      units: normalized
+      mode: log2
+      min: 1/128
+      max: 1
+      base: 2
+    video_logging:
+      enable: true
+      num_samples: 3
+      fps: 4
+      wandb_project: dc-shortcut-openvid

@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 
 from generative_flow_adapters.data.dataset import TranslatedClipDataset
 from generative_flow_adapters.data.translators.acwm_phys import ACWMPhysTranslator
+from generative_flow_adapters.data.translators.rt1 import RT1Translator
+from generative_flow_adapters.data.translators.openvid import OpenVidTranslator
 from generative_flow_adapters.data.translators.metaworld import MetaWorldTranslator
 
 if TYPE_CHECKING:
@@ -90,6 +92,80 @@ def build_acwmphys_clip_dataset(
 
     translator = ACWMPhysTranslator(data_dir, env_name=env_name, fs_value=data.fs_value,
                                     letterbox_aspect=letterbox_aspect)
+    dataset = TranslatedClipDataset(
+        translator,
+        window_width=resolved_window,
+        frame_stride=resolved_stride,
+        sampling=resolved_sampling,
+        num_windows=resolved_num_windows,
+    )
+    return translator, dataset
+
+
+def build_rt1_clip_dataset(
+    data: "DataConfig",
+    *,
+    default_window_width: int,
+    data_dir: str,
+    env_name: str | None = None,
+    frame_stride: int | None = None,
+    sampling: str | None = None,
+    num_windows: int | None = None,
+    letterbox_aspect: tuple[int, int] | None = None,
+) -> tuple[RT1Translator, TranslatedClipDataset]:
+    """RT-1 (Open X-Embodiment) twin of :func:`build_acwmphys_clip_dataset`.
+
+    ``data_dir`` is a directory produced by
+    ``jobs/experiments_cluster/avid_official/convert_rt1_to_mp4meta.py``
+    (``metadata.pt`` + ``episode_*.mp4``, ACWM-identical schema). Real-world
+    robot video, in-distribution for the Wan/SkyReels priors — the control for
+    the ACWM action-blindness. Everything mirrors the ACWM builder; only the
+    translator (and thus caption/fps identity) differs."""
+    if not data_dir:
+        raise ValueError("RT-1 dataset needs --data-dir (a converted RT-1 split directory).")
+    resolved_stride = data.frame_stride if frame_stride is None else int(frame_stride)
+    resolved_sampling = sampling or data.sampling
+    resolved_window = int(data.window_width) if data.window_width else int(default_window_width)
+    resolved_num_windows = num_windows if num_windows is not None else getattr(data, "num_windows", None)
+
+    translator = RT1Translator(data_dir, env_name=env_name, fs_value=data.fs_value,
+                               letterbox_aspect=letterbox_aspect)
+    dataset = TranslatedClipDataset(
+        translator,
+        window_width=resolved_window,
+        frame_stride=resolved_stride,
+        sampling=resolved_sampling,
+        num_windows=resolved_num_windows,
+    )
+    return translator, dataset
+
+
+def build_openvid_clip_dataset(
+    data: "DataConfig",
+    *,
+    default_window_width: int,
+    data_dir: str,
+    env_name: str | None = None,
+    frame_stride: int | None = None,
+    sampling: str | None = None,
+    num_windows: int | None = None,
+    letterbox_aspect: tuple[int, int] | None = None,
+) -> tuple[OpenVidTranslator, TranslatedClipDataset]:
+    """OpenVid-1M captioned real-world video (D3 few-step shortcut in-distribution
+    test). ``data_dir`` is produced by ``scripts/download_openvid.py`` (mp4 +
+    metadata.pt with a PER-CLIP ``caption`` + ``clip_id``, no real actions).
+    Mirrors the RT-1/ACWM builders; the translator emits per-clip caption +
+    task_name=clip_id so the per-clip text-context table conditions the base on
+    each clip's own caption (TI2V)."""
+    if not data_dir:
+        raise ValueError("OpenVid dataset needs --data-dir (a converted OpenVid split directory).")
+    resolved_stride = data.frame_stride if frame_stride is None else int(frame_stride)
+    resolved_sampling = sampling or data.sampling
+    resolved_window = int(data.window_width) if data.window_width else int(default_window_width)
+    resolved_num_windows = num_windows if num_windows is not None else getattr(data, "num_windows", None)
+
+    translator = OpenVidTranslator(data_dir, env_name=env_name, fs_value=data.fs_value,
+                                   letterbox_aspect=letterbox_aspect)
     dataset = TranslatedClipDataset(
         translator,
         window_width=resolved_window,

@@ -1,0 +1,5 @@
+# OpenVid per-clip captions: this YAML is a PLACEHOLDER — the real payload is
+# openvid_train.contexts.pt, a POSITIVE table keyed by clip_id, built by
+# scripts/precompute_clip_captions.py (NOT precompute_prompt_contexts.py).
+# The preprocessor loads <this>.contexts.pt (positive mode, per-clip lookup).
+default: "A high quality video."
