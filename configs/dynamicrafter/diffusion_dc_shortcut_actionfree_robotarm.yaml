@@ -116,8 +116,12 @@ training:
     shortcut_step_level_key: step_level
     shortcut_anchor_prob: 0.5            # <1 so shortcut/consistency targets are built
     eval_step_schedule:
-      - { num_steps: 8,  step_level: 0.125 }
-      - { num_steps: 50,  step_level: 0.02 }
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
+      - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
+      - {num_steps: 50, step_level: 0.02}
     shortcut_step_schedule:
       units: normalized
       mode: log2

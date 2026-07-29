@@ -234,25 +234,13 @@ class WandbLogger:
         ``[ground_truth | base@N | adapted@N]`` along width, rows stacked along
         height top→bottom in schedule order.
         """
-        if not adapted_by_steps:
+        grids = assemble_step_size_grids(target_pixels, adapted_by_steps, base_by_steps)
+        if not grids:
             return
-        sample_count = target_pixels.shape[0]
-        base_pixels = {n: px for n, px in base_by_steps} if base_by_steps else {}
         actions = _maybe_extract_actions(cond)
-
         videos: dict[str, Any] = {}
-        for i in range(sample_count):
-            rows = []
-            for num_steps, pixels in adapted_by_steps:
-                panels = [target_pixels[i]]
-                if num_steps in base_pixels:
-                    panels.append(base_pixels[num_steps][i])
-                panels.append(pixels[i])
-                rows.append(torch.cat(panels, dim=-1))
-            grid = torch.cat(rows, dim=-2)
-            cols = "gt | base | adapted" if base_pixels else "gt | adapted"
-            order = ", ".join(f"N={n}" for n, _ in adapted_by_steps)
-            caption = f"sample={i} | rows top→bottom: {order} | cols: {cols}"
+        for i, (grid, cols_desc, order_desc) in enumerate(grids):
+            caption = f"sample={i} | rows top→bottom: {order_desc} | cols: {cols_desc}"
             if isinstance(actions, Tensor) and actions.shape[0] > i:
                 caption += self._format_action_block(actions[i])
             videos[f"eval_step_grid/sample_{i}"] = self._wandb.Video(
@@ -445,3 +433,35 @@ def _maybe_extract_actions(cond: object | None) -> Tensor | None:
         if isinstance(act, Tensor):
             return act
     return None
+
+
+def assemble_step_size_grids(
+    target_pixels: Tensor,
+    adapted_by_steps: list[tuple[int, Tensor]],
+    base_by_steps: list[tuple[int, Tensor]] | None,
+) -> list[tuple[Tensor, str, str]]:
+    """Build the per-sample step-size comparison grids (shared by the wandb logger
+    and the offline ``scripts/generate_shortcut_fewstep.py``).
+
+    Inputs are uint8 ``[S, T, C, H, W]``; ``adapted_by_steps`` / ``base_by_steps``
+    are ``(num_steps, pixels)`` lists. Each grid is one sample: rows = schedule
+    order (N), cols = ``gt | base | adapted`` (or ``gt | adapted``) — i.e.
+    ``[T, C, H*rows, W*cols]``. Returns ``[(grid, cols_desc, order_desc), ...]``,
+    one per sample."""
+    if not adapted_by_steps:
+        return []
+    sample_count = int(target_pixels.shape[0])
+    base_pixels = {n: px for n, px in base_by_steps} if base_by_steps else {}
+    cols_desc = "gt | base | adapted" if base_pixels else "gt | adapted"
+    order_desc = ", ".join(f"N={n}" for n, _ in adapted_by_steps)
+    grids: list[tuple[Tensor, str, str]] = []
+    for i in range(sample_count):
+        rows = []
+        for num_steps, pixels in adapted_by_steps:
+            panels = [target_pixels[i]]
+            if num_steps in base_pixels:
+                panels.append(base_pixels[num_steps][i])
+            panels.append(pixels[i])
+            rows.append(torch.cat(panels, dim=-1))
+        grids.append((torch.cat(rows, dim=-2), cols_desc, order_desc))
+    return grids

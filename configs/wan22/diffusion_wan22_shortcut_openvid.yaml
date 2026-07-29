@@ -130,7 +130,11 @@ training:
       max: 1
       base: 2
     eval_step_schedule:
+      - {num_steps: 1,  step_level: 1.0}
+      - {num_steps: 2,  step_level: 0.5}
+      - {num_steps: 4,  step_level: 0.25}
       - {num_steps: 8,  step_level: 0.125}
+      - {num_steps: 25, step_level: 0.04}
       - {num_steps: 50, step_level: 0.02}
 
     wandb:
