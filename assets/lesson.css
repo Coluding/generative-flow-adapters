@@ -1,0 +1,141 @@
+/* Shared stylesheet for all lessons and reference documents.
+   Tufte-ish: generous measure, restrained palette, prints cleanly. */
+
+:root {
+  --ink: #1a1a1a;
+  --ink-soft: #5c5c5c;
+  --rule: #d8d4cc;
+  --bg: #fffef9;
+  --accent: #7a2e0e;      /* rust — used sparingly, for emphasis only */
+  --ok: #1f6b3a;
+  --bad: #8a1f1f;
+  --code-bg: #f4f1ea;
+  --measure: 38rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e8e6e0; --ink-soft: #a8a49c; --rule: #3a3833;
+    --bg: #16150f; --accent: #e0885c; --ok: #6fca92; --bad: #e58c8c;
+    --code-bg: #211f18;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0 auto;
+  padding: 4rem 2rem 8rem;
+  max-width: var(--measure);
+  background: var(--bg);
+  color: var(--ink);
+  font: 1.05rem/1.65 et-book, Palatino, "Palatino Linotype", Georgia, serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ---- masthead ---------------------------------------------------------- */
+.kicker {
+  font: 600 0.7rem/1 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.9rem;
+}
+h1 { font-size: 2rem; line-height: 1.15; margin: 0 0 0.4rem; font-weight: 600; }
+.standfirst { color: var(--ink-soft); font-style: italic; margin: 0 0 2.5rem; }
+
+h2 {
+  font-size: 1.25rem; font-weight: 600; margin: 3rem 0 0.8rem;
+  padding-top: 0.9rem; border-top: 1px solid var(--rule);
+}
+h3 { font-size: 1rem; font-weight: 600; margin: 1.8rem 0 0.4rem; }
+
+p, li { hyphens: auto; }
+a { color: var(--accent); text-underline-offset: 0.15em; }
+
+/* ---- the one idea ------------------------------------------------------ */
+.keystone {
+  margin: 2rem 0;
+  padding: 1.2rem 1.4rem;
+  border-left: 3px solid var(--accent);
+  background: var(--code-bg);
+  font-size: 1.1rem;
+}
+.keystone strong { color: var(--accent); }
+
+/* ---- code -------------------------------------------------------------- */
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.85em;
+}
+code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; }
+pre {
+  background: var(--code-bg); padding: 1rem 1.1rem; border-radius: 4px;
+  overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+}
+pre code { background: none; padding: 0; }
+
+/* ---- tables ------------------------------------------------------------ */
+.tbl-wrap { overflow-x: auto; margin: 1.4rem 0; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th {
+  font: 600 0.72rem/1.2 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft);
+}
+
+/* ---- asides ------------------------------------------------------------ */
+.aside {
+  font-size: 0.9rem; color: var(--ink-soft);
+  border-left: 2px solid var(--rule); padding: 0.2rem 0 0.2rem 1rem; margin: 1.4rem 0;
+}
+.danger { border-left-color: var(--bad); }
+.danger strong { color: var(--bad); }
+
+/* ---- quiz -------------------------------------------------------------- */
+.quiz { margin: 1.6rem 0; padding: 1.1rem 1.2rem; border: 1px solid var(--rule); border-radius: 5px; }
+.quiz .stem { margin: 0 0 0.9rem; }
+.quiz .stem code { font-size: 0.9em; }
+.quiz .opts { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.quiz button {
+  font: 600 0.75rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.05em;
+  padding: 0.6rem 0.9rem; cursor: pointer;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--ink-soft); border-radius: 4px;
+}
+.quiz button:hover:not(:disabled) { border-color: var(--accent); }
+.quiz button:disabled { cursor: default; opacity: 0.55; }
+.quiz button.right { border-color: var(--ok); color: var(--ok); opacity: 1; font-weight: 700; }
+.quiz button.wrong { border-color: var(--bad); color: var(--bad); opacity: 1; }
+.quiz .fb {
+  margin: 0.9rem 0 0; padding-top: 0.8rem; border-top: 1px dashed var(--rule);
+  font-size: 0.9rem;
+}
+.quiz .fb[hidden] { display: none; }
+
+.scorebar {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--bg); border-bottom: 1px solid var(--rule);
+  font: 600 0.72rem/1 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink-soft); padding: 0.7rem 0; margin-bottom: 1rem;
+}
+.scorebar b { color: var(--accent); }
+
+/* ---- footer ------------------------------------------------------------ */
+.next { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule); font-size: 0.92rem; }
+.next h2 { border: 0; margin-top: 0; padding-top: 0; }
+.ask {
+  margin-top: 2rem; padding: 0.9rem 1.1rem; border-radius: 4px;
+  background: var(--code-bg); font-size: 0.9rem; color: var(--ink-soft);
+}
+
+@media print {
+  body { max-width: none; padding: 0; font-size: 10.5pt; background: #fff; color: #000; }
+  .scorebar, .quiz .opts { display: none; }
+  .quiz .fb { display: block !important; }
+  a::after { content: " (" attr(href) ")"; font-size: 0.75em; color: #555; word-break: break-all; }
+  h2 { page-break-after: avoid; }
+  pre, table, .quiz { page-break-inside: avoid; }
+}

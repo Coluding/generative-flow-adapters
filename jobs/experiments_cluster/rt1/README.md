@@ -11,7 +11,7 @@ positive. Ticket context:
 
 ```bash
 # 0) RT-1 already downloaded for AVID (avid_official/download_rt1.sh). Then:
-bash   jobs/experiments_cluster/rt1/convert_rt1.sh                    # RLDS -> mp4+metadata (AVID env, local, std-norm actions)
+sbatch jobs/experiments_cluster/rt1/convert_rt1.sh                  # RLDS -> mp4+metadata (AVID env, local, std-norm actions)
 sbatch jobs/experiments_cluster/rt1/submit_precompute_rt1_latents.sh  # Wan VAE latents  ("pre-encode")
 sbatch jobs/experiments_cluster/rt1/submit_precompute_rt1_captions.sh # per-clip T5 (natural_language_instruction)
 sbatch jobs/experiments_cluster/rt1/submit_train_wan_rt1_action.sh    # THE action test

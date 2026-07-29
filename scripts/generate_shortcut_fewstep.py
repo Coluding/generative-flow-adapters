@@ -116,7 +116,12 @@ def _build_preprocessor(config, model, args):
         action_seq_len=(latent_frames if config.training.extra.get("action_per_frame") else None),
         sigma_shift=None,
     )
-    if provider in ("wan2.2", "wan", "wan2.1", "wan2.2_external", "wan_ti2v_external"):
+    if provider in ("wan2.2_external", "wan_ti2v_external", "wan2.2", "wan", "wan2.1"):
+        # `.wan` (the upstream WanTI2V) only exists on WanTI2VVideoModel, i.e. the
+        # *_external providers. main() swaps the config onto those before building,
+        # exactly as the train script does, so the vendored Wan22DiTWrapper (no
+        # `.wan`, and `allow_missing_checkpoint: true` -> random weights) is never
+        # what we generate from.
         from generative_flow_adapters.data import Wan22DiffusionForcingPreprocessor  # noqa: PLC0415
         return Wan22DiffusionForcingPreprocessor(vae=model.base_model.wan.vae, config=pp_cfg)
     if provider == "skyreels":
@@ -136,6 +141,9 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--dataset", choices=["acwm_phys", "rt1", "openvid", "metaworld"], default="acwm_phys")
     ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B",
+                    help="Wan base checkpoint DIR (WanTI2V from_pretrained; wan providers only) — must "
+                         "match the training run. Ignored for DC/SkyReels.")
     ap.add_argument("--hdf5", default=None, help="metaworld only")
     ap.add_argument("--num-clips", type=int, default=3)
     ap.add_argument("--out-dir", default="outputs/fewstep_videos")
@@ -145,14 +153,32 @@ def main() -> None:
     ap.add_argument("--max-area", type=int, default=None)
     ap.add_argument("--frame-stride", type=int, default=1)
     ap.add_argument("--fps", type=int, default=5)
-    ap.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B",
-                    help="Wan base weights dir (WanTI2V from_pretrained). Ignored for DC/SkyReels.")
     ap.add_argument("--offload", action="store_true",
                     help="Offload the Wan DiT to CPU between calls — saves VRAM for local generation on a small GPU.")
     args = ap.parse_args()
 
     config = load_config(args.config)
     temporal_length = int(config.model.extra.get("temporal_length", 17))
+
+    # Mirror train_wan22_i2v_metaworld_external.py:162 — the YAMLs still declare
+    # the OLD vendored provider (`wan2.2` -> Wan22DiTWrapper), and the train
+    # script swaps it to the external WanTI2V at runtime. Without the same swap
+    # here the rollout is not the training rollout: the vendored wrapper has no
+    # `.wan` (AttributeError, job 25042531) and `allow_missing_checkpoint: true`
+    # means it would happily generate from a RANDOM base if it ever got past that.
+    if str(config.model.provider).lower() in ("wan2.2", "wan", "wan2.1"):
+        ckpt_dir = Path(args.ckpt_dir)
+        if not (ckpt_dir / "Wan2.2_VAE.pth").exists():
+            raise SystemExit(f"Wan2.2_VAE.pth not found in {ckpt_dir}; pass --ckpt-dir with the full checkpoint.")
+        if not list(ckpt_dir.glob("diffusion_pytorch_model*.safetensors")):
+            raise SystemExit(f"No Wan2.2 DiT safetensors in {ckpt_dir}; the external WanTI2V needs real weights.")
+        config.model.provider = "wan2.2_external"
+        config.model.pretrained_model_name_or_path = str(ckpt_dir)
+        # --offload keeps the DiT on CPU between calls, so a small local GPU can
+        # still render the grid; the cluster path leaves it resident (default).
+        config.model.extra["offload_model"] = bool(args.offload)
+        print(f"[fewstep] provider -> wan2.2_external (base {ckpt_dir}, "
+              f"offload={bool(args.offload)}), matching the train script")
 
     # eval schedule (rows of the grid) + inference plumbing, mirroring the train script.
     config.training.extra["eval_step_schedule"] = _schedule_from_arg(args.step_schedule)
@@ -163,16 +189,6 @@ def main() -> None:
     config.training.extra.setdefault("inference_use_prompt", ctx_path is not None)
     if args.max_area is not None:
         config.training.extra["inference_max_area"] = int(args.max_area)
-
-    # Wan shortcut runs were trained via the EXTERNAL path (WanTI2VVideoModel),
-    # not the vendored Wan22DiTWrapper that build_experiment gives for provider
-    # "wan2.2" (which lacks .wan / generate()). Mirror
-    # scripts/train_wan22_i2v_metaworld_external.py so the base matches the
-    # checkpoint. DC (dynamicrafter_video) / SkyReels build correctly as-is.
-    if config.model.provider == "wan2.2":
-        config.model.provider = "wan2.2_external"
-        config.model.pretrained_model_name_or_path = str(args.ckpt_dir)
-        config.model.extra["offload_model"] = bool(args.offload)
 
     experiment = build_experiment(config)
     model = experiment.model

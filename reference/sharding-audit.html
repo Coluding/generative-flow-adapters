@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — The sharding audit</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+
+<p class="kicker">Reference sheet</p>
+<h1>The sharding audit</h1>
+<p class="standfirst">Run this against any preprocessing stage before splitting it across
+machines. Designed to print on two sides.</p>
+
+<h2>1. The test</h2>
+
+<div class="keystone">
+Shardable ⟺ every output depends only on inputs <strong>inside its own shard</strong>.
+Everything else is deferred to a merge that runs once, over the whole set.
+</div>
+
+<h2>2. Three questions</h2>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>#</th><th>Question</th><th>Grep for</th><th>If yes</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Statistic</strong> — does an output need records outside this one?</td>
+    <td><code>.mean(</code> <code>.std(</code> <code>min</code> <code>max</code> <code>set(</code> <code>Counter</code> <code>sort</code> <code>dedup</code></td>
+    <td>Shards emit raw/local values → merge aggregates once</td></tr>
+<tr><td>2</td><td><strong>Identifier</strong> — does it allocate names/indices/keys used downstream?</td>
+    <td><code>enumerate</code> <code>_{i}</code> <code>uuid</code> <code>count</code> <code>id =</code></td>
+    <td>Merge reassigns globally; assert uniqueness</td></tr>
+<tr><td>3</td><td><strong>Ordering</strong> — does anything downstream depend on position?</td>
+    <td><code>[0]</code> <code>first</code> <code>[:n]</code> <code>index</code> <code>idx</code></td>
+    <td>Fix a deterministic concat order; assert it</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>All three "no" → shard it. Any "yes" → that piece moves to the merge.</p>
+
+<h2>3. Silent-failure catalogue</h2>
+
+<p>The reason to audit rather than to test-and-see: none of these raise.</p>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Missed coupling</th><th>What you get</th><th>Guard that catches it</th></tr></thead>
+<tbody>
+<tr><td>Per-shard normalization</td>
+    <td>N inconsistent feature scales; training converges to something wrong</td>
+    <td>Merge refuses input that is already normalized (<code>action_mean</code> present)</td></tr>
+<tr><td>Per-shard identifiers</td>
+    <td>Key collisions → downstream lookups return another record's value</td>
+    <td>Assert <code>len(set(ids)) == len(ids)</code> after merge</td></tr>
+<tr><td>Order assumed, not fixed</td>
+    <td>Position-keyed caches alias to the wrong item</td>
+    <td>Compare a prefix against a known single-pass run</td></tr>
+<tr><td>A shard died</td>
+    <td>A quietly smaller dataset; every metric still computes</td>
+    <td><code>--expect-shards</code> / <code>--expect-episodes</code></td></tr>
+<tr><td>Relative paths not rebased</td>
+    <td><code>FileNotFoundError</code> — the one loud failure of the set</td>
+    <td>Merge stats every referenced file</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>4. Worked example — RT-1, this repo</h2>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Stage</th><th>Verdict</th><th>Coupling</th><th>Where it is resolved</th></tr></thead>
+<tbody>
+<tr><td>Decode frames → <code>episode_i.mp4</code></td><td>shard-safe</td><td>—</td><td>—</td></tr>
+<tr><td>Stack 7-dim actions</td><td>shard-safe</td><td>—</td><td>—</td></tr>
+<tr><td>Per-dim std-normalization</td><td>coupled</td><td>statistic</td><td><code>merge_rt1_shards.py</code>, one pass</td></tr>
+<tr><td><code>clip_id</code> allocation</td><td>coupled</td><td>identifier</td><td>merge reassigns <code>rt1_&lt;global&gt;</code></td></tr>
+<tr><td><code>video_path</code> (shard-relative)</td><td>coupled</td><td>path scope</td><td>merge rebases to <code>shard_k/…</code></td></tr>
+<tr><td>Drop episodes &lt; 17 frames</td><td>shard-safe</td><td>—</td><td>—</td></tr>
+<tr><td>VAE latent encode</td><td>shard-safe</td><td>—</td><td>—</td></tr>
+<tr><td>T5 caption encode</td><td>shard-safe</td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>5. Glossary</h2>
+
+<div class="tbl-wrap">
+<table>
+<tbody>
+<tr><td><strong>Global coupling</strong></td><td>A computation whose correct value requires the entire dataset. Deferred, never distributed.</td></tr>
+<tr><td><strong>Shard</strong></td><td>A disjoint subset of the input, processed by one independent task. Shards must <em>partition</em>: no gaps, no overlaps.</td></tr>
+<tr><td><strong>Merge</strong></td><td>The single pass that resolves every deferred coupling and emits the canonical manifest. The <code>reduce</code>.</td></tr>
+<tr><td><strong>Span</strong></td><td><code>window_width × frame_stride</code> — frames one training window consumes. Episodes shorter than the span are dropped (<code>data/dataset.py:69</code>).</td></tr>
+<tr><td><strong>Cache key</strong></td><td><code>env|episode_idx|start_idx|frame_stride|t×h×w</code> → <code>sha1[:20].pt</code> (<code>data/latent_cache.py:27</code>). Any component changing invalidates; <code>episode_idx</code> is why order matters.</td></tr>
+<tr><td><strong>Fixed starts</strong></td><td>The deterministic pool of ≤ <code>num_windows</code> evenly-spaced window starts per episode. Determinism is what makes caching possible.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>6. Slurm array cheat sheet</h2>
+
+<pre><code>#SBATCH --array=0-17          # 18 tasks; add %6 to cap concurrency
+#SBATCH --array=0-17%6
+
+K=${SLURM_ARRAY_TASK_ID}      # this task's index
+PER=$(( (TOTAL + N - 1) / N ))    # ceil division
+BEG=$(( K * PER )); END=$(( BEG + PER )); [ $END -gt $TOTAL ] && END=$TOTAL
+
+sacct -j &lt;arrayjobid&gt; --format=JobID,State -X    # one row per index
+scontrol requeue &lt;jobid&gt;_7                       # re-run a single index</code></pre>
+
+<p class="aside">Node packing is not controlled by <code>--array</code>. Slurm may place
+many tasks on one node and they will contend for cores — observed 2.5× rate spread
+(155 vs 61 eps/min) across the RT-1 array. Use <code>--ntasks-per-node</code> or a
+concurrency cap if even pacing matters.
+Primary source: <a href="https://slurm.schedmd.com/job_array.html">SchedMD, Job Array Support</a>.</p>
+
+<h2>7. Sources</h2>
+<ul>
+<li><a href="https://www.usenix.org/conference/osdi-04/mapreduce-simplified-data-processing-large-clusters">Dean &amp; Ghemawat, MapReduce (OSDI 2004)</a> — the map/reduce split.</li>
+<li><a href="https://www.tensorflow.org/datasets/determinism">TFDS and determinism</a> — ordering guarantees for split slices.</li>
+<li><a href="https://www.tensorflow.org/datasets/splits">TFDS splits and slicing</a> — slice syntax.</li>
+<li><a href="https://slurm.schedmd.com/job_array.html">Slurm job arrays</a> · <a href="https://slurm.schedmd.com/sbatch.html">sbatch</a></li>
+</ul>
+
+</body>
+</html>

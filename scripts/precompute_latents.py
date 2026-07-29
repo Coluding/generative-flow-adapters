@@ -151,6 +151,12 @@ def main() -> None:
                         help="Where to write latents. Default: <hdf5>.latents/ (same default as training).")
     parser.add_argument("--limit", type=int, default=None,
                         help="Encode only the first N windows then stop (partial cache; safe to resume later).")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Split the window pool across N independent workers (e.g. a Slurm job array) so a "
+                             "40-GPU-hour pass runs as N shorter jobs. Cache keys are content-derived and writes "
+                             "are atomic, so shards never collide. Billing is per GPU-hour, so this is free.")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="Which shard this process owns, 0 <= index < --num-shards.")
     parser.add_argument("--progress", choices=["auto", "bar", "plain"], default="auto",
                         help="auto: tqdm bar on a TTY, periodic lines when redirected to a log (default).")
     args = parser.parse_args()
@@ -228,6 +234,20 @@ def main() -> None:
             "--num-windows 0 with --sampling random has infinitely many windows and cannot be "
             "precomputed. Use --num-windows K>0 (recommended) or --sampling exhaustive."
         )
+
+    # Fan the pool out across independent processes. STRIDED, not contiguous, so
+    # every shard draws uniformly from the whole dataset — a contiguous split
+    # would hand one shard all the long episodes if the manifest is ordered.
+    # Safe to run concurrently: the cache key is derived from clip identity +
+    # geometry (data/latent_cache.py:27), so two shards never target the same
+    # file, and LatentCache.put writes atomically and skips existing files.
+    if args.num_shards > 1:
+        if not (0 <= args.shard_index < args.num_shards):
+            raise SystemExit(f"--shard-index {args.shard_index} out of range for --num-shards {args.num_shards}")
+        from torch.utils.data import Subset  # noqa: PLC0415
+        idxs = list(range(args.shard_index, len(precompute_set), args.num_shards))
+        print(f"shard {args.shard_index}/{args.num_shards}: {len(idxs)} of {len(precompute_set)} windows")
+        precompute_set = Subset(precompute_set, idxs)
 
     total = len(precompute_set) if args.limit is None else min(args.limit, len(precompute_set))
     if max_area is not None:
