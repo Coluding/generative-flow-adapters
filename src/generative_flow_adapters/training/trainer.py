@@ -107,6 +107,18 @@ class Trainer:
         self._action_probe_draws = int(config.extra.get("action_sensitivity_draws", 2))
         self._action_probe_batches = int(config.extra.get("action_sensitivity_batches", 2))
         self._action_probe_warned = False
+        # Step-size sensitivity probe (shortcut analog of the action probe):
+        # perturb the shortcut step-size `step_level` and measure whether the
+        # adapter's prediction moves. Default ON when shortcut/consistency is
+        # active (else meaningless). Catches step-size-BLINDNESS — the adapter
+        # ignoring d / self-consistency collapse (copy-the-base transposed to D3).
+        self._stepsize_probe_enabled = bool(
+            config.extra.get("stepsize_sensitivity_probe", self._needs_shortcut_target())
+        )
+        self._stepsize_probe_levels = tuple(
+            float(x) for x in config.extra.get("stepsize_probe_levels", (1.0, 0.25, 0.0625, 0.02))
+        )
+        self._stepsize_probe_warned = False
         self._accum_micro_step = 0
         warmup_steps = config.linear_warmup_steps
         self.lr_scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
@@ -579,7 +591,7 @@ class Trainer:
                     and isinstance(batch.get("t"), Tensor)
                 ):
                     self._probe_batch = _detach_clone(dict(batch))
-                if self._action_probe_enabled and len(probe_batches) < self._action_probe_batches:
+                if (self._action_probe_enabled or self._stepsize_probe_enabled) and len(probe_batches) < self._action_probe_batches:
                     probe_batches.append(_detach_clone(dict(batch)))
                 loss, loss_components, *_ = self._forward_and_loss(batch)
                 loss_components["loss"] = float(loss.detach().cpu())
@@ -595,6 +607,8 @@ class Trainer:
         result.update({f"eval_{key}": value for key, value in self._probe_eval().items()})
         if self._action_probe_enabled and probe_batches:
             result.update(self._action_sensitivity_eval(probe_batches))
+        if self._stepsize_probe_enabled and probe_batches:
+            result.update(self._stepsize_sensitivity_eval(probe_batches))
         return result
 
     @torch.no_grad()
@@ -667,6 +681,80 @@ class Trainer:
             eff = _mean(st.action_effect_rel)
             if eff is not None:
                 out[f"eval_action_effect_rel_{name}"] = eff
+        return out
+
+    @torch.no_grad()
+    def _stepsize_sensitivity_eval(self, batches: list[Mapping[str, object]]) -> dict[str, float]:
+        """Step-size sensitivity probe (D3 shortcut analog of the action probe).
+        Perturbs the shortcut step-size `step_level` at fixed x_t/t and measures
+        whether the adapter's prediction MOVES:
+
+        - ``eval_stepsize_effect_rel`` — max ‖pred(d) − pred(d_ref)‖ / ‖pred(d_ref)‖
+          over the probe levels (d_ref = the smallest, base-like step).
+          **≈ 0 ⇒ STEP-SIZE-BLIND** — the adapter ignores d (self-consistency
+          collapsed → few-step is fake; copy-the-base failure transposed to D3).
+        - ``eval_stepsize_cos`` — cosine at the biggest jump vs the base-like step
+          (≈ 1 ⇒ blind).
+        - ``eval_stepsize_base_null_violation`` — the frozen base ignores
+          step_level, so its prediction must be identical across d; > 0 = a leak.
+
+        Best-effort: warns once and returns {} on failure."""
+        try:
+            if not getattr(self.model, "supports_return_base", False):
+                return {}
+            key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
+            levels = list(self._stepsize_probe_levels)
+            if len(levels) < 2:
+                return {}
+            ref = min(levels)
+            others = [lv for lv in levels if lv != ref]
+
+            effect_rels: list[float] = []
+            cosines: list[float] = []
+            null_viol = 0.0
+            for batch in batches:
+                # Get a valid x_t/t/cond for this model type (flow or diffusion);
+                # then re-run the adapted model at each probe step_level on the
+                # SAME x_t/t (paired), overriding only step_level.
+                _l, _c, x_t, t, cond, _p, _b = self._forward_and_loss(batch)
+                n = int(x_t.shape[0])
+
+                def _run(lv: float):
+                    c = self._inject_step_level(
+                        dict(cond) if isinstance(cond, Mapping) else {},
+                        key,
+                        torch.full((n,), lv, device=x_t.device, dtype=x_t.dtype),
+                    )
+                    # Same autocast context the training forward uses — otherwise
+                    # a bf16-weight base gets a fp32 input and dtype-mismatches.
+                    with self._autocast():
+                        p, b = self.model(x_t, t, c, return_base=True)
+                    return p.float(), (b.float() if isinstance(b, Tensor) else None)
+
+                pref, bref = _run(ref)
+                pref_norm = pref.norm().clamp_min(1e-8)
+                for lv in others:
+                    plv, blv = _run(lv)
+                    effect_rels.append(float(((plv - pref).norm() / pref_norm).cpu()))
+                    cosines.append(self._masked_cosine(plv, pref, batch))
+                    if bref is not None and blv is not None:
+                        null_viol = max(
+                            null_viol,
+                            float(((blv - bref).norm() / bref.norm().clamp_min(1e-8)).cpu()),
+                        )
+        except Exception as exc:  # noqa: BLE001 — probe must never break eval
+            if not self._stepsize_probe_warned:
+                self._stepsize_probe_warned = True
+                print(f"[stepsize-probe] skipped ({type(exc).__name__}: {exc})")
+            return {}
+
+        out: dict[str, float] = {}
+        if effect_rels:
+            out["eval_stepsize_effect_rel"] = max(effect_rels)
+            out["eval_stepsize_effect_rel_mean"] = sum(effect_rels) / len(effect_rels)
+        if cosines:
+            out["eval_stepsize_cos"] = min(cosines)
+        out["eval_stepsize_base_null_violation"] = float(null_viol)
         return out
 
     @torch.no_grad()
