@@ -116,7 +116,7 @@ def _build_preprocessor(config, model, args):
         action_seq_len=(latent_frames if config.training.extra.get("action_per_frame") else None),
         sigma_shift=None,
     )
-    if provider in ("wan2.2", "wan", "wan2.1"):
+    if provider in ("wan2.2", "wan", "wan2.1", "wan2.2_external", "wan_ti2v_external"):
         from generative_flow_adapters.data import Wan22DiffusionForcingPreprocessor  # noqa: PLC0415
         return Wan22DiffusionForcingPreprocessor(vae=model.base_model.wan.vae, config=pp_cfg)
     if provider == "skyreels":
@@ -145,6 +145,10 @@ def main() -> None:
     ap.add_argument("--max-area", type=int, default=None)
     ap.add_argument("--frame-stride", type=int, default=1)
     ap.add_argument("--fps", type=int, default=5)
+    ap.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B",
+                    help="Wan base weights dir (WanTI2V from_pretrained). Ignored for DC/SkyReels.")
+    ap.add_argument("--offload", action="store_true",
+                    help="Offload the Wan DiT to CPU between calls — saves VRAM for local generation on a small GPU.")
     args = ap.parse_args()
 
     config = load_config(args.config)
@@ -159,6 +163,16 @@ def main() -> None:
     config.training.extra.setdefault("inference_use_prompt", ctx_path is not None)
     if args.max_area is not None:
         config.training.extra["inference_max_area"] = int(args.max_area)
+
+    # Wan shortcut runs were trained via the EXTERNAL path (WanTI2VVideoModel),
+    # not the vendored Wan22DiTWrapper that build_experiment gives for provider
+    # "wan2.2" (which lacks .wan / generate()). Mirror
+    # scripts/train_wan22_i2v_metaworld_external.py so the base matches the
+    # checkpoint. DC (dynamicrafter_video) / SkyReels build correctly as-is.
+    if config.model.provider == "wan2.2":
+        config.model.provider = "wan2.2_external"
+        config.model.pretrained_model_name_or_path = str(args.ckpt_dir)
+        config.model.extra["offload_model"] = bool(args.offload)
 
     experiment = build_experiment(config)
     model = experiment.model
