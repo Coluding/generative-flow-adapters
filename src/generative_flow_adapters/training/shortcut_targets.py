@@ -135,7 +135,8 @@ def compute_self_consistency_target_v_flow(
     cond_half: object | None,
     d: Tensor,
     timestep_scale: float = 1.0,
-) -> Tensor:
+    return_base: bool = False,
+) -> Tensor | tuple[Tensor, Tensor | None]:
     """Flow-native self-consistency target (shortcut models, Frans et al. 2024).
 
     The 2d-step velocity equals the average of two d-step velocities chained
@@ -146,12 +147,22 @@ def compute_self_consistency_target_v_flow(
     ``d`` is the step in **sigma** units (∈[0,1]); the spatial micro-step is
     ``x - d·v``. The model is fed ``t = sigma · timestep_scale``, so the second
     call's timestep moves by ``d · timestep_scale`` (not ``d``).
+
+    With ``return_base=True`` also return the frozen-base prediction from the
+    **first** call — which is taken at the same ``(x_t, t)`` the caller's training
+    forward will use, so the caller can hand it straight back to
+    ``AdaptedModel.forward(base_output=...)`` and skip one full base forward.
+    ``None`` when the model can't report it.
     """
     was_training = model.training
     model.eval()
+    base_v1: Tensor | None = None
     try:
         with torch.no_grad():
-            v1 = model(x_t, t, cond_half)
+            if return_base and getattr(model, "supports_return_base", False):
+                v1, base_v1 = model(x_t, t, cond_half, return_base=True)
+            else:
+                v1 = model(x_t, t, cond_half)
             x_mid = flow_micro_step_v(x=x_t, v=v1, d=d)
             # `d` is per-sample [B]; reshape it to broadcast against `t`, which is
             # per-sample [B] (uniform-timestep flow) or per-latent-frame [B, T']
@@ -162,7 +173,8 @@ def compute_self_consistency_target_v_flow(
             v2 = model(x_mid, t_next, cond_half)
     finally:
         model.train(was_training)
-    return ((v1 + v2) / 2.0).detach()
+    target = ((v1 + v2) / 2.0).detach()
+    return (target, base_v1) if return_base else target
 
 
 def ddim_micro_step_v(

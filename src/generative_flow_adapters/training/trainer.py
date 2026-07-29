@@ -106,6 +106,12 @@ class Trainer:
         )
         self._action_probe_draws = int(config.extra.get("action_sensitivity_draws", 2))
         self._action_probe_batches = int(config.extra.get("action_sensitivity_batches", 2))
+        # Which cond keys hold the action. Defaults to the Wan-family names
+        # ("action", "action_seq"); DynamiCrafter's structured preprocessor emits
+        # "act" instead, and with no override the probe can only ever skip on DC —
+        # silently, since it is caught and downgraded to a warning below.
+        _probe_keys = config.extra.get("action_sensitivity_keys")
+        self._action_probe_keys = tuple(_probe_keys) if _probe_keys else None
         self._action_probe_warned = False
         # Step-size sensitivity probe (shortcut analog of the action probe):
         # perturb the shortcut step-size `step_level` and measure whether the
@@ -335,7 +341,7 @@ class Trainer:
             target_scaled = self.diffusion_objective.scale_x_start(target, t)
             x_t = self.diffusion_objective.q_sample(x_start=target_scaled, t=t, noise=noise)
             with self._prof("  shortcut target prep (_maybe_prepare_shortcut)"):
-                cond, shortcut_target = self._maybe_prepare_shortcut(
+                cond, shortcut_target, reusable_base = self._maybe_prepare_shortcut(
                     batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
                 )
             # Request the frozen-base prediction too (when the composed model
@@ -346,7 +352,9 @@ class Trainer:
             want_base = getattr(self.model, "supports_return_base", False)
             with self._prof("  model forward (base + adapter)"), self._autocast():
                 if want_base:
-                    prediction, base_output = self.model(x_t, t, cond, return_base=True)
+                    prediction, base_output = self.model(
+                        x_t, t, cond, return_base=True, base_output=reusable_base
+                    )
                 else:
                     prediction, base_output = self.model(x_t, t, cond), None
             # Upcast the (possibly bf16) prediction back to fp32 so the loss and
@@ -396,13 +404,15 @@ class Trainer:
                     patch_size=patch_size,
                 )
             with self._prof("  shortcut target prep (_maybe_prepare_shortcut)"):
-                cond, shortcut_target = self._maybe_prepare_shortcut(
+                cond, shortcut_target, reusable_base = self._maybe_prepare_shortcut(
                     batch=batch, x_t=x_t, t=t, cond=batch.get("cond")
                 )
             want_base = getattr(self.model, "supports_return_base", False)
             with self._prof("  model forward (base + adapter)"), self._autocast():
                 if want_base:
-                    prediction, base_output = self.model(x_t, t, cond, return_base=True)
+                    prediction, base_output = self.model(
+                        x_t, t, cond, return_base=True, base_output=reusable_base
+                    )
                 else:
                     prediction, base_output = self.model(x_t, t, cond), None
             prediction = prediction.float()
@@ -495,7 +505,12 @@ class Trainer:
         with self._prof("  forward"):
             loss, loss_components, _x_t, _t, _cond, _prediction, batch = self._forward_and_loss(batch)
         model_type = getattr(self.model, "model_type", None)
-        accum_steps = max(2, int(self.config.grad_accum_steps))
+        # Honour the config. This used to be `max(2, ...)`, which silently forced
+        # TWO micro-batches per optimizer step even at the documented default of
+        # `grad_accum_steps: 1` — doubling the wall-clock cost of every optimizer
+        # step (and the effective batch) for every run in the repo. Set
+        # `training.grad_accum_steps: 2` explicitly to get the old behaviour back.
+        accum_steps = max(1, int(self.config.grad_accum_steps))
         with self._prof("  backward"):
             (loss / accum_steps).backward()
         self._accum_micro_step += 1
@@ -635,6 +650,7 @@ class Trainer:
                 run_action_sensitivity,
             )
 
+            extra_kw = {} if self._action_probe_keys is None else {"action_keys": self._action_probe_keys}
             res = run_action_sensitivity(
                 trainer=self,
                 model=self.model,
@@ -642,6 +658,7 @@ class Trainer:
                 variants=self._action_probe_variants,
                 num_draws=self._action_probe_draws,
                 progress=lambda _msg: None,
+                **extra_kw,
             )
         except Exception as exc:  # noqa: BLE001 — never let the probe break training
             if not self._action_probe_warned:
@@ -1673,8 +1690,16 @@ class Trainer:
         x_t: Tensor,
         t: Tensor,
         cond: object | None,
-    ) -> tuple[object | None, Tensor | None]:
+    ) -> tuple[object | None, Tensor | None, Tensor | None]:
         """Resolve step_level + shortcut target at the same (x_t, t) the adapter will see.
+
+        Returns ``(cond, shortcut_target, reusable_base_output)``. The third value is
+        the frozen-base prediction the target computation already took at this exact
+        ``(x_t, t)`` — the caller's training forward runs the base on the *same*
+        inputs (only ``step_level`` differs, which the frozen base never sees), so
+        passing it to ``AdaptedModel.forward(base_output=...)`` removes one of the
+        three 5B forwards a supervised shortcut step would otherwise pay for.
+        ``None`` whenever no such forward happened or the adapter can't reuse it.
 
         Single supported method (see ``training.shortcut_target_method``); the
         ``two_step`` mode was removed — see thesis-vault
@@ -1695,9 +1720,9 @@ class Trainer:
         self._last_shortcut_step_level = None
         existing = batch.get("shortcut_target")
         if isinstance(existing, Tensor):
-            return cond, existing.to(device=x_t.device, dtype=x_t.dtype)
+            return cond, existing.to(device=x_t.device, dtype=x_t.dtype), None
         if not self._needs_shortcut_target():
-            return cond, None
+            return cond, None, None
 
         method = str(self.config.shortcut_target_method).lower()
         step_level_key = str(self.config.extra.get("shortcut_step_level_key", "step_level"))
@@ -1739,7 +1764,7 @@ class Trainer:
                     step_level = torch.full(
                         (batch_size,), float(self.step_schedule.smallest()), device=device, dtype=dtype
                     )
-                    return self._inject_step_level(cond, step_level_key, step_level), None
+                    return self._inject_step_level(cond, step_level_key, step_level), None, None
                 s_full = self.step_schedule.sample(exclude_smallest=True)
                 self._last_shortcut_step_level = float(s_full)
                 s_half = s_full / 2.0
@@ -1748,19 +1773,20 @@ class Trainer:
                 new_cond = self._inject_step_level(cond, step_level_key, step_level_full)
                 cond_half = self._inject_step_level(cond, step_level_key, step_level_half)
                 d_tensor = torch.full((batch_size,), float(s_half), device=device, dtype=dtype)
+                reuse = self._can_reuse_base_output()
                 with self._autocast():
-                    target = compute_self_consistency_target_v_flow(
+                    target, base_v1 = compute_self_consistency_target_v_flow(
                         model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=d_tensor,
-                        timestep_scale=self._flow_timestep_scale,
+                        timestep_scale=self._flow_timestep_scale, return_base=True,
                     )
-                return new_cond, target
+                return new_cond, target, (base_v1 if reuse else None)
 
             # Legacy dyadic ladder (no schedule configured): d = 2^-k, k in 1..max.
             max_log2 = int(self.config.extra.get("shortcut_max_log2_steps", 3))
             if do_anchor:
                 d_min = 1.0 / (2 ** max_log2)
                 step_level = torch.full((batch_size,), d_min, device=device, dtype=dtype)
-                return self._inject_step_level(cond, step_level_key, step_level), None
+                return self._inject_step_level(cond, step_level_key, step_level), None, None
             k = int(torch.randint(1, max_log2 + 1, (), device="cpu").item())
             d_half = 1.0 / (2 ** k)
             d_full = 2.0 * d_half
@@ -1773,12 +1799,13 @@ class Trainer:
             # Under autocast: the Wan DiT casts its modulation to fp32 and relies
             # on autocast to reconcile that with bf16 weights. This prep runs
             # outside the main forward's autocast block, so wrap it explicitly.
+            reuse = self._can_reuse_base_output()
             with self._autocast():
-                target = compute_self_consistency_target_v_flow(
+                target, base_v1 = compute_self_consistency_target_v_flow(
                     model=self.model, x_t=x_t, t=t, cond_half=cond_half, d=d_tensor,
-                    timestep_scale=self._flow_timestep_scale,
+                    timestep_scale=self._flow_timestep_scale, return_base=True,
                 )
-            return new_cond, target
+            return new_cond, target, (base_v1 if reuse else None)
 
         if method == "distillation":
             anchor_prob = float(self.config.extra.get("shortcut_anchor_prob", 0.75))
@@ -1798,7 +1825,7 @@ class Trainer:
                     step_level = torch.full(
                         (batch_size,), float(self.step_schedule.smallest()), device=device, dtype=dtype
                     )
-                    return self._inject_step_level(cond, step_level_key, step_level), None
+                    return self._inject_step_level(cond, step_level_key, step_level), None, None
                 s_full = self.step_schedule.sample(exclude_smallest=True)
                 self._last_shortcut_step_level = float(s_full)
                 s_half = s_full / 2.0
@@ -1813,14 +1840,14 @@ class Trainer:
                     alphas_cumprod=alphas, scale_arr=scale_arr,
                     target_kind=self.config.shortcut_consistency_target,
                 )
-                return new_cond, target
+                return new_cond, target, None
 
             # Legacy self-consistency (no schedule): dyadic d in raw timesteps,
             # supervise the adapter at step_level=2d against two calls at d.
             if do_anchor:
                 step_level = torch.ones(batch_size, device=device, dtype=dtype)
                 new_cond = self._inject_step_level(cond, step_level_key, step_level)
-                return new_cond, None
+                return new_cond, None, None
 
             dyadic_max = int(self.config.extra.get("shortcut_step_level_max", 4))
             d_value = self._sample_dyadic_d(dyadic_max=dyadic_max)
@@ -1838,13 +1865,22 @@ class Trainer:
                 alphas_cumprod=alphas, scale_arr=scale_arr,
                 target_kind=self.config.shortcut_consistency_target,
             )
-            return new_cond, target
+            return new_cond, target, None
 
         raise ValueError(
             f"Unknown shortcut_target_method={self.config.shortcut_target_method!r}; "
             "expected 'distillation'. (The 'two_step' mode was removed — see "
             "thesis-vault decided/deprecate-twostep-shortcut-mode.)"
         )
+
+    def _can_reuse_base_output(self) -> bool:
+        """Whether the training forward may skip its base forward and compose onto
+        the one the shortcut prep already took (see
+        ``AdaptedModel.reuses_base_output``). Env-kill-switch ``GFA_NO_BASE_REUSE=1``
+        forces the old two-forward behaviour for A/B-ing the optimisation."""
+        if os.environ.get("GFA_NO_BASE_REUSE", "").strip().lower() not in ("", "0", "false", "no"):
+            return False
+        return bool(getattr(self.model, "reuses_base_output", False))
 
     def _inject_step_level(
         self,

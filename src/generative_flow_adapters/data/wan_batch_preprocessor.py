@@ -253,9 +253,25 @@ class WanBatchPreprocessor:
     def dtype(self) -> torch.dtype:
         return torch.float32
 
+    @staticmethod
+    def _batch_video_and_size(batch: Mapping[str, Any]) -> tuple[Any, int]:
+        """``(raw_video, batch_size)`` for a batch that may carry pixels, prefetched
+        latents, or both. ``raw_video`` is ``None`` when every sample arrived as a
+        latent (``data/latent_prefetch.py``) — nothing downstream needs the frames
+        in that case, and the batch size comes off the latents instead."""
+        raw_video = batch.get("video")
+        if raw_video is not None:
+            return raw_video, int(raw_video.shape[0])
+        z0 = batch.get("z0")
+        if isinstance(z0, Tensor):
+            return None, int(z0.shape[0])
+        z0_list = batch.get("z0_list")
+        if isinstance(z0_list, list):
+            return None, len(z0_list)
+        raise KeyError("batch has neither 'video' nor prefetched latents ('z0'/'z0_list').")
+
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
-        raw_video = batch["video"]
-        batch_size = int(raw_video.shape[0])
+        raw_video, batch_size = self._batch_video_and_size(batch)
 
         # Wan-VAE encodes a list of [C, T, H, W] clips -> list of [48, f, h, w].
         # Cached per clip when a latent cache is configured. `_encode_z0` is
@@ -287,7 +303,22 @@ class WanBatchPreprocessor:
         geometry is deterministic, so no resize is needed to look a clip up). Only
         the **misses** are then resized, uploaded and VAE-encoded — on a full hit
         the pixels are never touched. Misses are written back when
-        ``write_latent_cache``."""
+        ``write_latent_cache``.
+
+        Fastest path first: when the DataLoader workers already read the latents
+        (``data/latent_prefetch.py``), the batch carries them and there is nothing
+        left to do here but upload — no cache lookup, no disk read on the training
+        thread. See that module for why the read belongs in the workers."""
+        prefetched = batch.get("z0")
+        if isinstance(prefetched, Tensor):
+            self.last_encoded = 0
+            return prefetched.to(self.device).float()
+
+        z0_list = batch.get("z0_list")
+        if isinstance(z0_list, list):
+            # Mixed batch: some workers hit the cache, some had to decode pixels.
+            return self._encode_mixed(z0_list, batch.get("video_list"), batch, batch_size)
+
         if self.latent_cache is None:
             video = self._normalize_video(raw_video).to(device=self.device, dtype=torch.float32)
             self.last_encoded = batch_size
@@ -332,6 +363,44 @@ class WanBatchPreprocessor:
                 if keys[i] is not None and self.config.write_latent_cache:
                     self.latent_cache.put(keys[i], z)
         return torch.stack([z for z in z_list if z is not None], dim=0)
+
+    def _encode_mixed(
+        self,
+        z0_list: list[Tensor | None],
+        video_list: Any,
+        batch: Mapping[str, Any],
+        batch_size: int,
+    ) -> Tensor:
+        """``_encode_z0`` for a batch where only *some* samples arrived with a
+        prefetched latent (a cold or partially-precomputed cache). The hits are
+        used as-is; the misses are resized, encoded and written back exactly as
+        the pixel path would."""
+        z_out: list[Tensor | None] = [
+            (z.to(self.device).float() if isinstance(z, Tensor) else None) for z in z0_list
+        ]
+        miss_idx = [i for i, z in enumerate(z_out) if z is None]
+        self.last_encoded = len(miss_idx)
+        if not miss_idx:
+            return torch.stack([z for z in z_out if z is not None], dim=0)
+        if not isinstance(video_list, list):
+            raise ValueError(
+                f"{len(miss_idx)} sample(s) arrived without a cached latent, but the batch "
+                "carries no 'video_list' to encode them from."
+            )
+        miss_video = torch.stack([torch.as_tensor(video_list[i]) for i in miss_idx], dim=0)
+        normalized = self._normalize_video(miss_video).to(device=self.device, dtype=torch.float32)
+        encoded = self.vae.encode([normalized[j] for j in range(len(miss_idx))])
+        keys: list[str | None] = [None] * batch_size
+        if self.latent_cache is not None and self.config.write_latent_cache:
+            keys = self._latent_keys(
+                batch, batch_size, int(normalized.shape[2]),
+                int(normalized.shape[3]), int(normalized.shape[4]),
+            )
+        for j, i in enumerate(miss_idx):
+            z_out[i] = encoded[j].float()
+            if keys[i] is not None and self.latent_cache is not None:
+                self.latent_cache.put(keys[i], z_out[i])
+        return torch.stack([z for z in z_out if z is not None], dim=0)
 
     def _output_hw(self, src_h: int, src_w: int) -> tuple[int, int]:
         """Resized (H, W) a clip of source ``(src_h, src_w)`` would get from

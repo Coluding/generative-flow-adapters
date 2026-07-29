@@ -1,0 +1,4 @@
+ERROR: running under Slurm (job 24998843 on tcn218.local.snellius.surf.nl) — compute nodes have no internet.
+Run this on the LOGIN node instead:
+  nohup bash /var/spool/slurm/slurmd/job24998843/slurm_script > logs/download_rt1.log 2>&1 &
+(Set ALLOW_SLURM=1 to bypass this check.)

@@ -28,9 +28,19 @@ module purge
 module load 2024
 
 export GFA_PROFILE=0
-# Shortcut = 2–3x forwards; DC is 4-ch (lighter than Wan-5B) but still lower the
-# batch vs the action run's 24.
-export BATCH_SIZE=8
+# Batch sizing, measured 2026-07-29 on H100-94GB. bs=8 used only 20.9 GiB (22%
+# of the card, 73 GiB idle); raised to 24 → measured 38.7 GiB (41%), ~1.3
+# GiB/sample marginal over a ~7 GiB static floor. DC is far cheaper per sample
+# than the Wan shortcut arm (~5.9 GiB) — 4-ch SD-VAE latents at 16 frames vs
+# Wan's 14 175 tokens/clip. Still ~55 GiB spare if more is ever wanted.
+#
+# 24 = parity with the robot-arm action run
+# (acwm_phys/dc/submit_train_dc_robotarm.sh), keeping the D3 shortcut arm
+# comparable to its D2 counterpart at fixed lr=1e-4.
+#
+# NOTE: eval batch size inherits --batch-size, so this also tripled the step-0
+# eval cost. See thesis-vault 30_Knowledge/tech/adapter-training-vram-headroom.md.
+export BATCH_SIZE=24
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache
