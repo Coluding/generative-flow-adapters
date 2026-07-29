@@ -48,6 +48,10 @@ from generative_flow_adapters.data import (
     build_openvid_clip_dataset,
     build_metaworld_clip_dataset,
 )
+from generative_flow_adapters.data.latent_prefetch import (
+    LatentPrefetchDataset,
+    collate_latent_windows,
+)
 from generative_flow_adapters.training import build_experiment
 from generative_flow_adapters.training.trainer import Trainer
 
@@ -338,6 +342,37 @@ def main() -> None:
             num_windows=num_windows,
         )
 
+    # Source geometry, probed once from a real clip. Needed here (rather than at the
+    # print below) because the latent-prefetch wrapper keys on the *resized* H×W.
+    _probe = dataset[0]["video"]  # [T, H, W, C]
+    dataset.translator.close()    # probe opened a parent-process reader; workers open their own
+    src_h, src_w = int(_probe.shape[1]), int(_probe.shape[2])
+    output_hw = preprocessor._output_hw(src_h, src_w)
+    del _probe
+
+    # Read precomputed latents in the DataLoader workers instead of on the training
+    # thread. Measured 2026-07-29 (H100, bs=12, robot_arm): the main-process cache
+    # read cost 2.0-2.9 s per micro-step and the mp4 decode behind it was pure waste
+    # on a hit. See data/latent_prefetch.py. Not applied to --precompute-latents,
+    # which exists precisely to encode the pixels.
+    # Only safe when eval comes from its OWN split dir: the `--eval-data-dir` branch
+    # builds a fresh unwrapped dataset, whereas the random_split / --overfit-index
+    # fallbacks carve eval out of *this* dataset — and a latent-only eval batch
+    # carries no `video`, which the native generation grid conditions on.
+    _eval_is_separate = (not want_eval) or args.eval_data_dir is not None or eval_hdf5 is not None
+    _prefetch_ok = latent_cache_dir is not None and not args.precompute_latents and _eval_is_separate
+    if latent_cache_dir is not None and not args.precompute_latents and not _prefetch_ok:
+        print("latent prefetch: OFF — eval is split from the training dataset, which needs raw pixels "
+              "for the generation grid. Pass --eval-data-dir to enable it.")
+
+    dataset = (
+        LatentPrefetchDataset(dataset, cache_dir=latent_cache_dir, output_hw=output_hw)
+        if _prefetch_ok else dataset
+    )
+    if _prefetch_ok:
+        print(f"latent prefetch: ON — cached windows load in the {args.num_workers} DataLoader "
+              f"worker(s) and skip the mp4 decode entirely ({output_hw[1]}x{output_hw[0]} keys)")
+
     eval_dataset = None
     train_dataset = dataset
     if args.overfit_index is not None:
@@ -392,6 +427,11 @@ def main() -> None:
             sampling=args.sampling,
             num_windows=num_windows,
         )
+        # NB: eval is deliberately NOT latent-prefetched. The native generation
+        # grid and the quality metrics condition on the observation frame in
+        # *pixels* (`raw_batch["video"]`, see Trainer._native_eval_grid), which a
+        # latent-only batch does not carry — they would silently log nothing. Eval
+        # runs one batch every few hundred steps, so the read cost is irrelevant.
         print(f"eval dataset: {args.dataset} split {args.eval_data_dir}")
     elif want_eval and eval_hdf5 is not None:
         _, eval_dataset = build_metaworld_clip_dataset(
@@ -422,6 +462,12 @@ def main() -> None:
     # processes, each re-importing torch/decord/h5py under the spawn context —
     # ~26 s per epoch, measured 2026-07-23. That is invisible on long epochs but
     # dominated single-clip overfit runs, where an epoch is a handful of batches.
+    # A prefetched batch mixes latent hits and (on a cold cache) pixel misses, which
+    # default_collate rejects — see data/latent_prefetch.py. pin_memory makes the
+    # latent H2D copy async; it is only worth it once the batch is latents (~5 MB
+    # each) rather than raw frames (~89 MB each), so it rides along with the wrapper.
+    _prefetching = isinstance(dataset, LatentPrefetchDataset)
+    _collate = collate_latent_windows if _prefetching else None
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -430,6 +476,8 @@ def main() -> None:
         drop_last=True,
         multiprocessing_context=_mp_ctx,
         persistent_workers=True if args.num_workers > 0 else False,
+        collate_fn=_collate,
+        pin_memory=_prefetching,
     )
     eval_loader = None
     if eval_dataset is not None:
@@ -440,7 +488,9 @@ def main() -> None:
             num_workers=args.num_workers,
             drop_last=True,
             multiprocessing_context=_mp_ctx,
-            persistent_workers=True if args.num_workers > 0 else False
+            persistent_workers=True if args.num_workers > 0 else False,
+            collate_fn=collate_latent_windows if isinstance(eval_dataset, LatentPrefetchDataset) else None,
+            pin_memory=isinstance(eval_dataset, LatentPrefetchDataset),
         )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -452,10 +502,7 @@ def main() -> None:
     if max_area is not None:
         from generative_flow_adapters.data.wan_batch_preprocessor import best_output_size
 
-        vid = dataset[0]["video"]  # [T, H, W, C]
-        dataset.translator.close()  # probe opened a parent-process reader; workers open their own
-        src_h, src_w = int(vid.shape[1]), int(vid.shape[2])
-        ow, oh = best_output_size(src_w, src_h, align, align, max_area)
+        ow, oh = best_output_size(src_w, src_h, align, align, max_area)  # src probed above
         lat_f = 1 + (temporal_length - 1) // 4
         tok = (oh // align) * (ow // align)  # patch tokens per frame (align == patch*stride)
         print(f"resize: source {src_w}x{src_h} -> Wan-native {ow}x{oh} px (max_area={max_area}, aligned to {align})")

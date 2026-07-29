@@ -109,8 +109,7 @@ class Wan22DiffusionForcingPreprocessor(WanBatchPreprocessor):
         return ks.clamp_(min=0, max=t_lat - 1)
 
     def __call__(self, batch: Mapping[str, Any], train: bool = True) -> dict[str, Any]:
-        raw_video = batch["video"]
-        batch_size = int(raw_video.shape[0])
+        raw_video, batch_size = self._batch_video_and_size(batch)
 
         # Wan2.2-VAE: list of [3, T, H, W] clips -> list of [48, T', h, w] latents.
         # `_encode_z0` is cache-first (data/latent_cache.py): on a hit it returns

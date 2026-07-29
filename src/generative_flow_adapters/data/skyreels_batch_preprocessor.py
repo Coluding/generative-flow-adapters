@@ -85,7 +85,6 @@ class SkyReelsI2VPreprocessor(WanBatchPreprocessor):
         self._encoder_dtype = getattr(
             pipe.transformer, "dtype", getattr(model, "dtype", torch.bfloat16)
         )
-        self._clip_on_device = False
         self._text_cache: dict[str, Tensor] = {}
 
     # SkyReels' WanVAE lacks .device/.dtype attributes the parent reads.
@@ -166,20 +165,29 @@ class SkyReelsI2VPreprocessor(WanBatchPreprocessor):
         return {"y": y, "clip_fea": clip_fea}
 
     def _onload_clip(self) -> None:
-        """Move CLIP to the compute device once and keep it resident.
+        """Ensure CLIP is on the compute device, RE-CHECKING every call.
 
-        ``Image2VideoPipeline.generate`` shuttles it per call — onload, encode,
-        ``.cpu()``, ``empty_cache()`` (lines 100-104) — which is right when you
-        generate once. CLIP runs on EVERY training batch here (the conditioning
-        frame changes per sample), so shuttling would just burn PCIe bandwidth
-        every step. It is the small one (~1.5 GB), so it stays.
+        CLIP runs on every training batch (the conditioning frame changes per
+        sample), so we want it resident rather than shuttled per call the way
+        ``Image2VideoPipeline.generate`` does it.
 
-        Idempotent — free to call per batch after the first.
+        But "already moved it once" must NOT be cached in a flag. The native eval
+        rollout calls that same pipeline, and on the way out it does
+        ``self.clip.cpu()`` when ``offload=True``
+        (image2video_pipeline.py:103-104) — moving the SAME module object back to
+        CPU behind our back. A cached flag then reports "resident" while the
+        weights sit on CPU, and the next training batch dies with
+        ``Input type (CUDABFloat16Type) and weight type (CPUBFloat16Type)``.
+
+        So: check residency, don't remember it. ``CLIPModel`` is a diffusers
+        ``ModelMixin``, so ``.device`` is just a read off the first parameter —
+        and the steady state is a no-op, since nothing moves CLIP between evals.
+        Compared on type/index so ``cuda`` matches ``cuda:0``.
         """
-        if self._clip_on_device:
-            return
-        self._clip.to(self._device)
-        self._clip_on_device = True
+        current = self._clip.device
+        want = self._device
+        if current.type != want.type or (want.index is not None and current.index != want.index):
+            self._clip.to(want)
 
     def _encode_text(self, prompts: list[str]) -> Tensor:
         """SkyReels' own T5 encode of per-sample prompts -> ``[B, L, C]``.

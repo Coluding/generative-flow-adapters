@@ -173,6 +173,31 @@ class ACWMPhysTranslator(Translator):
         return reader
 
     def load_clip(self, ref: EpisodeRef, start: int, length: int, stride: int = 1) -> dict[str, object]:
+        meta = self._clip_meta(ref, start, length, stride)
+        episode_idx = int(meta["episode_idx"])
+        pixel_span = (length - 1) * stride + 1
+        frame_indices = list(range(start, start + pixel_span, stride))
+        video = self._reader(episode_idx).get_batch(frame_indices).asnumpy()  # uint8 [T, H, W, C]
+        if self.letterbox_aspect is not None:
+            video = self._letterbox(video)
+        meta.pop("source_hw", None)
+        return {"video": np.ascontiguousarray(video), **meta}
+
+    def load_clip_meta(
+        self, ref: EpisodeRef, start: int, length: int, stride: int = 1
+    ) -> dict[str, object]:
+        """:meth:`load_clip` minus the decode — see :meth:`Translator.load_clip_meta`.
+
+        ``source_hw`` is the mp4's native ``(H, W)``, taken from the single
+        one-frame probe in :meth:`_source_hw` rather than from the clip, so a
+        latent-cache key can be built without touching the window's frames."""
+        meta = self._clip_meta(ref, start, length, stride)
+        meta["source_hw"] = self._source_hw()
+        return meta
+
+    def _clip_meta(self, ref: EpisodeRef, start: int, length: int, stride: int) -> dict[str, object]:
+        """Bounds-check the request and build the non-pixel half of a clip dict
+        (actions + the identity fields the latent cache keys on)."""
         if length <= 0 or stride <= 0 or start < 0:
             raise ValueError(f"invalid clip request: start={start}, length={length}, stride={stride}")
         episode_idx = int(ref.identifier[1])
@@ -185,17 +210,11 @@ class ACWMPhysTranslator(Translator):
                 f"episode_length={ref.length}"
             )
 
-        frame_indices = list(range(start, start + pixel_span, stride))
-        video = self._reader(episode_idx).get_batch(frame_indices).asnumpy()  # uint8 [T, H, W, C]
-        if self.letterbox_aspect is not None:
-            video = self._letterbox(video)
-
         actions = torch.as_tensor(entry["actions"][start : start + action_span], dtype=torch.float32)
         if stride > 1:
             actions = actions.reshape(length, stride, -1).sum(dim=1)
 
         return {
-            "video": np.ascontiguousarray(video),
             "act": actions,
             "caption": self.caption,
             "task_name": self.data_dir.parent.name,
@@ -206,6 +225,20 @@ class ACWMPhysTranslator(Translator):
             "env_name": self.env_name,
             "episode_idx": episode_idx,
         }
+
+    def _source_hw(self) -> tuple[int, int]:
+        """Native ``(H, W)`` of this split's videos, from one decoded frame of
+        episode 0 (cached per process). Every episode in an ACWM-Phys split is
+        exported at the same resolution; ``_letterbox`` is applied on top when
+        configured, so mirror it here."""
+        hw = getattr(self, "_src_hw_cache", None)
+        if hw is None:
+            frame = self._reader(0).get_batch([0]).asnumpy()  # [1, H, W, C]
+            if self.letterbox_aspect is not None:
+                frame = self._letterbox(frame)
+            hw = (int(frame.shape[1]), int(frame.shape[2]))
+            self._src_hw_cache = hw
+        return hw
 
     def _letterbox(self, video: np.ndarray) -> np.ndarray:
         """Pad uint8 [T, H, W, C] frames onto a white canvas of

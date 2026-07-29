@@ -90,7 +90,12 @@ class TranslatedClipDataset(Dataset):
     def episodes(self) -> list[EpisodeRef]:
         return list(self._episodes)
 
-    def __getitem__(self, idx: int) -> dict[str, object]:
+    def resolve(self, idx: int) -> tuple[EpisodeRef, int]:
+        """The ``(episode, start)`` this index draws — the sampling decision on its
+        own, split out from the pixel load so a caller can act on the window's
+        *identity* (e.g. look up its precomputed latent) before deciding whether
+        the frames need decoding at all. In ``random`` mode this consumes RNG, so
+        call it exactly once per ``__getitem__``."""
         if idx < 0:
             idx = self._length + idx
         if idx < 0 or idx >= self._length:
@@ -99,19 +104,19 @@ class TranslatedClipDataset(Dataset):
         if self.sampling == SAMPLING_EXHAUSTIVE:
             ep_idx = bisect_left(self._cumulative, idx + 1)
             prior = self._cumulative[ep_idx - 1] if ep_idx > 0 else 0
-            start = idx - prior
-            ep = self._episodes[ep_idx]
-        else:
-            ep = self._episodes[idx]
-            if self.num_windows is not None:
-                # Random augmentation restricted to the episode's fixed K-window pool
-                # (so every sampled clip has a cached latent).
-                starts = self._fixed_starts(ep)
-                start = starts[int(torch.randint(0, len(starts), ()).item())]
-            else:
-                max_start = ep.length - self._span
-                start = 0 if max_start <= 0 else int(torch.randint(0, max_start + 1, ()).item())
+            return self._episodes[ep_idx], idx - prior
 
+        ep = self._episodes[idx]
+        if self.num_windows is not None:
+            # Random augmentation restricted to the episode's fixed K-window pool
+            # (so every sampled clip has a cached latent).
+            starts = self._fixed_starts(ep)
+            return ep, starts[int(torch.randint(0, len(starts), ()).item())]
+        max_start = ep.length - self._span
+        return ep, (0 if max_start <= 0 else int(torch.randint(0, max_start + 1, ()).item()))
+
+    def __getitem__(self, idx: int) -> dict[str, object]:
+        ep, start = self.resolve(idx)
         return self.translator.load_clip(
             ep,
             start=start,

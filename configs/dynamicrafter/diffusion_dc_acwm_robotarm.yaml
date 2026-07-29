@@ -112,6 +112,11 @@ training:
     action_sensitivity_variants: [shuffle, zero]
     action_sensitivity_draws: 2
     action_sensitivity_batches: 2
+    # DC's structured preprocessor emits the action under `act`, not the
+    # Wan-family `action`/`action_seq` the probe defaults to. Without this the
+    # probe raises "no action tensor found" and is silently downgraded to a
+    # skip — job 24973886 produced NO sensitivity numbers for that reason.
+    action_sensitivity_keys: [act]
     shortcut_step_level_key: step_level
     shortcut_anchor_prob: 1.0            # matched to pushblock (2026-07-27); was 0.55
     eval_step_schedule:

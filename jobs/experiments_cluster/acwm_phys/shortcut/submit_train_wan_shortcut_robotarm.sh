@@ -30,10 +30,40 @@ module load 2024
 
 export GFA_PROFILE=0
 export GFA_DEBUG_CACHE=0
-# Shortcut evaluates the frozen 5B at MULTIPLE sub-steps per training step
-# (2–3x the forwards of the action runs) → peak memory is much higher, so start
-# at a LOWER batch than the action baseline's 12. Raise if VRAM allows.
-export BATCH_SIZE=4
+# Throughput, measured 2026-07-29 on the interactive H100 (see thesis-vault
+# 30_Knowledge/tech/wan-shortcut-step-throughput.md): average micro-step 22.2 s
+# -> 15.4 s (1.44x) from (a) reusing the frozen-base forward the shortcut
+# self-consistency prep already took at the same (x_t, t), and (b) reading the
+# precomputed latents in the DataLoader workers instead of on the training
+# thread (2 143 ms -> 3.5 ms per step). Both are on by default;
+# GFA_NO_BASE_REUSE=1 reverts (a) for an A/B.
+#
+# ⚠️ grad_accum_steps: the trainer used to force a minimum of 2 micro-batches per
+# optimizer step regardless of config, so every earlier robot-arm run trained at
+# an EFFECTIVE batch of 24, not 12. That is fixed (it now honours the config
+# default of 1). To reproduce the old dynamics exactly, set
+# `training.grad_accum_steps: 2` in the YAML — at 2x the wall-clock per step.
+# Batch sizing, measured 2026-07-29 on H100-94GB (job 25015341).
+# bs=12 → 86.5 GiB resident, 90% of the card. Static (frozen weights + optimiser)
+# is 13.0 GiB, so the marginal cost is ~5.9 GiB/sample.
+#
+# WHY so high: the frozen 5B does run under no_grad (adapted_model.py:128), so
+# the extra BASE forwards are memory-free — but the shortcut/consistency losses
+# invoke the TRAINABLE adapter 2-3x per step and every one of those retains its
+# activation graph for backward, at 14 175 tokens/clip. So the original "2-3x
+# forwards → start at a lower batch" instinct was right; no_grad on the base
+# does not license a bigger batch here.
+#
+# 12 = parity with the robot-arm action baseline
+# (acwm_phys/wan/submit_train_wan_robotarm.sh) so the D3 shortcut arm stays
+# comparable to its D2 counterpart. Note parity is in batch size only — the
+# action run at 12 uses ~37 GiB, this uses 86.5 GiB.
+#
+# ⚠️ 90% occupancy is tight: the periodic gen_eval (inference_every_n_steps: 200)
+# must fit ~30 GiB of transients inside the already-reserved pool. That relies on
+# expandable_segments (set below) reusing freed blocks. If step 200 OOMs, drop to
+# 8 (~61 GiB). See thesis-vault 30_Knowledge/tech/adapter-training-vram-headroom.md.
+export BATCH_SIZE=12
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export UV_CACHE_DIR=/scratch-shared/$USER/uv-cache

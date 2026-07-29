@@ -108,25 +108,54 @@ class AdaptedModel(nn.Module):
     # trainer can feature-detect without importing this class.
     supports_return_base = True
 
+    @property
+    def reuses_base_output(self) -> bool:
+        """Whether a caller may hand :meth:`forward` a base prediction it computed
+        earlier (``base_output=``) instead of paying for a second base forward.
+
+        Safe only for adapters that read the base through the ``base_output``
+        *tensor*. Adapters that capture the base's **internal** activations during
+        the forward (UniCon, HyperAlign — they expose
+        ``clear_captured_base_features``) would silently pair a reused output with
+        whatever hidden states the most recent base forward happened to leave
+        behind, so they always recompute."""
+        return not hasattr(self.adapter, "clear_captured_base_features")
+
     def forward(
-        self, x_t: Tensor, t: Tensor, cond: object | None = None, *, return_base: bool = False
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        cond: object | None = None,
+        *,
+        return_base: bool = False,
+        base_output: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Single-step composition: compute the frozen base prediction, then
         compose the adapter residual onto it. This is the training seam. With
         ``return_base=True`` also return the frozen base prediction (already
         computed here), so the caller can score both on the same batch without a
-        second base forward."""
-        if hasattr(self.adapter, "clear_captured_base_features"):
-            self.adapter.clear_captured_base_features()
-        # Some adapters (e.g. HyperAlign) inject dynamic LoRA weights into the
-        # base model and intentionally leave them set across forward+backward
-        # so that gradient checkpointing's recomputation matches the original
-        # forward. Clear before our frozen reference pass so it sees the
-        # unmodified base.
-        if hasattr(self.adapter, "clear_dynamic_parameters"):
-            self.adapter.clear_dynamic_parameters()
-        with torch.no_grad(), _prof("base forward (frozen 5B, no_grad)"):
-            base_output = self.base_model(x_t, t, cond=cond)
+        second base forward.
+
+        ``base_output`` skips the base forward and composes onto a prediction the
+        caller already has. The frozen base is a pure function of
+        ``(x_t, t, cond['context'])`` — it never sees ``step_level`` or the action —
+        so the shortcut self-consistency prep and the training forward, which run
+        at the *same* ``(x_t, t)`` and differ only in ``step_level``, would
+        otherwise compute the identical 5B forward twice (~9 s at bs=12 /
+        14 175 tokens). Only pass it when :attr:`reuses_base_output`; the caller is
+        responsible for the inputs actually matching."""
+        if base_output is None:
+            if hasattr(self.adapter, "clear_captured_base_features"):
+                self.adapter.clear_captured_base_features()
+            # Some adapters (e.g. HyperAlign) inject dynamic LoRA weights into the
+            # base model and intentionally leave them set across forward+backward
+            # so that gradient checkpointing's recomputation matches the original
+            # forward. Clear before our frozen reference pass so it sees the
+            # unmodified base.
+            if hasattr(self.adapter, "clear_dynamic_parameters"):
+                self.adapter.clear_dynamic_parameters()
+            with torch.no_grad(), _prof("base forward (frozen 5B, no_grad)"):
+                base_output = self.base_model(x_t, t, cond=cond)
         composed = self._compose_with_adapter(x_t, t, cond, base_output)
         if return_base:
             return composed, base_output

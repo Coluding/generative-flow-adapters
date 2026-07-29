@@ -1,0 +1,2 @@
+>>> downloading OpenVid-1M subset (2000 clips) -> /home/lbierling/scratch-shared/openvid/train
+[2026-07-28T18:58:38.037] error: *** JOB 25009410 ON tcn436 CANCELLED AT 2026-07-28T18:58:38 DUE TO TIME LIMIT ***

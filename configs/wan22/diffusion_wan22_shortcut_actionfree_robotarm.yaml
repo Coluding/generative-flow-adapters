@@ -97,7 +97,13 @@ training:
   quality_dist_metrics: [fvd, fid]
   quality_dist_every_n_steps: 400
   quality_dist_num_batches: 1
-  baseline_eval_inference: true
+  # Skip the step-0 baseline generation grid (2026-07-29): it cost ~10 min of
+  # wall-clock before the first gradient update and spiked reserved VRAM to
+  # 42.7 GiB (vs 17.4 GiB steady training) — the single largest allocation in
+  # the run, and it only ever produced an at-init reference we already have from
+  # the sibling action runs. The periodic cadence (inference_every_n_steps: 200)
+  # is unaffected, so mid-training generation still happens.
+  baseline_eval_inference: false
   baseline_eval_loss: false
   baseline_eval_quality: false
 

@@ -1,0 +1,2 @@
+ERROR: gsutil not found. Install it (pip install --user gsutil) or load a google-cloud-sdk module, then re-run.
+Alternative: 'gcloud storage cp -r gs://gresearch/robotics/fractal20220817_data ../scratch-shared/oxe/'
