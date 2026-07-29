@@ -6,7 +6,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=180G
-#SBATCH --time=8:00:00
+#SBATCH --time=16:00:00
 #SBATCH --output=logs/rt1/precompute-%x-%j.out
 #SBATCH --error=logs/rt1/precompute-%x-%j.err
 

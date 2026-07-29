@@ -116,7 +116,12 @@ def _build_preprocessor(config, model, args):
         action_seq_len=(latent_frames if config.training.extra.get("action_per_frame") else None),
         sigma_shift=None,
     )
-    if provider in ("wan2.2", "wan", "wan2.1"):
+    if provider in ("wan2.2_external", "wan_ti2v_external", "wan2.2", "wan", "wan2.1"):
+        # `.wan` (the upstream WanTI2V) only exists on WanTI2VVideoModel, i.e. the
+        # *_external providers. main() swaps the config onto those before building,
+        # exactly as the train script does, so the vendored Wan22DiTWrapper (no
+        # `.wan`, and `allow_missing_checkpoint: true` -> random weights) is never
+        # what we generate from.
         from generative_flow_adapters.data import Wan22DiffusionForcingPreprocessor  # noqa: PLC0415
         return Wan22DiffusionForcingPreprocessor(vae=model.base_model.wan.vae, config=pp_cfg)
     if provider == "skyreels":
@@ -136,6 +141,8 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--dataset", choices=["acwm_phys", "rt1", "openvid", "metaworld"], default="acwm_phys")
     ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--ckpt-dir", default="ckpts/Wan2.2-TI2V-5B",
+                    help="Wan base checkpoint DIR (wan providers only) — must match the training run.")
     ap.add_argument("--hdf5", default=None, help="metaworld only")
     ap.add_argument("--num-clips", type=int, default=3)
     ap.add_argument("--out-dir", default="outputs/fewstep_videos")
@@ -149,6 +156,23 @@ def main() -> None:
 
     config = load_config(args.config)
     temporal_length = int(config.model.extra.get("temporal_length", 17))
+
+    # Mirror train_wan22_i2v_metaworld_external.py:162 — the YAMLs still declare
+    # the OLD vendored provider (`wan2.2` -> Wan22DiTWrapper), and the train
+    # script swaps it to the external WanTI2V at runtime. Without the same swap
+    # here the rollout is not the training rollout: the vendored wrapper has no
+    # `.wan` (AttributeError, job 25042531) and `allow_missing_checkpoint: true`
+    # means it would happily generate from a RANDOM base if it ever got past that.
+    if str(config.model.provider).lower() in ("wan2.2", "wan", "wan2.1"):
+        ckpt_dir = Path(args.ckpt_dir)
+        if not (ckpt_dir / "Wan2.2_VAE.pth").exists():
+            raise SystemExit(f"Wan2.2_VAE.pth not found in {ckpt_dir}; pass --ckpt-dir with the full checkpoint.")
+        if not list(ckpt_dir.glob("diffusion_pytorch_model*.safetensors")):
+            raise SystemExit(f"No Wan2.2 DiT safetensors in {ckpt_dir}; the external WanTI2V needs real weights.")
+        config.model.provider = "wan2.2_external"
+        config.model.pretrained_model_name_or_path = str(ckpt_dir)
+        config.model.extra["offload_model"] = False
+        print(f"[fewstep] provider -> wan2.2_external (base {ckpt_dir}), matching the train script")
 
     # eval schedule (rows of the grid) + inference plumbing, mirroring the train script.
     config.training.extra["eval_step_schedule"] = _schedule_from_arg(args.step_schedule)

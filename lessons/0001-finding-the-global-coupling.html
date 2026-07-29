@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 01 — Finding the global coupling</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+<script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+
+<p class="kicker">Lesson 01 · Sharding pipelines</p>
+<h1>Finding the global coupling</h1>
+<p class="standfirst">Before you split a preprocessing stage across 18 machines, one
+question decides everything. This lesson teaches you to ask it — and to recognise the
+three shapes the answer takes.</p>
+
+<div class="scorebar" data-score></div>
+
+<h2>The one idea</h2>
+
+<div class="keystone">
+A stage is shardable if and only if <strong>every output depends only on the inputs
+inside its own shard</strong>. Anything that depends on <em>all</em> the data is a
+<strong>global coupling</strong>, and it cannot be distributed — it can only be
+<strong>deferred</strong> to a merge step that runs once, over everything.
+</div>
+
+<p>This is the <code>map</code> / <code>reduce</code> split, and it is older than any of
+our tooling: Dean &amp; Ghemawat formalised it in 2004 precisely because "which part of
+this can run independently?" is the question that decides whether a job takes 21 hours
+or 80 minutes.</p>
+
+<p>The RT-1 conversion in this repo is a worked example. Converting one episode —
+decode its frames, write <code>episode_i.mp4</code>, stack its 7-dim actions — touches
+nothing outside that episode. Pure map. But the converter also does this
+(<code>convert_rt1_to_mp4meta.py:93</code>):</p>
+
+<pre><code>alla = torch.cat([e["actions"] for e in meta], dim=0)   # every episode
+mean = alla.mean(dim=0); std = alla.std(dim=0).clamp_min(1e-6)
+e["actions"] = (e["actions"] - mean) / std</code></pre>
+
+<p>That <code>mean</code> is a function of all 87,212 episodes. Eighteen shards would
+each compute their own — eighteen different action scales, silently. So the shards run
+with <code>--no-normalize</code>, and the normalization moves to
+<code>merge_rt1_shards.py</code>. That single decision <em>is</em> the sharding strategy;
+everything else is bookkeeping.</p>
+
+<h2>The three shapes a coupling takes</h2>
+
+<p>In practice couplings are not exotic. Nearly all of them are one of three, and RT-1
+happened to contain all three at once:</p>
+
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Shape</th><th>Test: does it need the whole set?</th><th>RT-1 instance</th><th>Resolution</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>Statistic</strong></td>
+  <td>An aggregate — mean, std, min/max, vocabulary, dedup set</td>
+  <td>Per-dim action <code>mean</code>/<code>std</code></td>
+  <td>Shards emit raw values; merge computes once and applies</td>
+</tr>
+<tr>
+  <td><strong>Identifier</strong></td>
+  <td>A counter or key that must be unique across the corpus</td>
+  <td><code>clip_id = f"rt1_{i}"</code> — restarts at 0 in every shard</td>
+  <td>Merge reassigns a global running index</td>
+</tr>
+<tr>
+  <td><strong>Ordering</strong></td>
+  <td>Meaning attached to an item's <em>position</em>, not its content</td>
+  <td><code>episode_idx</code> is part of the latent cache key</td>
+  <td>Fix a deterministic concatenation order; never re-derive it casually</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p>Notice the asymmetry in how they hurt. A missed <em>statistic</em> gives you 18
+inconsistent scales. A missed <em>identifier</em> gives you 18 clips all claiming
+<code>rt1_0</code> — and since the caption table is keyed on <code>clip_id</code>, the
+frozen base would be conditioned on the wrong instruction for thousands of clips. A
+missed <em>ordering</em> assumption means a stale latent cache silently serves you
+<em>another episode's</em> latents.</p>
+
+<div class="aside danger">
+<strong>None of these three crashes.</strong> Every one of them produces a pipeline that
+runs to completion and yields a loss curve that goes down. That is the whole reason this
+lesson exists: sharding bugs are not caught by "did the job succeed?" — they are caught
+only by the audit you do beforehand, and by guards you write into the merge.
+</div>
+
+<h2>The audit</h2>
+
+<p>Three questions, in order, against any stage you are about to shard:</p>
+
+<ol>
+<li><strong>Statistic?</strong> Does any output value require reading records outside
+this one? (Grep for <code>.mean(</code>, <code>.std(</code>, <code>set(</code>,
+<code>Counter</code>, <code>sort</code>, <code>min</code>/<code>max</code>.)</li>
+<li><strong>Identifier?</strong> Does the stage allocate names, indices, or keys that
+something downstream looks things up by?</li>
+<li><strong>Ordering?</strong> Does anything downstream depend on <em>where</em> a record
+sits rather than what it contains?</li>
+</ol>
+
+<p>If all three are "no", shard it. If any is "yes", that piece moves to the merge —
+and the merge should <em>refuse to run</em> when its assumptions are violated, rather
+than quietly producing a short or mis-keyed dataset. Ours does:</p>
+
+<pre><code>if "action_mean" in e or "action_std" in e:
+    raise SystemExit(f"{mp} is ALREADY normalized ... must be --no-normalize")
+--expect-shards 18  --expect-episodes 87212</code></pre>
+
+<h2>Retrieval practice</h2>
+
+<p>Answer from memory before reading the feedback — the effortful retrieval is what
+makes this stick, not the recognition. Items are deliberately mixed across datasets.</p>
+
+<p class="aside"><code>SHARD-SAFE</code> = each output depends only on its own shard.
+<code>GLOBAL-DEP</code> = has a global coupling; must be deferred to a merge.</p>
+
+<div class="quiz" data-quiz data-explain="Re-run the three questions: statistic, identifier, ordering.">
+  <p class="stem">1. <strong>ACWM-Phys:</strong> encode each 17-frame window to Wan VAE latents and write it to the cache.</p>
+  <div class="opts">
+    <button data-correct data-fb="One window in, one latent out. The VAE is frozen and stateless, so shard 3 cannot affect shard 7.">SHARD-SAFE</button>
+    <button data-fb="Nothing here reads another window. The frozen VAE is a pure function of its input.">GLOBAL-DEP</button>
+  </div>
+  <p class="fb" hidden></p>
+</div>
+
+<div class="quiz" data-quiz data-explain="Ask: could shard 0 compute this correctly without seeing shard 17?">
+  <p class="stem">2. <strong>OpenVid:</strong> build a caption vocabulary, dropping tokens that appear fewer than 5 times across the corpus.</p>
+  <div class="opts">
+    <button data-fb="&quot;Across the corpus&quot; is the tell — a token rare in your shard may be common overall.">SHARD-SAFE</button>
+    <button data-correct data-fb="A statistic. Shards must emit local counts; the merge sums them and applies one threshold.">GLOBAL-DEP</button>
+  </div>
+  <p class="fb" hidden></p>
+</div>
+
+<div class="quiz" data-quiz data-explain="Ask: could shard 0 compute this correctly without seeing shard 17?">
+  <p class="stem">3. <strong>RT-1:</strong> T5-encode one episode's <code>natural_language_instruction</code> into a context tensor.</p>
+  <div class="opts">
+    <button data-correct data-fb="A frozen encoder applied to one string. Note the *table* keyed by clip_id is a different stage — that one has an identifier coupling.">SHARD-SAFE</button>
+    <button data-fb="The encode itself is pure. The coupling in this pipeline lives in the clip_id key, not in T5.">GLOBAL-DEP</button>
+  </div>
+  <p class="fb" hidden></p>
+</div>
+
+<div class="quiz" data-quiz data-explain="Ask: could shard 0 compute this correctly without seeing shard 17?">
+  <p class="stem">4. <strong>Any dataset:</strong> assign each clip to train/val by <code>hash(clip_id) % 100 &lt; 1</code>.</p>
+  <div class="opts">
+    <button data-correct data-fb="A hash is a *local* function of the record. Each shard reaches the same verdict alone — which is exactly why hash-based splits are the standard trick for parallel pipelines.">SHARD-SAFE</button>
+    <button data-fb="Tempting, because splitting feels global — but the hash reads only this record's own id.">GLOBAL-DEP</button>
+  </div>
+  <p class="fb" hidden></p>
+</div>
+
+<div class="quiz" data-quiz data-explain="Compare carefully with the previous item — the difference is the whole lesson.">
+  <p class="stem">5. <strong>Any dataset:</strong> assign the <em>first</em> 1% of episodes to val, the rest to train.</p>
+  <div class="opts">
+    <button data-fb="&quot;First&quot; is positional. Every shard thinks its own opening episodes are the first 1%.">SHARD-SAFE</button>
+    <button data-correct data-fb="An ordering coupling — position-dependent. Item 4 and item 5 do the same job; only one survives sharding.">GLOBAL-DEP</button>
+  </div>
+  <p class="fb" hidden></p>
+</div>
+
+<div class="quiz" data-quiz data-explain="Ask: could shard 0 compute this correctly without seeing shard 17?">
+  <p class="stem">6. <strong>RT-1:</strong> drop episodes shorter than the 17-frame window (<code>ep.length &gt;= span</code>).</p>
+  <div class="opts">
+    <button data-correct data-fb="A per-episode predicate on its own length. This is why 132 of your 5,000 episodes vanished without any global pass.">SHARD-SAFE</button>
+    <button data-fb="It reads only this episode's own length — no other record changes the verdict.">GLOBAL-DEP</button>
+  </div>
+  <p class="fb" hidden></p>
+</div>
+
+<h2>One nuance worth carrying</h2>
+
+<p>Sharding by <em>split slice</em> — <code>train[0:4846]</code>,
+<code>train[4846:9692]</code>, … — guarantees the shards <strong>partition</strong> the
+dataset: every example appears exactly once. It does <em>not</em>, on its own, guarantee
+the order examples come back in. TFDS is explicit that
+<a href="https://www.tensorflow.org/datasets/determinism">example order is only
+guaranteed for a fixed value of the interleave args</a>, and that
+<code>ds.take(x)</code> and <code>split='train[:x]'</code> are not equivalent.</p>
+
+<p>For RT-1 the order <em>is</em> preserved — verified, not assumed: the first 2,572
+episodes of the sharded run match the single-pass run caption-for-caption and
+length-for-length. That matters because <code>episode_idx</code> is baked into the latent
+cache key (see <a href="../reference/sharding-audit.html">the reference sheet</a>). Fine
+here; something to re-verify on the next dataset.</p>
+
+<h2>Read this next</h2>
+<p><strong>Primary source:</strong>
+<a href="https://www.usenix.org/conference/osdi-04/mapreduce-simplified-data-processing-large-clusters">Dean
+&amp; Ghemawat, <em>MapReduce: Simplified Data Processing on Large Clusters</em>
+(OSDI 2004)</a> — sections 2 and 3 only, about 20 minutes. Read it for the shape of the
+argument, not the implementation: it is the cleanest statement of what has to be true for
+a computation to split, and what has to be true of the step that puts it back together.</p>
+
+<div class="next">
+<h2>Where this goes</h2>
+<ul>
+<li><a href="../reference/sharding-audit.html">Reference: the sharding audit + silent-failure catalogue</a> — the compressed version, for when you are staring at a new dataset.</li>
+<li><em>Next lesson (not yet written):</em> reading a failed Slurm array — telling "re-run index 7" apart from "the merged output is corrupt".</li>
+<li><a href="../MISSION.md">MISSION.md</a></li>
+</ul>
+</div>
+
+<p class="ask"><strong>Ask me follow-ups.</strong> I am your teacher for this — if any
+step of the audit felt hand-wavy, or you want to run it against a dataset that is not in
+this repo, say so and we will work it live rather than in the abstract.</p>
+
+</body>
+</html>
