@@ -73,11 +73,13 @@ test -f "$ROOT/ind_train/metadata.pt" || { echo "Error: $ROOT/ind_train/metadata
 test -f "ckts/dynami512.ckpt" || { echo "Error: DC checkpoint ckts/dynami512.ckpt missing" >&2; exit 1; }
 
 CFG_DIR=configs/dynamicrafter
-ARM="${ARM:?set ARM=A|B|C|D — see the header}"
+ARM="${ARM:?set ARM=0|0S|A|B|C|D — see the header}"
 
-# frame_stride is ALSO set in each config's `data:` block to the same value;
-# the CLI flag wins (train_avid_shortcut_metaworld.py:374). Kept consistent so
-# the config reads truthfully on its own.
+# Each arm's frame_stride/geometry is set BOTH here and in the arm's config
+# `data:` block, to the same value. The CLI flag wins
+# (train_avid_shortcut_metaworld.py:374); the config keeps its copy so it reads
+# truthfully on its own. Keep the two in sync when editing.
+# SEED defaults to 0 but arms 0/0S override it below — their seed IS the treatment.
 SEED="${SEED:-0}"
 case "$ARM" in
   # --- controls: untreated baseline, re-measured under the SAME probe as the
